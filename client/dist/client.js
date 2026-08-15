@@ -441,7 +441,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.11.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.11.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -658,7 +658,7 @@ window.__ModuleLoader__.load({
           // gain a small vertical gap so the tree breathes (workspace blocks,
           // section headers, session rows and file rows alike).
           '.dsh-fe-wslist { padding:6px 0; }',
-          '.dsh-fe-ws-item { margin-bottom:4px; }',
+          '.dsh-fe-ws-item { margin-bottom:2px; }',
           '.dsh-fe-ws-item:last-child { margin-bottom:0; }',
           '.dsh-fe-ws-row { padding:6px 8px; }',
           '.dsh-fe-sec { padding:5px 8px 5px 22px; margin:2px 0; }',
@@ -667,8 +667,32 @@ window.__ModuleLoader__.load({
           '.dsh-fe-newbtn { margin:3px 8px 3px 40px; padding:3px 10px; }',
           '.dsh-fe-search { margin:4px 0 8px 40px; padding:3px 8px; }',
           // Session time labels sit at the right edge of each history row
-          // (the name span's flex:1 already pushes them there).
-          '.dsh-fe-sess-time { flex:none; margin-left:6px; font-size:11px; color:var(--dsw-alias-label-secondary); font-family:ui-monospace,Consolas,monospace; white-space:nowrap; }',
+          // (the name span's flex:1 already pushes them there). v1.11.1: font
+          // matches the WebUI body stack (--dsw-font-family, declared on
+          // :root by the shell's theme base.css) instead of a code/mono font —
+          // Latin glyphs render in the same system UI face as the
+          // conversation text (Segoe UI etc.), CJK falls back to the stack's
+          // PingFang SC / Microsoft YaHei entries.
+          '.dsh-fe-sess-time { flex:none; margin-left:6px; font-size:11px; color:var(--dsw-alias-label-secondary); font-family:var(--dsw-font-family); white-space:nowrap; }',
+          // ---- v1.11.1: unified hover transitions ----
+          // Every hover highlight now fades on the same .12s ease curve
+          // (matching the icon buttons) instead of snapping on. Covers the
+          // modified-files bar rows plus the remaining plugin controls that
+          // highlighted instantly: tree refresh, tab close, diff jump,
+          // inline-edit line hover/focus and the hunk hover outline.
+          '.dsh-fe-file-row { transition:background .12s ease; }',
+          '.dsh-fe-secbtn { transition:background .12s ease,color .12s ease; }',
+          '.dsh-fe-tab-x { transition:background .12s ease,color .12s ease; }',
+          '.dsh-fe-jump-btn { transition:background .12s ease,color .12s ease; }',
+          '.dsh-fe-tx-edit { transition:background .12s ease,box-shadow .12s ease; }',
+          // Hunk outline: transparent at rest, fades to the hover tint. The
+          // current-hunk marker needs a two-class selector to win over the
+          // rest-state transparent outline (same-specificity single-class
+          // rules would let the later base rule erase it).
+          '.dsh-fe-hunk { outline:1px solid transparent; transition:outline-color .12s ease; }',
+          '.dsh-fe-hunk:hover { outline-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 40%, transparent); }',
+          '.dsh-fe-hunk.dsh-fe-hunk-cur { outline-color:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 55%, transparent); }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-tab-x,.dsh-fe-jump-btn,.dsh-fe-tx-edit,.dsh-fe-hunk { transition:none; } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
