@@ -52,10 +52,16 @@ if ($Uninstall) {
   }
   if (Test-Path -LiteralPath $patchFile) {
     $text = [System.IO.File]::ReadAllText($patchFile)
-    if ($text -match 'id:\s*dsh-file-edit') {
+    # Enter the removal pass only when one of OUR entry lines (id or name
+    # ending in dsh-file-edit) is actually present — a bare marker comment
+    # or an unrelated mention must not trigger a rewrite of the file.
+    if ($text -match '(?m)^\s*-?\s*(id|name):\s*dsh-file-edit\s*$') {
       # Line-based removal (tolerant to indentation drift): drop the marker
       # comment block, its `- insert:` line and the id/name entry lines. Also
       # covers a hand-placed `- insert:` entry without the marker comment.
+      # Preserve the file's own line endings so foreign content stays
+      # byte-stable apart from the removed lines.
+      $eol = if ($text -match "`r`n") { "`r`n" } else { "`n" }
       $lines = $text -split "`r?`n"
       $out = New-Object System.Collections.Generic.List[string]
       $i = 0
@@ -63,14 +69,28 @@ if ($Uninstall) {
         $line = $lines[$i]
         if ($line -match '^#\s*dsh-file-edit:') {
           $i++
-          while ($i -lt $lines.Count -and $lines[$i] -match '^\s*#') { $i++ }
-          if ($i -lt $lines.Count -and $lines[$i] -match '^-\s*insert:') { $i++ }
+          # Consume only OUR OWN comment lines (any comment mentioning the
+          # plugin); a foreign comment that happens to follow must survive.
+          while ($i -lt $lines.Count -and $lines[$i] -match '^\s*#.*dsh-file-edit') { $i++ }
+          # Only consume the following `- insert:` line when that block is
+          # really ours (its entries carry id/name: dsh-file-edit). A
+          # hand-rearranged file can have a foreign block between our comment
+          # and our entry — never eat that one.
+          $ours = $false
+          if ($i -lt $lines.Count -and $lines[$i] -match '^\s*-\s*insert:') {
+            $j = $i + 1
+            while ($j -lt $lines.Count -and $lines[$j] -match '^\s*-?\s*(id|name):\s*\S') {
+              if ($lines[$j] -match ':\s*dsh-file-edit\s*$') { $ours = $true }
+              $j++
+            }
+            if ($ours) { $i++ }
+          }
           # Entry lines: `- id: dsh-file-edit` carries the dash; `name: ...`
           # is its mapping continuation and has none — both must go.
           while ($i -lt $lines.Count -and $lines[$i] -match '^\s*-?\s*(id|name):\s*dsh-file-edit\s*$') { $i++ }
           continue
         }
-        if ($line -match '^-\s*insert:') {
+        if ($line -match '^\s*-\s*insert:') {
           $j = $i + 1
           $isOurs = $false
           while ($j -lt $lines.Count -and $lines[$j] -match '^\s*-?\s*(id|name):\s*\S') {
@@ -82,13 +102,13 @@ if ($Uninstall) {
         $out.Add($line)
         $i++
       }
-      $new = [string]::Join("`r`n", $out)
+      $new = [string]::Join($eol, $out)
       # If no list content remains (other entries, or the `[]` skeleton),
       # restore the empty-list skeleton so the patch file stays valid YAML
       # (a comments-only file parses to null).
       $hasList = [regex]::IsMatch($new, '(?m)^\s*-\s') -or [regex]::IsMatch($new, '(?m)^\s*\[\]\s*$')
       if (-not $hasList) {
-        $new = $new.TrimEnd("`r", "`n", " ") + "`n`n[]`n"
+        $new = $new.TrimEnd("`r", "`n", " ") + $eol + $eol + '[]' + $eol
       }
       Write-TextUtf8NoBom -Path $patchFile -Text $new
       "removed the dsh-file-edit insert block from cordis.patch.yml"
