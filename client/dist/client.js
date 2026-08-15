@@ -96,9 +96,22 @@ window.__ModuleLoader__.load({
           // FileView as --dsh-fe-dock-h so the diff scroll areas reserve
           // clearance for the panel.
           fileViewActive: false,
-          dockH: 0,
           setFileViewActive(v) { if (!!v !== this.fileViewActive) { this.fileViewActive = !!v; this.emit() } },
-          setDockH(n) { const v = Math.round(Number(n) || 0); if (v !== this.dockH) { this.dockH = v; this.emit() } },
+          // v1.12.1: dockH publishes on its OWN channel (dockSubs), not the
+          // global store emit. A global emit would re-render DiffPane's
+          // thousand-line tree (and every sidebar node) on each bar resize —
+          // the CPU spike fixed here. Only the FileView CSS-var writer
+          // subscribes.
+          dockH: 0,
+          dockSubs: new Set(),
+          setDockH(n) {
+            const v = Math.round(Number(n) || 0)
+            if (v === this.dockH) return
+            this.dockH = v
+            const subs = Array.from(this.dockSubs)
+            for (const f of subs) { try { f() } catch (e) {} }
+          },
+          onDockH(f) { this.dockSubs.add(f); return () => { this.dockSubs.delete(f) } },
           requestRefresh() { this.refreshTick++; this.emit() },
           emit() { this.rev++; const subs = Array.from(this.subs); for (const f of subs) { try { f() } catch (e) {} } },
           subscribe(f) { this.subs.add(f); return () => { this.subs.delete(f) } },
@@ -451,7 +464,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.12.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.12.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -721,6 +734,15 @@ window.__ModuleLoader__.load({
           // collapse animation) and is 0 outside the file view.
           '.dsh-fe-diff { padding-bottom:var(--dsh-fe-dock-h, 0px); }',
           '.dsh-fe-mdwrap { padding-bottom:calc(48px + var(--dsh-fe-dock-h, 0px)); }',
+          // ---- v1.12.1: cheap editor reflows ----
+          // Offscreen code lines and markdown block children skip layout &
+          // paint entirely: the bar's clearance updates (dockH) then only
+          // relayout the ~visible lines instead of the whole file — the other
+          // half of the toggle CPU spike. 19px matches the 12.5px/1.5 code
+          // line box; the estimates keep the scrollbar stable for content
+          // that has never rendered.
+          '.dsh-fe-line { content-visibility:auto; contain-intrinsic-size:auto 19px; }',
+          '.dsh-fe-md > * { content-visibility:auto; contain-intrinsic-size:auto 24px; }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -1131,8 +1153,14 @@ window.__ModuleLoader__.load({
             let dockTimer = null
             let ro = null
             if (typeof ResizeObserver === 'function') {
-              ro = new ResizeObserver(() => {
-                measure()
+              ro = new ResizeObserver((entries) => {
+                // The bottom offset depends only on the SEAT (input card)
+                // height; bar resizes (the collapse animation) only refresh
+                // the dock clearance after the size settles. Filtering skips
+                // per-frame measuring during the animation entirely.
+                for (let k = 0; k < entries.length; k++) {
+                  if (entries[k].target === seat) { measure(); break }
+                }
                 if (dockTimer) clearTimeout(dockTimer)
                 dockTimer = setTimeout(() => {
                   dockTimer = null
@@ -2539,13 +2567,16 @@ window.__ModuleLoader__.load({
               if (viewerRef.node) viewerRef.node.style.setProperty('--dsh-fe-tabs-h', el.offsetHeight + 'px')
             }
           })
-          // v1.12: mirror the floating bar's height onto the viewer root so
-          // the diff scroll areas keep their bottom clearance in sync (the
-          // bar publishes store.dockH debounced, after its animation settles;
-          // this effect re-runs on every store-driven render).
+          // v1.12.1: write the clearance var directly from the dockH channel
+          // — no React re-render of this thousand-line view involved. The
+          // v1.12.0 render-driven effect made every bar resize reconcile the
+          // whole DiffPane tree (and the padding change reflow the editor),
+          // which is the toggle CPU spike being fixed.
           React.useEffect(() => {
-            if (viewerRef.node) viewerRef.node.style.setProperty('--dsh-fe-dock-h', (store.dockH || 0) + 'px')
-          })
+            const apply = () => { if (viewerRef.node) viewerRef.node.style.setProperty('--dsh-fe-dock-h', (store.dockH || 0) + 'px') }
+            apply()
+            return store.onDockH(apply)
+          }, [])
           const tabs = store.tabs
           const active = store.active
           const modified = store.modified
