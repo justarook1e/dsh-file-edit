@@ -21,6 +21,32 @@ $profileDir = Join-Path $homeDsh 'profiles\web'
 $pkgDir = Join-Path $profileDir 'node_modules\dsh-file-edit'
 $patchFile = Join-Path $profileDir 'cordis.patch.yml'
 
+if (-not (Test-Path -LiteralPath $profileDir)) {
+  throw "DSH profile dir not found: $profileDir`nSet DSH_HOME to your dsh home, or start DSH once to create it."
+}
+
+# Uninstall needs nothing from the repo: handle it BEFORE the bootstrap
+# download so removing the plugin never touches the network.
+if ($Uninstall) {
+  if (Test-Path -LiteralPath $pkgDir) {
+    Remove-Item -LiteralPath $pkgDir -Recurse -Force
+    "removed package: $pkgDir"
+  } else {
+    "package not installed — nothing to remove"
+  }
+  if (Test-Path -LiteralPath $patchFile) {
+    $text = [System.IO.File]::ReadAllText($patchFile)
+    if ($text -match 'id:\s*dsh-file-edit') {
+      $new = $text -replace '(?ms)^# dsh-file-edit:.*?^      name: dsh-file-edit[ \t]*\r?\n', ''
+      Write-TextUtf8NoBom -Path $patchFile -Text $new
+      "removed the dsh-file-edit insert block from cordis.patch.yml"
+    }
+  }
+  ""
+  "Uninstall done. Restart DSH to apply."
+  exit 0
+}
+
 # Where the package files come from:
 #  * run from a cloned repo / downloaded install.ps1 file -> $PSScriptRoot
 #  * run via `irm <url> | iex` (no script file on disk) -> download the
@@ -51,30 +77,6 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 function Write-TextUtf8NoBom {
   param([string]$Path, [string]$Text)
   [System.IO.File]::WriteAllText($Path, $Text, $utf8NoBom)
-}
-
-if (-not (Test-Path -LiteralPath $profileDir)) {
-  throw "DSH profile dir not found: $profileDir`nSet DSH_HOME to your dsh home, or start DSH once to create it."
-}
-
-if ($Uninstall) {
-  if (Test-Path -LiteralPath $pkgDir) {
-    Remove-Item -LiteralPath $pkgDir -Recurse -Force
-    "removed package: $pkgDir"
-  } else {
-    "package not installed — nothing to remove"
-  }
-  if (Test-Path -LiteralPath $patchFile) {
-    $text = [System.IO.File]::ReadAllText($patchFile)
-    if ($text -match 'id:\s*dsh-file-edit') {
-      $new = $text -replace '(?ms)^# dsh-file-edit:.*?^      name: dsh-file-edit[ \t]*\r?\n', ''
-      Write-TextUtf8NoBom -Path $patchFile -Text $new
-      "removed the dsh-file-edit insert block from cordis.patch.yml"
-    }
-  }
-  ""
-  "Uninstall done. Restart DSH to apply."
-  exit 0
 }
 
 foreach ($rel in @('package.json', 'host', 'client')) {
