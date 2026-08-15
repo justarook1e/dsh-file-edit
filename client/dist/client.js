@@ -470,7 +470,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.13.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.13.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -2511,6 +2511,10 @@ window.__ModuleLoader__.load({
           const e = m.undo.pop()
           if (!e) return
           m.redo.push(e)
+          // v1.13.2: the render that follows must repaint the row's text
+          // (React renders code rows as empty shells filled imperatively via
+          // refs; the ACTIVE row is skipped to protect in-progress typing).
+          m.activeIdx = null
           afterModelChange(m)
           m.pendingCaret = { line: Math.max(0, Math.min(m.lines.length - 1, e.line)), pos: e.pos }
         }
@@ -2519,6 +2523,7 @@ window.__ModuleLoader__.load({
           const e = m.redo.pop()
           if (!e) return
           m.undo.push(e)
+          m.activeIdx = null
           afterModelChange(m)
           m.pendingCaret = { line: Math.max(0, Math.min(m.lines.length - 1, e.line)), pos: e.pos }
         }
@@ -2531,6 +2536,7 @@ window.__ModuleLoader__.load({
             if (k >= 0 && k < m.lines.length && m.lines[k] !== '') patches.push({ line: k, start: 0, removed: '', inserted: '  ' })
           }
           if (patches.length) {
+            m.activeIdx = null
             pushEntry(m, patches, sel.caret.row, sel.caret.pos + 2)
             m.pendingCaret = { line: sel.caret.row, pos: sel.caret.pos + 2 }
           }
@@ -2547,6 +2553,7 @@ window.__ModuleLoader__.load({
           }
           if (patches.length) {
             const first = patches[0].removed.length
+            m.activeIdx = null
             pushEntry(m, patches, sel.caret.row, Math.max(0, sel.caret.pos - first))
             m.pendingCaret = { line: sel.caret.row, pos: Math.max(0, sel.caret.pos - first) }
           }
@@ -2558,6 +2565,7 @@ window.__ModuleLoader__.load({
           const patches = []
           if (flush) patches.push(flush)
           patches.push({ line: info.row, start: info.pos, removed: '', inserted: '\n' })
+          m.activeIdx = null
           pushEntry(m, patches, info.row + 1, 0)
           m.pendingCaret = { line: info.row + 1, pos: 0 }
         }
@@ -2570,6 +2578,7 @@ window.__ModuleLoader__.load({
           if (flush) patches.push(flush)
           // Removing ONLY the newline joins the two rows (both texts survive).
           patches.push({ line: info.row - 1, start: prev.length, removed: '\n', inserted: '' })
+          m.activeIdx = null
           pushEntry(m, patches, info.row - 1, prev.length)
           m.pendingCaret = { line: info.row - 1, pos: prev.length }
         }
@@ -2582,6 +2591,7 @@ window.__ModuleLoader__.load({
           const flush = flushLine(m, info.row)
           if (flush) patches.push(flush)
           patches.push({ line: info.row, start: cur.length, removed: '\n', inserted: '' })
+          m.activeIdx = null
           pushEntry(m, patches, info.row, cur.length)
           m.pendingCaret = { line: info.row, pos: cur.length }
         }
@@ -2613,6 +2623,7 @@ window.__ModuleLoader__.load({
         function discardModel(m) {
           m.undo = m.undo.slice(0, m.savedUndoLen || 0)
           m.redo = []
+          m.activeIdx = null
           afterModelChange(m)
           persistNow(m)
         }
@@ -2677,14 +2688,18 @@ window.__ModuleLoader__.load({
           }, [m])
           // Caret restore after structural changes (Enter split, undo/redo,
           // paste, indent, line merges, arrows). Typing never lands here —
-          // it mutates the DOM in place.
+          // it mutates the DOM in place. Also re-establishes the engine's
+          // active-row pointer (the ops clear it so the repaint refs run).
           React.useEffect(() => {
             if (!m || !m.pendingCaret) return
             const pc = m.pendingCaret
             m.pendingCaret = null
             const t = setTimeout(() => {
               const el = m.rowEls.get(pc.line)
-              if (el) setCaretEl(el, pc.pos)
+              if (el) {
+                m.activeIdx = pc.line
+                setCaretEl(el, pc.pos)
+              }
             }, 0)
             return () => clearTimeout(t)
           }, [m, modelVersion])
@@ -3098,6 +3113,7 @@ window.__ModuleLoader__.load({
                 const nl = text.lastIndexOf('\n')
                 const lastRow = nl < 0 ? info.row : info.row + text.split('\n').length - 1
                 const lastPos = nl < 0 ? info.pos + text.length : text.length - nl - 1
+                mm.activeIdx = null
                 pushEntry(mm, patches, lastRow, lastPos)
                 mm.pendingCaret = { line: lastRow, pos: lastPos }
               }
@@ -3140,9 +3156,29 @@ window.__ModuleLoader__.load({
             )
           }
           // Model row: editable span on top of the pointer-events:none
-          // highlight layer. React owns the initial text and rewrites it on
-          // model changes; keystrokes mutate the DOM and are committed into
-          // the model on blur/undo/save.
+          // highlight layer. v1.13.2: React renders BOTH as EMPTY shells and
+          // fills them imperatively through refs — React never owns the text
+          // or token nodes inside a code row. The browser's contentEditable
+          // (and our syncHl) mutate that DOM behind React's back; letting
+          // React reconcile those nodes threw "The node to be removed is not
+          // a child of this node" during commits, which unmounted the whole
+          // root (the file view "disappearing" on Ctrl+S) and silently
+          // updated detached text nodes (Ctrl+Z looking like a no-op).
+          const paintHl = (node, text, hlState) => {
+            const langId = node.getAttribute('data-lang') || ''
+            const toks = langId ? lineTokensCached(text, langId, hlState) : null
+            node.textContent = ''
+            if (toks) {
+              for (const t of toks) {
+                const s = document.createElement('span')
+                s.className = 'dsh-fe-tk' + (t.c ? ' dsh-fe-tk-' + t.c : '')
+                s.textContent = t.t
+                node.append(s)
+              }
+            } else {
+              node.textContent = text
+            }
+          }
           const renderModelRow = (r, cls, hlState) => {
             const text = r.text
             if (!m) {
@@ -3161,7 +3197,10 @@ window.__ModuleLoader__.load({
                   if (ed && ed.focus) ed.focus()
                 },
               },
-                React.createElement('span', { className: 'dsh-fe-hl', 'data-hl': '1', 'data-lang': lang || '', 'aria-hidden': 'true' }, tokSpans(text, hlState)),
+                React.createElement('span', {
+                  className: 'dsh-fe-hl', 'data-hl': '1', 'data-lang': lang || '', 'aria-hidden': 'true',
+                  ref: (node) => { if (node && m.activeIdx !== r.model) paintHl(node, text, hlState) },
+                }),
                 React.createElement('span', {
                   className: 'dsh-fe-tx dsh-fe-tx-edit',
                   contentEditable: true,
@@ -3169,7 +3208,13 @@ window.__ModuleLoader__.load({
                   spellCheck: false,
                   'data-m': String(r.model),
                   title: '可编辑：Ctrl+S 保存 · Ctrl+Z/Y 撤销/重做 · Tab/Shift+Tab 缩进 · Enter 换行',
-                  ref: (node) => { if (node) m.rowEls.set(r.model, node); else m.rowEls.delete(r.model) },
+                  ref: (node) => {
+                    if (!node) { m.rowEls.delete(r.model); return }
+                    m.rowEls.set(r.model, node)
+                    // The ACTIVE row (being typed) keeps its DOM text; every
+                    // other row syncs to the model text.
+                    if (m.activeIdx !== r.model && node.textContent !== text) node.textContent = text
+                  },
                   // v1.13.1: BOTH flags — editingRef guards payload deferral
                   // (DiffPane-local); m.activeIdx drives the engine's
                   // flushActive (undo/save commit the line being typed).
@@ -3179,7 +3224,7 @@ window.__ModuleLoader__.load({
                   onKeyDown: (ev) => {
                     if (ev.key === 'Escape') { ev.preventDefault(); ev.currentTarget.textContent = m.lines[r.model]; syncHl(ev.currentTarget); ev.currentTarget.blur() }
                   },
-                }, text)))
+                })))
           }
           // Large-but-text files: host ships a read-only preview head instead of hunks.
           if (diff.note === 'large' && diff.preview) {
