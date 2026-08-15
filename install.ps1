@@ -20,7 +20,23 @@ if ([string]::IsNullOrEmpty($homeDsh)) { $homeDsh = Join-Path $HOME '.dsh' }
 $profileDir = Join-Path $homeDsh 'profiles\web'
 $pkgDir = Join-Path $profileDir 'node_modules\dsh-file-edit'
 $patchFile = Join-Path $profileDir 'cordis.patch.yml'
-$srcDir = $PSScriptRoot
+
+# Where the package files come from:
+#  * run from a cloned repo / downloaded install.ps1 file -> $PSScriptRoot
+#  * run via `irm <url> | iex` (no script file on disk) -> download the
+#    package files from the GitHub repo first (self-bootstrap)
+if ([string]::IsNullOrEmpty($PSScriptRoot)) {
+  $srcDir = Join-Path $env:TEMP 'dsh-file-edit-download'
+  New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
+  New-Item -ItemType Directory -Force -Path (Join-Path $srcDir 'host'), (Join-Path $srcDir 'client\dist') | Out-Null
+  $base = 'https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main'
+  Invoke-WebRequest -UseBasicParsing -Uri "$base/package.json" -OutFile (Join-Path $srcDir 'package.json') | Out-Null
+  Invoke-WebRequest -UseBasicParsing -Uri "$base/host/index.mjs" -OutFile (Join-Path $srcDir 'host\index.mjs') | Out-Null
+  Invoke-WebRequest -UseBasicParsing -Uri "$base/client/dist/client.js" -OutFile (Join-Path $srcDir 'client\dist\client.js') | Out-Null
+  "downloaded package files from $base"
+} else {
+  $srcDir = $PSScriptRoot
+}
 
 $block = @"
 # dsh-file-edit: workspace file browser with agent-change review (host + client web plugin).

@@ -17,15 +17,16 @@ DSH WebUI 工作区文件插件：把 AI（agent）对文件的每次改动变�
 
 ## 一条命令安装（推荐）
 
-需要本机已登录 GitHub 凭据（Git Credential Manager）与 DSH（`~/.dsh/profiles/web` 存在）。PowerShell 中执行：
+需要本机已装 DSH（`~/.dsh/profiles/web` 存在）且能访问 GitHub。PowerShell 中执行：
 
 ```powershell
-git clone https://github.com/justarook1e/dsh-file-edit.git "$env:TEMP\dsh-file-edit"; & "$env:TEMP\dsh-file-edit\install.ps1"
+irm https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main/install.ps1 | iex
 ```
 
 完成后：**重启 DSH**（加载宿主插件与挂载项），然后 **Ctrl+F5 刷新页面**（加载客户端 bundle）。
 
-> 仓库当前是私有仓库，所以用 clone 方式安装（凭据自动走 Windows 凭据管理器）。若将仓库设为公开，可换成 `irm https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main/install.ps1 | iex`。
+> 备选（clone 方式，凭据走 Git Credential Manager）：
+> `git clone https://github.com/justarook1e/dsh-file-edit.git "$env:TEMP\dsh-file-edit"; & "$env:TEMP\dsh-file-edit\install.ps1"`
 
 ## 手动安装
 
@@ -44,17 +45,21 @@ git clone https://github.com/justarook1e/dsh-file-edit.git "$env:TEMP\dsh-file-e
 
 ## 更新
 
-重新拉取仓库后再次运行安装脚本即可（`install.ps1` 会覆盖已安装的包）：
+再次运行安装脚本即可（幂等，覆盖已安装的包）：
 
 ```powershell
-cd "$env:TEMP\dsh-file-edit"; git pull; & .\install.ps1
+irm https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main/install.ps1 | iex
 ```
+
+或（clone 方式）：`cd "$env:TEMP\dsh-file-edit"; git pull; & .\install.ps1`
 
 ## 卸载
 
 ```powershell
-& "$env:TEMP\dsh-file-edit\install.ps1" -Uninstall
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/justarook1e/dsh-file-edit/main/install.ps1))) -Uninstall
 ```
+
+或（clone 方式）：`& "$env:TEMP\dsh-file-edit\install.ps1" -Uninstall`
 
 或手动删除 `node_modules/dsh-file-edit/` 与 patch 里的 insert 块。重启后生效。
 
