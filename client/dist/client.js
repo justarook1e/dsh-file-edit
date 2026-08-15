@@ -464,7 +464,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.12.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.12.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -2527,7 +2527,10 @@ window.__ModuleLoader__.load({
                     ref: (node) => { hunkRefs[hIdx] = node },
                   },
                     React.createElement('div', { className: 'dsh-fe-hunk-head' },
-                      React.createElement('span', null, '第 ' + (b.h.oldStart + 1) + '–' + (b.h.oldStart + b.h.oldLen) + ' 行 → ' + (b.h.newStart + 1) + '–' + (b.h.newStart + b.h.newLen) + ' 行'),
+                      React.createElement('span', null,
+                        (b.h.oldLen === 0 ? ('第 ' + (b.h.oldStart + 1) + ' 行前') : ('第 ' + (b.h.oldStart + 1) + '–' + (b.h.oldStart + b.h.oldLen) + ' 行'))
+                        + ' → ' +
+                        (b.h.newLen === 0 ? ('第 ' + (b.h.newStart + 1) + ' 行前') : ('第 ' + (b.h.newStart + 1) + '–' + (b.h.newStart + b.h.newLen) + ' 行'))),
                       React.createElement('span', { className: 'dsh-fe-spacer' }, null),
                       React.createElement(IconBtn, { tone: 'ok', small: true, title: '接受此块修改', onClick: () => onHunk(b.h, 'accept'), icon: IconCheck }),
                       React.createElement(IconBtn, { tone: 'no', small: true, className: 'dsh-fe-pair', title: '拒绝此块修改', onClick: () => onHunk(b.h, 'reject'), icon: IconCross }),

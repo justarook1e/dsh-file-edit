@@ -172,10 +172,10 @@ export default {
         return [{ id: 'h0', oldStart: 0, oldLen: a.length, newStart: 0, newLen: b.length, newLines: b.slice() }]
       }
       const hunks = []
-      let eqA = 0, eqB = 0, i = 0
+      let i = 0
       while (i < ops.length) {
         const op = ops[i]
-        if (op.t === 'e') { eqA++; eqB++; i++; continue }
+        if (op.t === 'e') { i++; continue }
         const h = { oldStart: -1, oldLen: 0, newStart: -1, newLen: 0, newLines: [] }
         while (i < ops.length && ops[i].t !== 'e') {
           const o = ops[i]
@@ -183,8 +183,19 @@ export default {
           else { if (h.newStart < 0) h.newStart = o.j; h.newLen++; h.newLines.push(b[o.j]) }
           i++
         }
-        if (h.oldStart < 0) h.oldStart = eqA
-        if (h.newStart < 0) h.newStart = eqB
+        // The fallbacks below must NOT use eqA/eqB: the common prefix/suffix
+        // is trimmed inside myersOps, so the ops array holds no equal ops
+        // and eqA/eqB stay 0 for every trimmed diff. For a pure run the
+        // missing coordinate equals the present one — the trimmed prefix
+        // aligns both files up to the change point, so:
+        //   pure deletion (oldStart set, newStart unset) → newStart = oldStart
+        //   pure insertion (newStart set, oldStart unset) → oldStart = newStart
+        // (The old `= eqA` / `= eqB` fallbacks produced 0 for ANY pure
+        // deletion/insertion: a deleted line's hunk claimed newStart 0, so
+        // the client rendered it at the very top; and an accepted insertion
+        // hunk merged at the top of the file.)
+        if (h.oldStart < 0) h.oldStart = h.newStart
+        if (h.newStart < 0) h.newStart = h.oldStart
         hunks.push(h)
       }
       for (let k = 0; k < hunks.length; k++) hunks[k].id = 'h' + k
