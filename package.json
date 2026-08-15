@@ -1,0 +1,21 @@
+{
+  "name": "dsh-file-edit",
+  "version": "1.10.0",
+  "description": "Workspace file browser with agent-change review (accept/reject + undo), inline editing, diff view and rendered markdown (static host+client plugin)",
+  "type": "module",
+  "main": "host/index.mjs",
+  "exports": {
+    ".": "./host/index.mjs",
+    "./client": "./client/dist/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "private": true
+}
