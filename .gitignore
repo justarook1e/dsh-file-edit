@@ -1,0 +1,3 @@
+# Local-only files — never publish to the repository
+dsh-file-edit-plugin-status.md
+diff-test.py
