@@ -441,7 +441,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.11.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.11.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -1001,7 +1001,6 @@ window.__ModuleLoader__.load({
           // the poll no longer runs an immediate first tick.
           React.useEffect(() => { if (sid) void refresh() }, [sid])
           const [files, setFiles] = React.useState(null)
-          const [busy, setBusy] = React.useState(false)
           const [error, setError] = React.useState(null)
           const [undo, setUndo] = React.useState(null)
           const [dismissed, setDismissed] = React.useState(null)
@@ -1014,9 +1013,13 @@ window.__ModuleLoader__.load({
           const [rowSet, setRowSet] = React.useState([])
           const animRef = React.useState({ t: null })[0]
           React.useEffect(() => () => { if (animRef.t) clearTimeout(animRef.t) }, [])
+          // v1.11.2: background refreshes are SILENT — no busy state, no
+          // flickering "…" next to the file count. The old busy span toggled
+          // on every poll tick (every 1.5s while the agent runs), and its
+          // insert/remove shifted the flex layout so the centered collapse
+          // button visibly jumped in sync.
           const refresh = async () => {
             if (!sid) return
-            setBusy(true)
             const r = await call('getModified', { sessionId: sid })
             if (r.ok) {
               const next = r.files || []
@@ -1042,7 +1045,6 @@ window.__ModuleLoader__.load({
               store.setModified([])
               setUndo(null)
             }
-            setBusy(false)
           }
           usePoll(refresh, () => pollDelayFor(sid))
           // Immediate refresh when the file view changes review state (hunk
@@ -1053,22 +1055,18 @@ window.__ModuleLoader__.load({
           React.useEffect(() => { if (refreshTick) void refresh() }, [refreshTick])
           const doUndo = async () => {
             if (!sid) return
-            setBusy(true)
             setError(null)
             const r = await call('undoReject', { sessionId: sid })
             if (!r.ok) setError(r.error || r.message || '撤销失败')
             else if (r.skipped && r.skipped.length > 0) setError('部分文件未撤销：已被再次修改（' + r.skipped.length + ' 个）')
             await refresh()
-            setBusy(false)
           }
           const actAll = async (method) => {
             if (!sid) return
-            setBusy(true)
             const r = await call(method, { sessionId: sid })
             if (!r.ok) setError(r.error || r.message || '操作失败')
             await refresh()
             store.requestRefresh()
-            setBusy(false)
           }
           const list = files || []
           const undoFresh = undo && undo.opId !== dismissed && Date.now() - undo.ts < 30000
@@ -1078,7 +1076,6 @@ window.__ModuleLoader__.load({
           const head = React.createElement('div', { className: 'dsh-fe-bar-head' },
             React.createElement('span', { className: 'dsh-fe-bar-title' }, IconPencil(), '修改的文件'),
             React.createElement('span', { className: 'dsh-fe-bar-count' }, String(list.length)),
-            busy ? React.createElement('span', { className: 'dsh-fe-stats' }, '…') : null,
             React.createElement('span', { className: 'dsh-fe-spacer' }, null),
             // v1.8.1: centered between the left group and the action buttons;
             // the glyph shows what CLICKING will do (expanded → collapse down,
