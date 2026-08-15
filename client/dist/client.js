@@ -1946,6 +1946,11 @@ window.__ModuleLoader__.load({
         // Loaded fully offline: zero network requests, no CDN, no external
         // service. The default preset adds GFM tables + strikethrough.
         // ==== markdown-it vendored (do not edit) ====
+        // markdown-it v15.0.0 — Copyright (c) 2014 Vitaly Puzrin, Alex Kocharin.
+        // MIT License — https://github.com/markdown-it/markdown-it/blob/master/LICENSE
+        // Bundled inside this UMD build: linkify-it (c) 2015 Vitaly Puzrin,
+        // mdurl (c) 2015 Vitaly Puzrin, Alex Kocharin, uc.micro (c) 2015
+        // Vitaly Puzrin — all MIT. Full license texts: THIRD_PARTY_LICENSES.md.
         const MarkdownIt = (() => {
           // Local CommonJS shim: the vendored UMD build picks its CommonJS
           // branch only when it SEES `module` — without this shim the browser

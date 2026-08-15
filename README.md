@@ -80,3 +80,9 @@ dsh-file-edit/
 - 大文件不做行级 diff：>512KB 或 >8000 行标为 `large`（≤512KB 的文本可只读预览前 4000 行）；二进制 ≤4MB 可拒绝还原。
 - shell/pwsh 命令不透明，执行期间的变更会保守地全部归入审阅（无法区分同窗口内的手动操作）。
 - 基线随插件重启重建（待审状态本身持久化）。
+
+## 许可证
+
+本项目以 **MIT License** 发布（见 [LICENSE](LICENSE)）。
+
+客户端 bundle（`client/dist/client.js`）内嵌了 [markdown-it](https://github.com/markdown-it/markdown-it) v15.0.0 的浏览器 UMD 构建，其中包含 linkify-it、mdurl、uc.micro。这些依赖同样以 MIT 发布，其版权声明与完整许可证文本见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
