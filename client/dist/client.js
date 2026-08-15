@@ -464,7 +464,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.12.4: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.12.5: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -2217,6 +2217,10 @@ window.__ModuleLoader__.load({
           const diffRef = React.useState({ node: null })[0]
           const scrollGate = React.useState({ pending: false })[0]
           const editingRef = React.useState({ idx: null })[0]
+          // v1.12.5: timer for the post-jump caret placement (smooth scroll
+          // must settle before the range is moved onto the target line).
+          const jumpTimer = React.useState({ t: null })[0]
+          React.useEffect(() => () => { if (jumpTimer.t) clearTimeout(jumpTimer.t) }, [])
           // v1.9.4: the CURRENT path, mirrored every render. fetch responses
           // are dropped when the user has since switched tabs — a late
           // response for the previous file must never overwrite the view of
@@ -2472,12 +2476,13 @@ window.__ModuleLoader__.load({
           // element that ACTUALLY scrolls. The shell's chat scroller — not
           // window — owns page scrolling, so the ancestor walk finds it; the
           // internal diff viewport is preferred when the pane is bounded.
-          // v1.12.3: prev/next no longer step from the tracked focus index —
-          // they resolve the line the user is actually parked at (the pane's
-          // top visible line) and jump to the first hunk strictly BELOW it
-          // (next) / strictly ABOVE it (prev), wrapping around. The tracked
-          // index still drives the counter + current-hunk highlight, and
-          // syncs from the landing jump and from manual scroll.
+          // v1.12.5: prev/next resolve the EDIT AREA'S INSERTION POINT (the
+          // selection anchor line) and jump to the first hunk strictly BELOW
+          // it (next) / strictly ABOVE it (prev), wrapping around; after the
+          // jump the caret is moved onto the landed line so the next click
+          // continues from there. No insertion point → treat as "before the
+          // first line" (next → first hunk, prev → last hunk). The tracked
+          // focus index drives the counter + current-hunk highlight only.
           const pickHunkFromTop = (positions, topLine, dir) => {
             const total = positions.length
             if (total === 0) return -1
@@ -2488,39 +2493,28 @@ window.__ModuleLoader__.load({
             for (let k = total - 1; k >= 0; k--) if (positions[k] < topLine) return k
             return total - 1
           }
-          const topLineAt = () => {
+          // v1.12.5: pure insertion-point semantics (user-chosen over the
+          // v1.12.4 scroll-probe). The jump position is the edit area's
+          // selection anchor line — the caret of an editable row, or a text
+          // selection on a read-only row (both live inside the diff scroller).
+          // Scrolling alone does NOT move this position. No anchor inside the
+          // edit area returns 0; jumpRel then treats the position as "before
+          // the first line" (next → first hunk, prev → wrap to the last).
+          const caretLineAt = () => {
             const sc = diffRef.node
-            if (!sc || typeof document === 'undefined' || typeof document.elementFromPoint !== 'function') return 1
-            const r = sc.getBoundingClientRect()
-            // v1.12.4: probe the diff scroller's VISIBLE region, not the
-            // pane's top edge. In the chat-column scroll layout (this
-            // environment's actual scroller — v1.8.2) the pane scrolls with
-            // the page: once the user parks deep in the file, the pane's top
-            // edge is far above the viewport and every probe coordinate fell
-            // outside the screen → elementFromPoint returned null → topLineAt
-            // always fell back to 1 → "next" always targeted the first hunk.
-            // The scroller's own rect moves with the page, so clamp the probe
-            // band to its on-screen slice: below the stuck header stack in
-            // page mode, or right below the scroller's top edge when the diff
-            // scrolls internally (headers live outside the scroller there).
-            const internal = sc.scrollHeight > sc.clientHeight + 1
-            const headerH = internal ? 0 : ((store.tabH || 32) + (store.toolH || 35))
-            const vw = typeof window !== 'undefined' ? window.innerWidth : 100000
-            const vh = typeof window !== 'undefined' ? window.innerHeight : 100000
-            const x = Math.min(Math.max(r.left + 8, 0), vw - 2)
-            const startY = Math.max(r.top, headerH) + 2
-            const endY = Math.min(r.bottom - 2, vh - 2, startY + 118)
-            for (let y = startY; y <= endY; y += 7) {
-              let el = null
-              try { el = document.elementFromPoint(x, y) } catch (e) {}
-              if (!el || typeof el.closest !== 'function') continue
-              const line = el.closest('.dsh-fe-line')
-              if (line) {
-                const n = Number(line.getAttribute('data-n'))
-                if (n > 0) return n
-              }
-            }
-            return 1
+            if (!sc || typeof window === 'undefined') return 0
+            let sel = null
+            try { sel = window.getSelection && window.getSelection() } catch (e) {}
+            if (!sel || sel.rangeCount === 0) return 0
+            const anchor = sel.anchorNode
+            let el = anchor
+            if (el && el.nodeType !== 1) el = el.parentElement
+            if (!el || typeof el.closest !== 'function') return 0
+            if (!sc.contains(el)) return 0
+            const line = el.closest('.dsh-fe-line')
+            if (!line) return 0
+            const n = Number(line.getAttribute('data-n'))
+            return n > 0 ? n : 0
           }
           const jumpTo = (k) => {
             const total = hunks.length
@@ -2550,11 +2544,42 @@ window.__ModuleLoader__.load({
             } catch (e) {
               try { scroller.scrollTop = Math.max(0, target) } catch (e2) { try { node.scrollIntoView() } catch (e3) {} }
             }
+            // v1.12.5: after the smooth scroll settles, move the edit-area
+            // insertion point onto the target hunk's first editable line
+            // (deletion-only hunks have none — land on the first editable
+            // line right after the hunk instead) so the next prev/next
+            // click continues from the landed position.
+            if (jumpTimer.t) clearTimeout(jumpTimer.t)
+            jumpTimer.t = setTimeout(() => {
+              jumpTimer.t = null
+              const targetNode = hunkRefs[idx]
+              if (!targetNode) return
+              let editable = targetNode.querySelector('.dsh-fe-tx-edit')
+              if (!editable && targetNode.nextElementSibling) {
+                editable = targetNode.nextElementSibling.querySelector('.dsh-fe-tx-edit')
+              }
+              if (!editable) return
+              try {
+                editable.focus({ preventScroll: true })
+                const sel = window.getSelection()
+                if (sel) {
+                  sel.removeAllRanges()
+                  const range = document.createRange()
+                  range.selectNodeContents(editable)
+                  range.collapse(true)
+                  sel.addRange(range)
+                }
+              } catch (e) {}
+            }, 300)
           }
           const jumpRel = (dir) => {
             if (hunks.length === 0) return
             const positions = hunks.map((h) => h.newStart + 1)
-            const t = pickHunkFromTop(positions, topLineAt(), dir)
+            const caret = caretLineAt()
+            // No insertion point in the edit area: position = "before the
+            // first line" → next lands on the first hunk, prev wraps to the
+            // last (user-confirmed behavior).
+            const t = pickHunkFromTop(positions, caret > 0 ? caret : 0, dir)
             if (t >= 0) jumpTo(t)
           }
           const onDiffScroll = () => {
@@ -2581,8 +2606,8 @@ window.__ModuleLoader__.load({
           // Only exists while the file has diff changes; disappears with them.
           const jump = hunks.length > 0 ? React.createElement('div', { className: 'dsh-fe-jump' },
             React.createElement('span', { className: 'dsh-fe-jump-count' }, (curFocus + 1) + ' / ' + hunks.length),
-            React.createElement('button', { type: 'button', className: 'dsh-fe-jump-btn', title: '上一处变更（按当前视图停留位置向上查找，循环）', onClick: () => jumpRel('prev') }, IconChevUp(), '上一处'),
-            React.createElement('button', { type: 'button', className: 'dsh-fe-jump-btn', title: '下一处变更（按当前视图停留位置向下查找，循环）', onClick: () => jumpRel('next') }, '下一处', IconChevDown()),
+            React.createElement('button', { type: 'button', className: 'dsh-fe-jump-btn', title: '上一处变更（以编辑区插入点所在行为基准向上查找，循环；无插入点时到最后一块）', onClick: () => jumpRel('prev') }, IconChevUp(), '上一处'),
+            React.createElement('button', { type: 'button', className: 'dsh-fe-jump-btn', title: '下一处变更（以编辑区插入点所在行为基准向下查找，循环；无插入点时到第一块）', onClick: () => jumpRel('next') }, '下一处', IconChevDown()),
           ) : null
           return React.createElement('div', { className: 'dsh-fe-pane', ref: (node) => { paneRef.node = node } },
             toolbar,
