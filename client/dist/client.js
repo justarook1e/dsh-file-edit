@@ -1,4 +1,4 @@
-// dsh-file-edit — static client bundle (web plugin).
+﻿// dsh-file-edit — static client bundle (web plugin).
 // Loaded by the client module system as a classic script; registers a factory
 // via window.__ModuleLoader__.load. The factory body runs at materialization;
 // require('react') resolves through the shell's static module table.
@@ -470,7 +470,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.13.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.13.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -2725,6 +2725,10 @@ window.__ModuleLoader__.load({
             const d = depth || 0
             if (pathRef.path !== path) return
             editingRef.idx = null
+            // v1.13.1: the model reconciliation replaces rows, so the engine's
+            // active-row pointer must not survive into the new DOM.
+            const mAny = editModels.get(editKeyOf(r.root || store.root, path))
+            if (mAny) mAny.activeIdx = null
             // Clean markdown renders read-only (no model); PENDING markdown
             // keeps the diff/审阅 view whose lines stay editable.
             const editable = !r.deleted && !r.zero && !r.note && (lang !== 'markdown' || r.changed === true)
@@ -2997,6 +3001,7 @@ window.__ModuleLoader__.load({
             const mm = modelRef.m
             if (!mm) return
             editingRef.idx = null
+            mm.activeIdx = null
             const caret = selectionOffsetIn(el)
             const patch = flushLine(mm, idx)
             if (patch) pushEntry(mm, [patch], idx, caret)
@@ -3165,7 +3170,10 @@ window.__ModuleLoader__.load({
                   'data-m': String(r.model),
                   title: '可编辑：Ctrl+S 保存 · Ctrl+Z/Y 撤销/重做 · Tab/Shift+Tab 缩进 · Enter 换行',
                   ref: (node) => { if (node) m.rowEls.set(r.model, node); else m.rowEls.delete(r.model) },
-                  onFocus: () => { editingRef.idx = r.model },
+                  // v1.13.1: BOTH flags — editingRef guards payload deferral
+                  // (DiffPane-local); m.activeIdx drives the engine's
+                  // flushActive (undo/save commit the line being typed).
+                  onFocus: () => { editingRef.idx = r.model; m.activeIdx = r.model },
                   onBlur: (ev) => { commitRow(ev.currentTarget) },
                   onInput: (ev) => { syncHl(ev.currentTarget); markTyping(m) },
                   onKeyDown: (ev) => {

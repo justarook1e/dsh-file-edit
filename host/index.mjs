@@ -692,9 +692,28 @@ export default {
     }
 
     // ---------- mutations ----------
+    // v1.13.1: the cached st.policy can be null (state restored from disk and
+    // no scan ran since the restart — getDiff serves from the restored map,
+    // so resolveSession never refreshed it) or empty (resolve threw). Passing
+    // null/empty to the fs service makes it fall back to the AGENTLESS policy
+    // (deployment default + fallback root = the DSH process cwd), which denies
+    // writes that are actually inside the session workspace — the observed
+    // "file access denied under workspace-write mode" on Ctrl+S. Re-resolve
+    // the session's CURRENT policy for every mutation; fall back to the cached
+    // one only when the session is unavailable.
+    function freshPolicy(st) {
+      try {
+        const session = sessions.get(st.sid)
+        if (session) {
+          const p = sandboxPolicy.resolve({ session })
+          if (p && p.mode) return p
+        }
+      } catch (e) {}
+      return st.policy ?? undefined
+    }
     async function writeFile(st, rel, content) {
       const target = await fs.resolve(joinPath(st.root, rel))
-      const outcome = await fs.writeText(target, content, undefined, undefined, st.policy)
+      const outcome = await fs.writeText(target, content, undefined, undefined, freshPolicy(st))
       return outcome
     }
     async function deleteFile(st, rel) {
@@ -713,15 +732,17 @@ export default {
       const alternate = isWin
         ? 'rm -f -- ' + bashQuote(p)
         : 'Remove-Item -LiteralPath ' + psQuote(p) + ' -Force'
+      // v1.13.1: same null-policy hazard as writeFile — resolve fresh.
+      const policy = freshPolicy(st)
       let result
       try {
-        result = await shell.run(shell.resolve({ command: primary, sandboxPolicy: st.policy }))
+        result = await shell.run(shell.resolve({ command: primary, sandboxPolicy: policy }))
       } catch (e) {
         result = undefined
       }
       if (!result || result.exitCode !== 0) {
         try {
-          result = await shell.run(shell.resolve({ command: alternate, sandboxPolicy: st.policy }))
+          result = await shell.run(shell.resolve({ command: alternate, sandboxPolicy: policy }))
         } catch (e) {
           result = undefined
         }
