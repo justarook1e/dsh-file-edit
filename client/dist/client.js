@@ -89,6 +89,16 @@ window.__ModuleLoader__.load({
             const v = Number(n) || 0
             if (v !== this.treeStamp) { this.treeStamp = v; this.emit() }
           },
+          // v1.12: the modified bar floats over the file view's bottom edge
+          // ONLY while the file editor is the active conversation view; the
+          // chat and trajectory views keep the classic in-flow layout.
+          // dockH = measured height of the floating bar (px), published to
+          // FileView as --dsh-fe-dock-h so the diff scroll areas reserve
+          // clearance for the panel.
+          fileViewActive: false,
+          dockH: 0,
+          setFileViewActive(v) { if (!!v !== this.fileViewActive) { this.fileViewActive = !!v; this.emit() } },
+          setDockH(n) { const v = Math.round(Number(n) || 0); if (v !== this.dockH) { this.dockH = v; this.emit() } },
           requestRefresh() { this.refreshTick++; this.emit() },
           emit() { this.rev++; const subs = Array.from(this.subs); for (const f of subs) { try { f() } catch (e) {} } },
           subscribe(f) { this.subs.add(f); return () => { this.subs.delete(f) } },
@@ -441,7 +451,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.11.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.12.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -693,6 +703,24 @@ window.__ModuleLoader__.load({
           '.dsh-fe-hunk:hover { outline-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 40%, transparent); }',
           '.dsh-fe-hunk.dsh-fe-hunk-cur { outline-color:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 55%, transparent); }',
           '@media (prefers-reduced-motion: reduce) { .dsh-fe-tab-x,.dsh-fe-jump-btn,.dsh-fe-tx-edit,.dsh-fe-hunk { transition:none; } }',
+          // ---- v1.12: floating modified bar over the file view ----
+          // With the file editor active, the bar overlays the editor's bottom
+          // edge (absolute inside the sticky composer seat; the bottom offset
+          // is measured at runtime against the zero-height dock anchor) so
+          // toggling it never reflows the view area: the seat keeps the
+          // input-card height and the shell's 36px fade band stays pinned
+          // above the InputBar. Chat/trajectory views never get this class
+          // and keep the classic in-flow layout.
+          '.dsh-fe-dock-anchor { display:block; height:0; }',
+          '.dsh-fe-bar-overlay { position:absolute; left:0; right:0; margin:0 auto; z-index:8; max-height:40vh; }',
+          '.dsh-fe-bar-overlay .dsh-fe-body { min-height:0; }',
+          '.dsh-fe-bar-overlay .dsh-fe-body-inner { overflow-y:auto; }',
+          // The editor's scroll areas reserve the floating bar's height so
+          // the last lines scroll clear of the panel. dockH is published as
+          // --dsh-fe-dock-h by FileView (debounced to settle after the
+          // collapse animation) and is 0 outside the file view.
+          '.dsh-fe-diff { padding-bottom:var(--dsh-fe-dock-h, 0px); }',
+          '.dsh-fe-mdwrap { padding-bottom:calc(48px + var(--dsh-fe-dock-h, 0px)); }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -1013,6 +1041,13 @@ window.__ModuleLoader__.load({
           const [rowSet, setRowSet] = React.useState([])
           const animRef = React.useState({ t: null })[0]
           React.useEffect(() => () => { if (animRef.t) clearTimeout(animRef.t) }, [])
+          // v1.12: overlay posture plumbing. The anchor is a zero-height
+          // in-flow span that keeps the dock row measurable; the bar root
+          // gets position:absolute (class) + a measured `bottom` offset so it
+          // floats above the InputBar without occupying seat flow space.
+          const barRef = React.useState({ node: null })[0]
+          const anchorRef = React.useState({ node: null })[0]
+          const [overlayBottom, setOverlayBottom] = React.useState(null)
           // v1.11.2: background refreshes are SILENT — no busy state, no
           // flickering "…" next to the file count. The old busy span toggled
           // on every poll tick (every 1.5s while the agent runs), and its
@@ -1072,7 +1107,52 @@ window.__ModuleLoader__.load({
           const undoFresh = undo && undo.opId !== dismissed && Date.now() - undo.ts < 30000
           // The bar stays mounted while leaving rows animate out (rowSet may
           // still hold them when the logical list is already empty).
-          if (!sid || (rowSet.length === 0 && !undoFresh)) return null
+          const visible = !!(sid && (rowSet.length > 0 || undoFresh))
+          const overlay = store.fileViewActive
+          // v1.12: overlay measurement. The bar's bottom offset = seat bottom
+          // − anchor bottom (the anchor rides the zero-height dock row right
+          // above the InputBar). The dock height publication is DEBOUNCED:
+          // the collapse animation resizes the bar every frame; publishing
+          // per frame would animate the editor's bottom padding (a layout
+          // pass) in lockstep — the exact jank this design removes. Publish
+          // once after the size settles. useLayoutEffect so the offset lands
+          // before paint (no in-flow flash on the first overlay frame).
+          React.useLayoutEffect(() => {
+            if (!overlay || !visible) { setOverlayBottom(null); store.setDockH(0); return }
+            const bar = barRef.node
+            const anchor = anchorRef.node
+            const seat = bar ? bar.offsetParent : null
+            if (!bar || !anchor || !seat) return
+            const measure = () => {
+              const seatRect = seat.getBoundingClientRect()
+              const anchorRect = anchor.getBoundingClientRect()
+              setOverlayBottom(Math.max(0, Math.round(seatRect.bottom - anchorRect.bottom)))
+            }
+            let dockTimer = null
+            let ro = null
+            if (typeof ResizeObserver === 'function') {
+              ro = new ResizeObserver(() => {
+                measure()
+                if (dockTimer) clearTimeout(dockTimer)
+                dockTimer = setTimeout(() => {
+                  dockTimer = null
+                  store.setDockH(Math.round(bar.getBoundingClientRect().height))
+                }, 150)
+              })
+              ro.observe(seat)
+              ro.observe(bar)
+            }
+            measure()
+            store.setDockH(Math.round(bar.getBoundingClientRect().height))
+            window.addEventListener('resize', measure)
+            return () => {
+              if (dockTimer) clearTimeout(dockTimer)
+              if (ro) ro.disconnect()
+              window.removeEventListener('resize', measure)
+              store.setDockH(0)
+            }
+          }, [overlay, visible])
+          if (!visible) return null
           const head = React.createElement('div', { className: 'dsh-fe-bar-head' },
             React.createElement('span', { className: 'dsh-fe-bar-title' }, IconPencil(), '修改的文件'),
             React.createElement('span', { className: 'dsh-fe-bar-count' }, String(list.length)),
@@ -1102,10 +1182,18 @@ window.__ModuleLoader__.load({
                 className: 'dsh-fe-anim' + (r.leaving ? ' dsh-fe-row-leave' : (r.enter ? ' dsh-fe-row-enter' : '')),
               }, React.createElement(FileRow, { item: r.item, sid: sid, onDone: refresh, onError: setError })))),
           ]
-          return React.createElement('div', { className: 'dsh-fe-bar' + (collapsed ? ' dsh-fe-bar-collapsed' : '') },
-            head,
-            React.createElement('div', { className: 'dsh-fe-body' },
-              React.createElement('div', { className: 'dsh-fe-body-inner' }, bodyInner)),
+          const barStyle = overlay && overlayBottom !== null ? { bottom: overlayBottom + 'px' } : null
+          return React.createElement(React.Fragment, null,
+            React.createElement('span', { ref: (node) => { anchorRef.node = node }, className: 'dsh-fe-dock-anchor' }),
+            React.createElement('div', {
+              ref: (node) => { barRef.node = node },
+              className: 'dsh-fe-bar' + (collapsed ? ' dsh-fe-bar-collapsed' : '') + (overlay ? ' dsh-fe-bar-overlay' : ''),
+              style: barStyle,
+            },
+              head,
+              React.createElement('div', { className: 'dsh-fe-body' },
+                React.createElement('div', { className: 'dsh-fe-body-inner' }, bodyInner)),
+            ),
           )
         }
 
@@ -2432,6 +2520,12 @@ window.__ModuleLoader__.load({
           const sid = props.sessionId
           useStore()
           React.useEffect(() => { if (sid) store.setSessionId(sid) }, [sid])
+          // v1.12: the shell renders ONLY the active conversation view
+          // (ConversationSession's renderSlot passes `only: active.id`), so
+          // this component's mount ⟺ the 文件 view is active. The flag drives
+          // the modified bar's overlay posture — floating over the editor's
+          // bottom edge here, classic in-flow layout on 对话/轨迹.
+          React.useEffect(() => { store.setFileViewActive(true); return () => store.setFileViewActive(false) }, [])
           const [dragIdx, setDragIdx] = React.useState(null)
           // v1.8.1: sticky header heights. The tabs bar pins to the top of
           // the scrollport; its measured height feeds the toolbar/jump
@@ -2444,6 +2538,13 @@ window.__ModuleLoader__.load({
               store.tabH = el.offsetHeight
               if (viewerRef.node) viewerRef.node.style.setProperty('--dsh-fe-tabs-h', el.offsetHeight + 'px')
             }
+          })
+          // v1.12: mirror the floating bar's height onto the viewer root so
+          // the diff scroll areas keep their bottom clearance in sync (the
+          // bar publishes store.dockH debounced, after its animation settles;
+          // this effect re-runs on every store-driven render).
+          React.useEffect(() => {
+            if (viewerRef.node) viewerRef.node.style.setProperty('--dsh-fe-dock-h', (store.dockH || 0) + 'px')
           })
           const tabs = store.tabs
           const active = store.active

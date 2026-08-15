@@ -1,6 +1,6 @@
 {
   "name": "dsh-file-edit",
-  "version": "1.11.2",
+  "version": "1.12.0",
   "description": "Workspace file browser with agent-change review (accept/reject + undo), inline editing, diff view and rendered markdown (static host+client plugin)",
   "type": "module",
   "main": "host/index.mjs",
