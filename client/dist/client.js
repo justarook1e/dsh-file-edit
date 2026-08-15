@@ -464,7 +464,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.12.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.12.4: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -2489,16 +2489,30 @@ window.__ModuleLoader__.load({
             return total - 1
           }
           const topLineAt = () => {
-            const pane = paneRef.node
-            if (!pane) return 1
-            const rect = pane.getBoundingClientRect()
-            // Probe below the pane's top edge: the toolbar (and the zero-height
-            // jump strip) may sit there; the first .dsh-fe-line hit is the row
-            // the user is visually parked at. content-visibility guarantees
-            // visible rows are rendered, so elementFromPoint resolves them.
-            for (let y = rect.top + 2; y <= rect.top + 120; y += 7) {
+            const sc = diffRef.node
+            if (!sc || typeof document === 'undefined' || typeof document.elementFromPoint !== 'function') return 1
+            const r = sc.getBoundingClientRect()
+            // v1.12.4: probe the diff scroller's VISIBLE region, not the
+            // pane's top edge. In the chat-column scroll layout (this
+            // environment's actual scroller — v1.8.2) the pane scrolls with
+            // the page: once the user parks deep in the file, the pane's top
+            // edge is far above the viewport and every probe coordinate fell
+            // outside the screen → elementFromPoint returned null → topLineAt
+            // always fell back to 1 → "next" always targeted the first hunk.
+            // The scroller's own rect moves with the page, so clamp the probe
+            // band to its on-screen slice: below the stuck header stack in
+            // page mode, or right below the scroller's top edge when the diff
+            // scrolls internally (headers live outside the scroller there).
+            const internal = sc.scrollHeight > sc.clientHeight + 1
+            const headerH = internal ? 0 : ((store.tabH || 32) + (store.toolH || 35))
+            const vw = typeof window !== 'undefined' ? window.innerWidth : 100000
+            const vh = typeof window !== 'undefined' ? window.innerHeight : 100000
+            const x = Math.min(Math.max(r.left + 8, 0), vw - 2)
+            const startY = Math.max(r.top, headerH) + 2
+            const endY = Math.min(r.bottom - 2, vh - 2, startY + 118)
+            for (let y = startY; y <= endY; y += 7) {
               let el = null
-              try { el = document.elementFromPoint(rect.left + 8, y) } catch (e) {}
+              try { el = document.elementFromPoint(x, y) } catch (e) {}
               if (!el || typeof el.closest !== 'function') continue
               const line = el.closest('.dsh-fe-line')
               if (line) {
