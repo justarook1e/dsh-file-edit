@@ -441,7 +441,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.10.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.11.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -652,6 +652,23 @@ window.__ModuleLoader__.load({
           '.dsh-fe-md tr:nth-child(2n) td { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 3%, transparent); }',
           '.dsh-fe-md hr { border:none; border-top:1px solid var(--dsw-alias-border-l1); margin:1.3em 0; }',
           '.dsh-fe-md img { max-width:100%; border-radius:6px; }',
+          // ---- v1.11: sidebar vertical rhythm (taller rows + gaps) and
+          // session recency labels ----
+          // The workspace column was too dense: rows grow a couple of px and
+          // gain a small vertical gap so the tree breathes (workspace blocks,
+          // section headers, session rows and file rows alike).
+          '.dsh-fe-wslist { padding:6px 0; }',
+          '.dsh-fe-ws-item { margin-bottom:4px; }',
+          '.dsh-fe-ws-item:last-child { margin-bottom:0; }',
+          '.dsh-fe-ws-row { padding:6px 8px; }',
+          '.dsh-fe-sec { padding:5px 8px 5px 22px; margin:2px 0; }',
+          '.dsh-fe-sess { padding:5px 8px 5px 40px; margin:1px 0; }',
+          '.dsh-fe-row { padding:4px 8px; margin:1px 0; }',
+          '.dsh-fe-newbtn { margin:3px 8px 3px 40px; padding:3px 10px; }',
+          '.dsh-fe-search { margin:4px 0 8px 40px; padding:3px 8px; }',
+          // Session time labels sit at the right edge of each history row
+          // (the name span's flex:1 already pushes them there).
+          '.dsh-fe-sess-time { flex:none; margin-left:6px; font-size:11px; color:var(--dsw-alias-label-secondary); font-family:ui-monospace,Consolas,monospace; white-space:nowrap; }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -742,6 +759,22 @@ window.__ModuleLoader__.load({
           )
         }
 
+        // v1.11: compact relative-age label for session rows ("2 min",
+        // "1 hr", "1 day" — bucket style matching the user's requested
+        // format; no plural suffixes by design).
+        const timeAgo = (ts, now) => {
+          const t = Number(ts)
+          if (!t) return ''
+          const MIN = 60000, HOUR = 3600000, DAY = 86400000
+          const diff = Math.max(0, now - t)
+          if (diff < MIN) return 'now'
+          if (diff < HOUR) return Math.floor(diff / MIN) + ' min'
+          if (diff < DAY) return Math.floor(diff / HOUR) + ' hr'
+          if (diff < 30 * DAY) return Math.floor(diff / DAY) + ' day'
+          if (diff < 365 * DAY) return Math.floor(diff / (30 * DAY)) + ' mo'
+          return Math.floor(diff / (365 * DAY)) + ' yr'
+        }
+
         // ---------- sidebar workspace tree ----------
         function WorkspaceNode(props) {
           const ws = props.ws
@@ -766,11 +799,14 @@ window.__ModuleLoader__.load({
             else setTreeError(r.error || '加载失败')
             setTreeLoading(false)
           }
+          // v1.11: history ordered by recency — newest session on top (the
+          // host's sessionIds order reflects creation/attachment, not
+          // activity). Equal timestamps keep the host order (stable sort).
           const sessions = (ws.sessionIds || [])
             .map(id => byId[id])
             .filter(s => s !== undefined)
             .filter(s => !query || (s.displayTitle || '').toLowerCase().indexOf(query.toLowerCase()) >= 0 || s.id.toLowerCase().indexOf(query.toLowerCase()) >= 0)
-            .sort((a, b) => (a.displayTitle || '').localeCompare(b.displayTitle || '') || (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0)))
+            .sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0)))
           const toggleFiles = () => {
             const next = !secFiles
             setSecFiles(next)
@@ -824,10 +860,11 @@ window.__ModuleLoader__.load({
                   key: s.id,
                   className: 'dsh-fe-sess' + (s.id === currentId ? ' dsh-fe-sess-cur' : ''),
                   onClick: () => ctx.sessions.open(s.id),
-                  title: s.id,
+                  title: s.id + (s.updatedAt ? '\n' + new Date(s.updatedAt).toLocaleString() : ''),
                 },
                   React.createElement('span', { className: 'dsh-fe-dot' + (s.running ? ' dsh-fe-dot-run' : (s.completed ? ' dsh-fe-dot-done' : '')) }),
                   React.createElement('span', { className: 'dsh-fe-sess-name' }, s.displayTitle),
+                  React.createElement('span', { className: 'dsh-fe-sess-time' }, timeAgo(s.updatedAt, Date.now())),
                 )),
                 React.createElement('button', { className: 'dsh-fe-newbtn', 'data-dsh-fe-guarded': '1', onClick: () => guardedStartSession(ws.workspaceId) }, IconPlus(), '新建会话'),
               ) : null,
