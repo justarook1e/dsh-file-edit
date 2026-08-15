@@ -56,7 +56,23 @@ window.__ModuleLoader__.load({
           sessionId: null,
           tabs: [],
           active: null,
-          modified: new Set(),
+          // v1.13: files with UNSAVED USER EDITS (white dot on the tab). The
+          // old `modified` set (yellow dot for pending agent DIFFs) is gone —
+          // that indicator collided semantically with the new dirty dot.
+          dirtyFiles: new Set(),
+          setDirty(path, v) {
+            const on = !!v
+            if (on === this.dirtyFiles.has(path)) return
+            if (on) this.dirtyFiles.add(path); else this.dirtyFiles.delete(path)
+            this.emit()
+          },
+          // Current session's workspace root (from getModified/getDiff).
+          // Used to key per-file edit histories by (root, path).
+          root: null,
+          setRoot(r) { if (r && r !== this.root) this.root = r },
+          // Pending save-confirmation dialog (rendered by FileView):
+          // { paths, reason, resolve } — resolved with 'save'|'discard'|'cancel'.
+          askSave: null,
           treeStamp: 0,
           // Cross-view refresh signal: any component that changes review
           // state (hunk accept/reject, file accept/reject, inline edit)
@@ -75,16 +91,6 @@ window.__ModuleLoader__.load({
           closeAll() { if (this.tabs.length === 0) return; this.tabs = []; this.active = null; this.emit() },
           activate(path) { if (this.active !== path) { this.active = path; this.emit() } },
           moveTab(from, to) { if (from === to || from < 0 || to < 0 || from >= this.tabs.length || to >= this.tabs.length) return; const t = this.tabs.splice(from, 1)[0]; this.tabs.splice(to, 0, t); this.emit() },
-          setModified(paths) {
-            const next = new Set(paths || [])
-            if (next.size === this.modified.size) {
-              let same = true
-              for (const p of next) if (!this.modified.has(p)) { same = false; break }
-              if (same) return
-            }
-            this.modified = next
-            this.emit()
-          },
           setTreeStamp(n) {
             const v = Number(n) || 0
             if (v !== this.treeStamp) { this.treeStamp = v; this.emit() }
@@ -464,7 +470,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.12.6: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.13.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -514,7 +520,18 @@ window.__ModuleLoader__.load({
           // (they indent 40px via .dsh-fe-sess padding).
           '.dsh-fe-search { background:transparent; border:1px solid var(--dsw-alias-border-l1); border-radius:6px; color:inherit; font-size:12px; padding:2px 8px; width:calc(100% - 40px); box-sizing:border-box; margin:2px 0 5px 40px; }',
           '.dsh-fe-search:focus { outline:1px solid color-mix(in srgb, var(--dsw-alias-label-secondary) 40%, transparent); }',
-          '.dsh-fe-tab-dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-left:2px; background:var(--dsw-alias-state-warn-primary); vertical-align:middle; }',
+          // v1.13: white dot = unsaved USER edits (white in the dark theme —
+          // it rides the primary label token so it stays visible in light
+          // themes too). The old DIFF-pending yellow dot is removed entirely.
+          '.dsh-fe-tab-dirty { display:inline-block; width:7px; height:7px; border-radius:50%; margin-left:2px; background:var(--dsw-alias-label-primary); opacity:.9; vertical-align:middle; }',
+          // v1.13: save-confirmation dialog (fixed overlay inside FileView).
+          '.dsh-fe-ask-mask { position:fixed; inset:0; z-index:60; background:color-mix(in srgb, var(--dsw-alias-label-primary) 24%, transparent); display:flex; align-items:flex-start; justify-content:center; padding-top:18vh; }',
+          '.dsh-fe-ask-card { background:var(--dsw-alias-bg-layer-2); border:1px solid var(--dsw-alias-border-l1); border-radius:12px; box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); padding:14px 16px; min-width:min(420px, calc(100vw - 48px)); max-width:calc(100vw - 48px); color:var(--dsw-alias-label-primary); }',
+          '.dsh-fe-ask-title { font-size:14px; font-weight:650; margin-bottom:8px; }',
+          '.dsh-fe-ask-body { font-size:12.5px; color:var(--dsw-alias-label-secondary); line-height:1.55; }',
+          '.dsh-fe-ask-path { font-family:ui-monospace,Consolas,monospace; color:var(--dsw-alias-label-primary); margin:3px 0 0 6px; word-break:break-all; }',
+          '.dsh-fe-ask-actions { display:flex; gap:8px; margin-top:14px; justify-content:flex-end; }',
+          '.dsh-fe-ask-actions .dsh-fe-btn { padding:4px 14px; font-size:12.5px; }',
           '.dsh-fe-tab-drag { opacity:.5; }',
           '.dsh-fe-tab-closeall { margin-left:auto; flex:none; }',
           // Modified bar matches the composer card width (token shared with
@@ -1109,7 +1126,7 @@ window.__ModuleLoader__.load({
               const next = r.files || []
               setFiles(next)
               setError(null)
-              store.setModified(next.map(f => f.path))
+              store.setRoot(r.root ?? null)
               store.setTreeStamp(r.treeStamp ?? 0)
               setUndo(r.undo ?? null)
               setRowSet((prev) => {
@@ -1126,7 +1143,6 @@ window.__ModuleLoader__.load({
               }, 260)
             } else {
               setError(r.error || '加载失败')
-              store.setModified([])
               setUndo(null)
             }
           }
@@ -2200,6 +2216,431 @@ window.__ModuleLoader__.load({
         const mdParser = new MarkdownIt({ html: false, linkify: true, highlight: mdHighlight })
         const renderMarkdown = (text) => mdParser.render(text || '')
 
+        // ---------- user edit engine (v1.13) ----------
+        // Line-based edit model with its OWN undo/redo stacks, fully isolated
+        // from the browser's native undo: ctrl+z / ctrl+y / ctrl+shift+z are
+        // intercepted with preventDefault + stopPropagation, so page/dialog
+        // text is never affected. Edits are minimal text patches
+        // {line, start, removed, inserted} applied in order; rebuild replays
+        // them over the origin lines into a renderable row list whose rows
+        // keep their origin-line attribution, so diff hunks keep interleaving
+        // correctly even after the user inserted/deleted lines. The model is
+        // keyed by (workspace root, relative path) and persisted to
+        // localStorage — closing/reopening a tab, switching sessions and
+        // restarting the harness all resume undo/redo (requirement 4).
+        const EDIT_KEY_PREFIX = 'dsh-fe-edit-v1:'
+        const MAX_PERSIST_BYTES = 2600000
+        const MAX_UNDO_ENTRIES = 400
+        const persistTimers = new Map()
+        const editModels = new Map()
+
+        function fpOf(lines) {
+          // 32-bit FNV-1a over the joined text — cheap content fingerprint
+          // for external-change detection and persistence reconciliation.
+          let h = 0x811c9dc5
+          const s = lines.join('\n')
+          for (let i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i)
+            h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0
+          }
+          return h >>> 0
+        }
+        function editKeyOf(root, path) {
+          return EDIT_KEY_PREFIX + String(root || '') + '\u0001' + String(path || '')
+        }
+        function nameOf(path) {
+          return String(path || '').split('/').pop()
+        }
+
+        // Apply one patch to a row list (rows = {origin, text}; origin = the
+        // origin-line index a row stems from, -1 for the empty-file
+        // placeholder). `verify` fails the application when the removed text
+        // is not at the position — used by the merge-after-AI-edit replay.
+        function applyPatchToRows(rows, p, verify) {
+          if (!Number.isInteger(p.line) || p.line < 0 || p.line >= rows.length) return false
+          const row = rows[p.line]
+          const start = Math.max(0, Math.min(row.text.length, Number.isInteger(p.start) ? p.start : row.text.length))
+          const removed = String(p.removed || '')
+          const inserted = String(p.inserted || '')
+          const head = row.text.slice(0, start)
+          const firstTake = Math.min(removed.length, row.text.length - start)
+          const consumed = [row.text.slice(start, start + firstTake)]
+          let remaining = removed.length - firstTake
+          let endIdx = p.line
+          let tail = remaining === 0 ? row.text.slice(start + removed.length) : ''
+          let valid = true
+          while (remaining > 0) {
+            if (endIdx + 1 >= rows.length) { remaining = 0; valid = false; break }
+            consumed.push('\n')
+            remaining--
+            endIdx++
+            const r2 = rows[endIdx]
+            const take = Math.min(remaining, r2.text.length)
+            consumed.push(r2.text.slice(0, take))
+            remaining -= take
+            tail = take < r2.text.length ? r2.text.slice(take) : ''
+          }
+          if (verify && (consumed.join('') !== removed || !valid)) return false
+          const parts = (head + inserted + tail).split('\n')
+          const originIdx = row.origin
+          rows.splice(p.line, endIdx - p.line + 1, ...parts.map((t) => ({ origin: originIdx, text: t })))
+          return true
+        }
+
+        function rebuildModel(m) {
+          let rows = (m.origin || []).map((t, i) => ({ origin: i, text: String(t) }))
+          if (rows.length === 0) rows.push({ origin: -1, text: '' })
+          // Verify every patch too: a malformed entry must be SKIPPED, never
+          // corrupt the document (replay uses the same rule).
+          for (const e of m.undo) for (const p of e.patches) applyPatchToRows(rows, p, true)
+          const lines = rows.map((r) => r.text)
+          const map = new Array(m.origin.length).fill(-1)
+          for (let k = 0; k < rows.length; k++) {
+            const r = rows[k]
+            r.model = k
+            if (r.origin >= 0 && r.origin < map.length && map[r.origin] < 0) map[r.origin] = k
+          }
+          m.lines = lines
+          m.rows = rows
+          m.map = map
+        }
+
+        function createModel(root, path, origin) {
+          const m = {
+            root: root || '', path: path, key: editKeyOf(root, path),
+            origin: (origin || []).slice(),
+            undo: [], redo: [],
+            savedFp: fpOf(origin || []), savedLines: (origin || []).slice(), savedUndoLen: 0,
+            diskFp: fpOf(origin || []), hostRev: null,
+            version: 0, dirty: false, persistable: true,
+            lines: [], rows: [], map: [],
+            rowEls: new Map(), activeIdx: null, pendingCaret: null, lastCol: 0,
+            subs: new Set(),
+          }
+          rebuildModel(m)
+          return m
+        }
+
+        function persistNow(m) {
+          if (!m.persistable) return
+          try {
+            const s = JSON.stringify({
+              v: 1, origin: m.origin, originLen: m.origin.length,
+              originBytes: m.origin.join('\n').length,
+              savedUndoLen: m.savedUndoLen || 0,
+              undo: m.undo, redo: m.redo,
+            })
+            if (s.length > MAX_PERSIST_BYTES) { m.persistable = false; return }
+            localStorage.setItem(m.key, s)
+          } catch (e) {}
+        }
+        function persistSoon(m) {
+          const h = persistTimers.get(m.key)
+          if (h) { try { h() } catch (e) {} }
+          persistTimers.set(m.key, ctx.timeout(() => { persistTimers.delete(m.key); persistNow(m) }, 800))
+        }
+        function loadPersisted(key) {
+          try {
+            const raw = localStorage.getItem(key)
+            if (!raw) return null
+            const d = JSON.parse(raw)
+            if (!d || d.v !== 1 || !Array.isArray(d.origin)) return null
+            return d
+          } catch (e) { return null }
+        }
+        function removePersisted(key) {
+          try { localStorage.removeItem(key) } catch (e) {}
+          const h = persistTimers.get(key)
+          if (h) { try { h() } catch (e) {} }
+          persistTimers.delete(key)
+        }
+        function restoreModel(root, path, origin, stored) {
+          const m = createModel(root, path, origin)
+          const valid = (e) => e && Array.isArray(e.patches) && e.patches.length > 0
+          m.undo = Array.isArray(stored.undo) ? stored.undo.filter(valid).slice(-MAX_UNDO_ENTRIES) : []
+          m.redo = Array.isArray(stored.redo) ? stored.redo.filter(valid) : []
+          m.savedUndoLen = typeof stored.savedUndoLen === 'number' ? Math.max(0, Math.min(m.undo.length, stored.savedUndoLen)) : 0
+          // Reconstruct the save-point content from the entries below the save
+          // marker, then re-derive the fingerprint (self-consistent).
+          const tmp = replayWithConflicts(origin, m.undo.slice(0, m.savedUndoLen))
+          m.savedLines = tmp.lines
+          m.savedFp = fpOf(m.savedLines)
+          rebuildModel(m)
+          m.dirty = fpOf(m.lines) !== m.savedFp
+          return m
+        }
+
+        function afterModelChange(m) {
+          rebuildModel(m)
+          m.dirty = fpOf(m.lines) !== m.savedFp
+          m.version++
+          store.setDirty(m.path, m.dirty)
+          persistSoon(m)
+          notifyModelSubs(m)
+        }
+        function notifyModelSubs(m) {
+          m.version++
+          const subs = Array.from(m.subs)
+          for (const f of subs) { try { f() } catch (e) {} }
+        }
+
+        // Requirement 5: a new edit after undo abandons the redo branch.
+        function pushEntry(m, patches, line, pos) {
+          if (!patches || patches.length === 0) return
+          m.redo = []
+          m.undo.push({ patches: patches, line: line, pos: pos })
+          if (m.undo.length > MAX_UNDO_ENTRIES) {
+            m.undo.shift()
+            if (m.savedUndoLen !== undefined && m.savedUndoLen > 0) m.savedUndoLen--
+          }
+          afterModelChange(m)
+        }
+
+        // ---------- DOM / caret helpers ----------
+        function offsetInEl(el, node, offset) {
+          if (!el) return 0
+          if (node === el) {
+            let pos = 0
+            const cn = el.childNodes
+            const upto = Math.min(offset, cn.length)
+            for (let k = 0; k < upto; k++) pos += (cn[k].textContent || '').length
+            return pos
+          }
+          let pos = 0
+          let found = false
+          const walk = (n) => {
+            if (found) return
+            if (n === node) { pos += offset; found = true; return }
+            if (n.nodeType === 3) pos += n.textContent.length
+            else { for (const c of n.childNodes) { walk(c); if (found) return } }
+          }
+          for (const c of el.childNodes) { walk(c); if (found) break }
+          return pos
+        }
+        function selectionOffsetIn(el) {
+          try {
+            const sel = window.getSelection && window.getSelection()
+            if (!sel || sel.rangeCount === 0) return 0
+            return offsetInEl(el, sel.anchorNode, sel.anchorOffset)
+          } catch (e) { return 0 }
+        }
+        function setCaretEl(el, pos) {
+          try {
+            el.focus({ preventScroll: true })
+            const sel = window.getSelection && window.getSelection()
+            if (!sel) return
+            sel.removeAllRanges()
+            const range = document.createRange()
+            let remaining = Math.max(0, pos)
+            let node = null
+            let offset = 0
+            const walk = (n) => {
+              if (node) return
+              if (n.nodeType === 3) {
+                if (n.textContent.length >= remaining) { node = n; offset = remaining }
+                else remaining -= n.textContent.length
+              } else { for (const c of n.childNodes) { walk(c); if (node) return } }
+            }
+            for (const c of el.childNodes) { walk(c); if (node) break }
+            if (node) { range.setStart(node, offset); range.collapse(true) }
+            else { range.selectNodeContents(el); range.collapse(false) }
+            sel.addRange(range)
+          } catch (e) {}
+        }
+        function caretModelPos(m) {
+          try {
+            const sel = window.getSelection && window.getSelection()
+            if (!sel || sel.rangeCount === 0) return null
+            const anchor = sel.anchorNode
+            let el = anchor
+            if (el && el.nodeType !== 1) el = el.parentElement
+            if (!el || !el.getAttribute || el.getAttribute('data-m') === null) return null
+            const rowIdx = Number(el.getAttribute('data-m'))
+            if (!Number.isInteger(rowIdx)) return null
+            return { row: rowIdx, pos: offsetInEl(el, anchor, sel.anchorOffset) }
+          } catch (e) { return null }
+        }
+        function rowOfNodeEl(node) {
+          let el = node
+          if (el && el.nodeType !== 1) el = el.parentElement
+          if (!el || !el.getAttribute || el.getAttribute('data-m') === null) return null
+          const v = Number(el.getAttribute('data-m'))
+          return Number.isInteger(v) ? { el: el, row: v } : null
+        }
+        function rowSelection(m) {
+          const info = caretModelPos(m)
+          if (!info) return null
+          try {
+            const sel = window.getSelection && window.getSelection()
+            if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+              const a = rowOfNodeEl(sel.anchorNode)
+              const f = rowOfNodeEl(sel.focusNode)
+              if (a && f && a.row !== f.row) {
+                return { start: Math.min(a.row, f.row), end: Math.max(a.row, f.row), caret: info }
+              }
+            }
+          } catch (e) {}
+          return { start: info.row, end: info.row, caret: info }
+        }
+
+        // Commit the DOM text of one row into the model as a minimal patch.
+        function flushLine(m, idx) {
+          const el = m.rowEls.get(idx)
+          if (!el) return null
+          const text = String(el.textContent || '').replace(/\r/g, '')
+          const cur = idx >= 0 && idx < m.lines.length ? m.lines[idx] : ''
+          if (text === cur) return null
+          let p = 0
+          const max = Math.min(text.length, cur.length)
+          while (p < max && text[p] === cur[p]) p++
+          let s1 = text.length
+          let s2 = cur.length
+          while (s1 > p && s2 > p && text[s1 - 1] === cur[s2 - 1]) { s1--; s2-- }
+          return { line: idx, start: p, removed: cur.slice(p, s2), inserted: text.slice(p, s1) }
+        }
+        function flushActive(m) {
+          const idx = m.activeIdx
+          if (idx === null || idx === undefined) return
+          const patch = flushLine(m, idx)
+          if (patch) pushEntry(m, [patch], idx, selectionOffsetIn(m.rowEls.get(idx)))
+        }
+
+        // ---------- editing operations ----------
+        function undoModel(m) {
+          flushActive(m)
+          const e = m.undo.pop()
+          if (!e) return
+          m.redo.push(e)
+          afterModelChange(m)
+          m.pendingCaret = { line: Math.max(0, Math.min(m.lines.length - 1, e.line)), pos: e.pos }
+        }
+        function redoModel(m) {
+          flushActive(m)
+          const e = m.redo.pop()
+          if (!e) return
+          m.undo.push(e)
+          afterModelChange(m)
+          m.pendingCaret = { line: Math.max(0, Math.min(m.lines.length - 1, e.line)), pos: e.pos }
+        }
+        function indentModel(m) {
+          flushActive(m)
+          const sel = rowSelection(m)
+          if (!sel) return
+          const patches = []
+          for (let k = sel.start; k <= sel.end; k++) {
+            if (k >= 0 && k < m.lines.length && m.lines[k] !== '') patches.push({ line: k, start: 0, removed: '', inserted: '  ' })
+          }
+          if (patches.length) {
+            pushEntry(m, patches, sel.caret.row, sel.caret.pos + 2)
+            m.pendingCaret = { line: sel.caret.row, pos: sel.caret.pos + 2 }
+          }
+        }
+        function outdentModel(m) {
+          flushActive(m)
+          const sel = rowSelection(m)
+          if (!sel) return
+          const patches = []
+          for (let k = sel.start; k <= sel.end; k++) {
+            const t = k >= 0 && k < m.lines.length ? m.lines[k] : ''
+            if (t.startsWith('  ')) patches.push({ line: k, start: 0, removed: '  ', inserted: '' })
+            else if (t.startsWith('\t')) patches.push({ line: k, start: 0, removed: '\t', inserted: '' })
+          }
+          if (patches.length) {
+            const first = patches[0].removed.length
+            pushEntry(m, patches, sel.caret.row, Math.max(0, sel.caret.pos - first))
+            m.pendingCaret = { line: sel.caret.row, pos: Math.max(0, sel.caret.pos - first) }
+          }
+        }
+        function newlineModel(m) {
+          const info = caretModelPos(m)
+          if (!info) return
+          const flush = flushLine(m, info.row)
+          const patches = []
+          if (flush) patches.push(flush)
+          patches.push({ line: info.row, start: info.pos, removed: '', inserted: '\n' })
+          pushEntry(m, patches, info.row + 1, 0)
+          m.pendingCaret = { line: info.row + 1, pos: 0 }
+        }
+        function mergeBackwardModel(m) {
+          const info = caretModelPos(m)
+          if (!info || info.pos !== 0 || info.row <= 0) return
+          const prev = info.row - 1 < m.lines.length ? m.lines[info.row - 1] : ''
+          const patches = []
+          const flush = flushLine(m, info.row)
+          if (flush) patches.push(flush)
+          // Removing ONLY the newline joins the two rows (both texts survive).
+          patches.push({ line: info.row - 1, start: prev.length, removed: '\n', inserted: '' })
+          pushEntry(m, patches, info.row - 1, prev.length)
+          m.pendingCaret = { line: info.row - 1, pos: prev.length }
+        }
+        function mergeForwardModel(m) {
+          const info = caretModelPos(m)
+          if (!info || info.row < 0 || info.row >= m.lines.length - 1) return
+          const cur = m.lines[info.row]
+          if (info.pos < cur.length) return
+          const patches = []
+          const flush = flushLine(m, info.row)
+          if (flush) patches.push(flush)
+          patches.push({ line: info.row, start: cur.length, removed: '\n', inserted: '' })
+          pushEntry(m, patches, info.row, cur.length)
+          m.pendingCaret = { line: info.row, pos: cur.length }
+        }
+        function moveCaretRow(m, targetRow, col) {
+          if (targetRow < 0 || targetRow >= m.lines.length) return
+          m.lastCol = col
+          m.pendingCaret = { line: targetRow, pos: Math.min(col, m.lines[targetRow].length) }
+          notifyModelSubs(m)
+        }
+
+        // Replay user patches onto NEW content (after an agent edit), keeping
+        // patches whose removed text still matches; the first conflict aborts
+        // the replay (later patches reference indices that no longer align)
+        // and is reported so the caller can tell the user.
+        function replayWithConflicts(theirs, entries) {
+          let rows = (theirs || []).map((t, i) => ({ origin: i, text: String(t) }))
+          if (rows.length === 0) rows.push({ origin: -1, text: '' })
+          let conflicts = 0
+          let aborted = false
+          for (const e of entries) {
+            for (const p of e.patches) {
+              if (!applyPatchToRows(rows, p, true)) { conflicts++; aborted = true; break }
+            }
+            if (aborted) break
+          }
+          return { lines: rows.map((r) => r.text), conflicts }
+        }
+
+        function discardModel(m) {
+          m.undo = m.undo.slice(0, m.savedUndoLen || 0)
+          m.redo = []
+          afterModelChange(m)
+          persistNow(m)
+        }
+        function markTyping(m) {
+          if (m.dirty) return
+          m.dirty = true
+          store.setDirty(m.path, true)
+          persistSoon(m)
+        }
+
+        // Full-content save: flush in-progress typing, write the model lines
+        // to disk through the host, and mark the save point. The undo history
+        // is KEPT (saving does not clear it); the white dot clears.
+        async function saveModel(m, sid, path) {
+          flushActive(m)
+          const r = await call('saveUserFile', { sessionId: sid, path: path, rev: m.hostRev, lines: m.lines })
+          if (!r || !r.ok) return r
+          m.savedFp = fpOf(m.lines)
+          m.savedLines = m.lines.slice()
+          m.savedUndoLen = m.undo.length
+          m.hostRev = r.rev
+          m.diskFp = fpOf(m.lines)
+          m.dirty = false
+          store.setDirty(path, false)
+          persistNow(m)
+          return r
+        }
+
         // ---------- file view ----------
         function DiffPane(props) {
           const sid = props.sid
@@ -2217,6 +2658,39 @@ window.__ModuleLoader__.load({
           const diffRef = React.useState({ node: null })[0]
           const scrollGate = React.useState({ pending: false })[0]
           const editingRef = React.useState({ idx: null })[0]
+          // v1.13: the per-file edit model drives the code area. modelKey
+          // identifies the model in the module-level registry; modelVersion
+          // re-renders after every structural model change (undo/redo/Enter/
+          // paste/indent — NOT per keystroke; typing mutates the DOM and is
+          // committed into the model on blur/undo/save).
+          const [modelKey, setModelKey] = React.useState(null)
+          const [modelVersion, setModelVersion] = React.useState(0)
+          const modelRef = React.useState({ m: null })[0]
+          const m = modelKey ? editModels.get(modelKey) : null
+          modelRef.m = m
+          const subRef = React.useState({ fn: null })[0]
+          React.useEffect(() => {
+            if (!m) return
+            subRef.fn = () => setModelVersion((n) => n + 1)
+            m.subs.add(subRef.fn)
+            return () => { m.subs.delete(subRef.fn) }
+          }, [m])
+          // Caret restore after structural changes (Enter split, undo/redo,
+          // paste, indent, line merges, arrows). Typing never lands here —
+          // it mutates the DOM in place.
+          React.useEffect(() => {
+            if (!m || !m.pendingCaret) return
+            const pc = m.pendingCaret
+            m.pendingCaret = null
+            const t = setTimeout(() => {
+              const el = m.rowEls.get(pc.line)
+              if (el) setCaretEl(el, pc.pos)
+            }, 0)
+            return () => clearTimeout(t)
+          }, [m, modelVersion])
+          // Payload deferred while a line is being edited (applied on blur
+          // commit so the poll never clobbers in-progress DOM typing).
+          const deferredPayloadRef = React.useState({ p: null })[0]
           // v1.12.5: timer for the post-jump caret placement (smooth scroll
           // must settle before the range is moved onto the target line).
           const jumpTimer = React.useState({ t: null })[0]
@@ -2240,40 +2714,185 @@ window.__ModuleLoader__.load({
               if (paneRef.node) paneRef.node.style.setProperty('--dsh-fe-toolbar-h', el.offsetHeight + 'px')
             }
           })
+          // v1.13: reconcile a full payload with the per-file edit model.
+          // * fingerprint unchanged → keep the model, refresh the host rev;
+          // * changed + dirty → external change with unsaved edits: reject/
+          //   undo-reject resets (toast), agent edits AUTO-SAVE the user's
+          //   edits replayed onto the new content (conflicts keep AI text);
+          // * changed + clean → reset the history (requirement 3) or restore
+          //   the persisted history when the fingerprints match (req 4).
+          const applyPayload = async (r, depth) => {
+            const d = depth || 0
+            if (pathRef.path !== path) return
+            editingRef.idx = null
+            // Clean markdown renders read-only (no model); PENDING markdown
+            // keeps the diff/审阅 view whose lines stay editable.
+            const editable = !r.deleted && !r.zero && !r.note && (lang !== 'markdown' || r.changed === true)
+            if (!editable) {
+              if (r.deleted || r.zero) {
+                const key = editKeyOf(store.root, path)
+                if (editModels.has(key)) { editModels.delete(key); removePersisted(key) }
+                store.setDirty(path, false)
+              }
+              setDiff(r)
+              setError(null)
+              return
+            }
+            if (!Array.isArray(r.current)) { setDiff(r); setError(null); return }
+            const key = r.root ? editKeyOf(r.root, path) : editKeyOf(store.root, path)
+            const curFp = fpOf(r.current)
+            const m0 = editModels.get(key)
+            if (m0 && m0.diskFp === curFp) {
+              m0.hostRev = r.rev
+              setModelKey(key)
+              store.setDirty(path, m0.dirty)
+              setDiff(r)
+              setError(null)
+              return
+            }
+            if (m0 && m0.dirty) {
+              if (r.justRejected) {
+                showToast('「' + nameOf(path) + '」已被还原，未保存的编辑已丢弃')
+                // Reset to a FRESH model right away (history reset per
+                // requirement 3) — the view stays editable without waiting
+                // for the next poll to re-create it.
+                const nm = createModel(r.root || store.root, path, r.current)
+                nm.hostRev = r.rev
+                nm.diskFp = fpOf(nm.origin)
+                editModels.set(key, nm)
+                persistNow(nm)
+                store.setDirty(path, false)
+                setModelKey(key)
+                setDiff(r)
+                setError(null)
+                return
+              }
+              // Agent edit while the user had unsaved edits: auto-save.
+              const merged = replayWithConflicts(r.current, m0.undo)
+              const r2 = await call('saveUserFile', { sessionId: sid, path: path, rev: r.rev, lines: merged.lines })
+              if (r2 && r2.ok) {
+                if (merged.conflicts > 0) showToast('「' + nameOf(path) + '」被 AI 修改：' + merged.conflicts + ' 处编辑与 AI 的修改冲突，已保留 AI 的版本')
+                else showToast('已自动保存对「' + nameOf(path) + '」的修改')
+                const nm = createModel(r.root || store.root, path, r2.current || merged.lines)
+                nm.hostRev = r2.rev
+                nm.diskFp = fpOf(nm.origin)
+                editModels.set(key, nm)
+                persistNow(nm)
+                store.setDirty(path, false)
+                setModelKey(key)
+                setDiff(r2)
+                setError(null)
+                return
+              }
+              if (r2 && r2.code === 'stale' && r2.payload && d < 2) {
+                await applyPayload(r2.payload, d + 1)
+                return
+              }
+              showToast('自动保存失败：' + ((r2 && (r2.message || r2.error)) || '未知错误'))
+              const nm = createModel(r.root || store.root, path, r.current)
+              nm.hostRev = r.rev
+              nm.diskFp = curFp
+              editModels.set(key, nm)
+              persistNow(nm)
+              store.setDirty(path, false)
+              setModelKey(key)
+              setDiff(r)
+              setError(null)
+              return
+            }
+            const stored = loadPersisted(key)
+            let nm = null
+            if (stored && fpOf(stored.origin) === curFp
+                && stored.originLen === r.current.length
+                && stored.originBytes === r.current.join('\n').length) {
+              nm = restoreModel(r.root || store.root, path, r.current, stored)
+            } else {
+              nm = createModel(r.root || store.root, path, r.current)
+            }
+            if (stored && nm.undo.length === 0 && nm.redo.length === 0 && stored.undo && stored.undo.length > 0) removePersisted(key)
+            nm.hostRev = r.rev
+            nm.diskFp = curFp
+            editModels.set(key, nm)
+            store.setDirty(path, nm.dirty)
+            setModelKey(key)
+            setDiff(r)
+            setError(null)
+          }
           // v1.9.4: `forceFull` (tab switch / path change) ignores the stale
-          // `diff.rev` and fetches the whole payload. The rev short-circuit
-          // is only valid when the rev belongs to the SAME file: the pane is
-          // ONE component instance reused across tabs, so after a switch
-          // `diff.rev` is the PREVIOUS file's counter. Files that lived the
-          // same lifecycle share the same rev (every new file is 1 after its
-          // first scan, 2 after a reject) — the host answers `same` for the
-          // NEW path and the stale content would stick forever.
+          // rev and fetches the whole payload. The rev short-circuit is only
+          // valid when the rev belongs to the SAME file: the pane is ONE
+          // component instance reused across tabs, so after a switch the old
+          // rev is the PREVIOUS file's counter — the host would answer `same`
+          // for the new path and stale content would stick forever. v1.13:
+          // the rev rides the edit model (hostRev) instead of the payload.
           const fetch = async (forceFull) => {
             if (!sid || !path) return
             const reqPath = path
             setBusy(true)
-            const r = await call('getDiff', { sessionId: sid, path: reqPath, rev: (forceFull || !diff) ? null : diff.rev })
+            const mm = modelRef.m
+            const rev = forceFull ? null : (mm ? mm.hostRev : (diff ? diff.rev : null))
+            const r = await call('getDiff', { sessionId: sid, path: reqPath, rev: rev })
             // Stale response guard: the user switched tabs while this request
             // was in flight — drop it entirely (its setBusy(false) would also
             // race the newer request's spinner).
             if (pathRef.path !== reqPath) return
             if (r.ok) {
-              // While a line is being edited, defer payload replacement so the
-              // poll does not clobber the in-progress DOM edit.
-              if (!r.same && editingRef.idx === null) setDiff(r)
-              setError(null)
+              if (r.same) { setError(null); setBusy(false); return }
+              if (r.root) store.setRoot(r.root)
+              // While a line is being edited, defer payload application so the
+              // poll cannot clobber in-progress DOM typing; the blur commit
+              // applies it afterwards.
+              if (editingRef.idx !== null && modelRef.m && modelRef.m.dirty) {
+                deferredPayloadRef.p = r
+                setBusy(false)
+                return
+              }
+              await applyPayload(r)
+              setBusy(false)
             } else if (r.missing) {
               setDiff(null)
+              setModelKey(null)
+              setBusy(false)
             } else {
               setError(r.error || r.message || '加载失败')
+              setBusy(false)
             }
-            setBusy(false)
           }
           usePoll(fetch, () => pollDelayFor(sid))
           // v1.9.4: on path change, clear the previous file's payload FIRST
           // (the pane shows 加载中… instead of the wrong file's content) and
           // force a full fetch without the stale rev.
-          React.useEffect(() => { setDiff(null); void fetch(true) }, [path, sid])
+          // v1.13: session switches first offer to SAVE the previous file's
+          // unsaved edits (requirement 6) — via the FileView-rendered prompt.
+          const prevSessionRef = React.useState({ sid: null, path: null })[0]
+          React.useEffect(() => {
+            const prev = { sid: prevSessionRef.sid, path: prevSessionRef.path }
+            prevSessionRef.sid = sid
+            prevSessionRef.path = path
+            void (async () => {
+              if (prev.sid && prev.sid !== sid && prev.path) {
+                const key0 = editKeyOf(store.root, prev.path)
+                const m0 = editModels.get(key0)
+                if (m0 && m0.dirty) {
+                  const choice = await new Promise((resolve) => {
+                    store.askSave = { paths: [prev.path], reason: '切换会话', resolve: resolve }
+                    store.emit()
+                  })
+                  if (choice === 'save') {
+                    const r = await saveModel(m0, prev.sid, prev.path)
+                    if (r && r.ok) store.requestRefresh()
+                    else if (!r || !(r.code === 'stale' && r.payload)) showToast('保存失败：' + ((r && (r.message || r.error)) || '未知错误'))
+                  } else if (choice === 'discard') {
+                    discardModel(m0)
+                  }
+                }
+              }
+              setDiff(null)
+              setModelKey(null)
+              deferredPayloadRef.p = null
+              await fetch(true)
+            })()
+          }, [path, sid])
           // Bar-side accept/reject bumps the shared tick: refetch right away
           // so this pane's toolbar stats stay in sync with the modified bar.
           useStore()
@@ -2287,16 +2906,31 @@ window.__ModuleLoader__.load({
           // edits stay visible; once clean, the tab shows the rendered doc.
           const isMd = lang === 'markdown'
           const mdRender = isMd && !diff.deleted && !diff.zero && diff.changed !== true && diff.current && diff.current.length > 0
+          // v1.13: review actions flush + save unsaved user edits FIRST so
+          // the host computes hunks over the up-to-date content (a reject
+          // then legitimately resets the history via justRejected).
+          const ensureSaved = async () => {
+            const mm = modelRef.m
+            if (!mm || !mm.dirty) return true
+            const r = await saveModel(mm, sid, path)
+            if (r && r.ok) { if (r.root) store.setRoot(r.root); setDiff(r); setError(null); return true }
+            if (r && r.code === 'stale' && r.payload) { await applyPayload(r.payload); return false }
+            setError((r && (r.message || r.error)) || '保存失败')
+            return false
+          }
           const onHunk = async (h, action) => {
-            const r = await call('applyHunk', { sessionId: sid, path: path, rev: diff.rev, hunkId: h.id, action: action })
+            if (!(await ensureSaved())) return
+            const revNow = modelRef.m ? modelRef.m.hostRev : diff.rev
+            const r = await call('applyHunk', { sessionId: sid, path: path, rev: revNow, hunkId: h.id, action: action })
             if (r.ok) { setDiff(r); setError(null); store.requestRefresh() }
-            else { setError(r.message || r.error || '操作失败'); await fetch() }
+            else { setError(r.message || r.error || '操作失败'); await fetch(true) }
           }
           const onFile = async (method) => {
+            if (!(await ensureSaved())) return
             const r = await call(method, { sessionId: sid, path: path })
             if (!r.ok) setError(r.error || r.message || '操作失败')
             else setError(null)
-            await fetch()
+            await fetch(true)
             if (r.ok) store.requestRefresh()
           }
           const statusText = mdRender ? 'Markdown' : (diff.status === 'added' ? '新增' : diff.status === 'deleted' ? '删除' : '修改')
@@ -2354,17 +2988,131 @@ window.__ModuleLoader__.load({
               ),
             )
           }
-          // Inline line editor bookkeeping: map each editable cur-line index
-          // to its rendered text so commits can detect real changes.
-          const lineText = new Map()
-          const commitEdit = async (idx, el) => {
+          // v1.13: the code area renders from the edit model. commitRow
+          // flushes a line's DOM text into the model on blur; typing itself
+          // never re-renders (the highlight layer syncs imperatively).
+          const commitRow = (el) => {
+            const idx = Number(el.getAttribute('data-m'))
+            if (!Number.isInteger(idx)) return
+            const mm = modelRef.m
+            if (!mm) return
             editingRef.idx = null
-            const text = (el.textContent || '').replace(/\n/g, '')
-            if (text === lineText.get(idx)) return
-            setError(null)
-            const r = await call('applyEdit', { sessionId: sid, path: path, idx: idx, text: text, rev: diff.rev })
-            if (r.ok) { if (!r.same) setDiff(r); setError(null); store.requestRefresh() }
-            else { setError(r.message || r.error || '编辑失败'); await fetch() }
+            const caret = selectionOffsetIn(el)
+            const patch = flushLine(mm, idx)
+            if (patch) pushEntry(mm, [patch], idx, caret)
+            if (deferredPayloadRef.p) {
+              const r = deferredPayloadRef.p
+              deferredPayloadRef.p = null
+              void applyPayload(r)
+            }
+          }
+          // v1.13 keyboard handling at the code container: every editing key
+          // from the requirements, intercepted with preventDefault +
+          // stopPropagation so nothing outside the editor ever sees them
+          // (undo/redo run the model's OWN stack — page/dialog undo stacks
+          // are untouched).
+          const onCodeKeyDown = (ev) => {
+            const t = ev.target
+            if (!t || !t.closest || !t.closest('.dsh-fe-line')) return
+            const mm = modelRef.m
+            if (!mm) return
+            const mod = ev.ctrlKey || ev.metaKey
+            const key = (ev.key || '').toLowerCase()
+            const stop = () => { ev.preventDefault(); ev.stopPropagation() }
+            if (mod && key === 'z') { stop(); if (ev.shiftKey) redoModel(mm); else undoModel(mm); return }
+            if (mod && key === 'y') { stop(); redoModel(mm); return }
+            if (mod && key === 's') { stop(); void saveCurrent(); return }
+            if (key === 'tab') { stop(); if (ev.shiftKey) outdentModel(mm); else indentModel(mm); return }
+            if (key === 'enter') { stop(); newlineModel(mm); return }
+            if (key === 'backspace') {
+              const info = caretModelPos(mm)
+              if (info && info.pos === 0 && info.row > 0) { stop(); mergeBackwardModel(mm); return }
+            }
+            if (key === 'delete') {
+              const info = caretModelPos(mm)
+              if (info && info.row >= 0 && info.row < mm.lines.length - 1 && info.pos >= mm.lines[info.row].length) {
+                stop(); mergeForwardModel(mm); return
+              }
+            }
+            if (key === 'arrowup') {
+              const info = caretModelPos(mm)
+              if (info && info.pos === 0 && info.row > 0) { stop(); moveCaretRow(mm, info.row - 1, mm.lastCol); return }
+            }
+            if (key === 'arrowdown') {
+              const info = caretModelPos(mm)
+              if (info && info.row >= 0 && info.row < mm.lines.length - 1 && info.pos >= mm.lines[info.row].length) {
+                stop(); moveCaretRow(mm, info.row + 1, Math.max(mm.lastCol, info.pos)); return
+              }
+            }
+            if (mod && key === 'c') {
+              // Multi-row copy: the browser concatenates inline spans without
+              // newlines — build the exact selected text from the model.
+              try {
+                const sel = window.getSelection && window.getSelection()
+                if (!sel || !sel.rangeCount || sel.isCollapsed) return
+                const a = rowOfNodeEl(sel.anchorNode)
+                const f = rowOfNodeEl(sel.focusNode)
+                if (!a || !f || a.row === f.row) return
+                stop()
+                const anchor = { row: a.row, pos: offsetInEl(a.el, sel.anchorNode, sel.anchorOffset) }
+                const focus = { row: f.row, pos: offsetInEl(f.el, sel.focusNode, sel.focusOffset) }
+                const p1 = (anchor.row < focus.row || (anchor.row === focus.row && anchor.pos <= focus.pos)) ? anchor : focus
+                const p2 = p1 === anchor ? focus : anchor
+                let text = ''
+                for (let r = p1.row; r <= p2.row && r < mm.lines.length; r++) {
+                  if (r > p1.row) text += '\n'
+                  const from = r === p1.row ? p1.pos : 0
+                  const to = r === p2.row ? p2.pos : mm.lines[r].length
+                  text += mm.lines[r].slice(from, to)
+                }
+                try {
+                  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(() => {})
+                } catch (e2) {}
+              } catch (e2) {}
+              return
+            }
+            if (mod && key === 'v') {
+              // Manual paste: the browser's default would splice block
+              // elements into the single-line spans. Read the clipboard and
+              // insert through the model (multi-line text splits rows).
+              stop()
+              const info = caretModelPos(mm)
+              if (!info) return
+              let text = ''
+              try {
+                const cd = ev.clipboardData || (window.clipboardData || null)
+                if (cd) text = cd.getData('text/plain') || ''
+              } catch (e2) {}
+              if (text === '') return
+              text = text.replace(/\r\n/g, '\n').replace(/\r/g, '')
+              const flush = flushLine(mm, info.row)
+              const patches = []
+              if (flush) patches.push(flush)
+              patches.push({ line: info.row, start: info.pos, removed: '', inserted: text })
+              if (patches.length) {
+                const nl = text.lastIndexOf('\n')
+                const lastRow = nl < 0 ? info.row : info.row + text.split('\n').length - 1
+                const lastPos = nl < 0 ? info.pos + text.length : text.length - nl - 1
+                pushEntry(mm, patches, lastRow, lastPos)
+                mm.pendingCaret = { line: lastRow, pos: lastPos }
+              }
+              return
+            }
+          }
+          const saveCurrent = async () => {
+            const mm = modelRef.m
+            if (!mm || !mm.dirty) return
+            const r = await saveModel(mm, sid, path)
+            if (r && r.ok) {
+              if (r.root) store.setRoot(r.root)
+              setDiff(r)
+              setError(null)
+              store.requestRefresh()
+            } else if (r && r.code === 'stale' && r.payload) {
+              await applyPayload(r.payload)
+            } else {
+              setError((r && (r.message || r.error)) || '保存失败')
+            }
           }
           // Per-line highlight state for the three line domains. Multiline
           // strings/comments carry their mode across rows in render order.
@@ -2375,29 +3123,31 @@ window.__ModuleLoader__.load({
             if (!toks) return text
             return toks.map((t, i) => React.createElement('span', { key: i, className: 'dsh-fe-tk' + (t.c ? ' dsh-fe-tk-' + t.c : '') }, t.t))
           }
-          const row = (key, cls, r, editable, idx, hlState) => {
-            const text = r.text === undefined ? '' : r.text
-            if (editable && idx !== null && idx !== undefined) lineText.set(idx, text)
+          const renderRoRow = (key, cls, n, text, hlState) => {
             const isOld = cls.indexOf('dsh-fe-old') >= 0
-            if (!editable) {
-              return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls, 'data-n': String(r.n) },
-                React.createElement('span', { className: 'dsh-fe-ln' }, String(r.n)),
+            return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls, 'data-n': String(n) },
+              React.createElement('span', { className: 'dsh-fe-ln' }, String(n)),
+              React.createElement('span', { className: 'dsh-fe-txwrap' },
+                React.createElement('span', {
+                  className: 'dsh-fe-tx' + (isOld ? ' dsh-fe-tx-ro' : ''),
+                  title: isOld ? '已删除的行：可复制，不可编辑' : undefined,
+                }, tokSpans(text, hlState))),
+            )
+          }
+          // Model row: editable span on top of the pointer-events:none
+          // highlight layer. React owns the initial text and rewrites it on
+          // model changes; keystrokes mutate the DOM and are committed into
+          // the model on blur/undo/save.
+          const renderModelRow = (r, cls, hlState) => {
+            const text = r.text
+            if (!m) {
+              return React.createElement('div', { key: 'm' + r.model, className: 'dsh-fe-line ' + cls, 'data-n': String(r.model + 1) },
+                React.createElement('span', { className: 'dsh-fe-ln' }, String(r.model + 1)),
                 React.createElement('span', { className: 'dsh-fe-txwrap' },
-                  React.createElement('span', {
-                    className: 'dsh-fe-tx' + (isOld ? ' dsh-fe-tx-ro' : ''),
-                    title: isOld ? '已删除的行：可复制，不可编辑' : undefined,
-                  }, tokSpans(text, hlState))),
-              )
+                  React.createElement('span', { className: 'dsh-fe-tx' }, tokSpans(text, hlState))))
             }
-            // Editable line: the contentEditable holds the REAL text (with
-            // transparent glyphs — caret/selection/copy all work on it), while
-            // the colored token layer below shows through. React manages the
-            // initial text; keystrokes mutate the DOM and syncHl re-tokenizes
-            // the layer imperatively; React only rewrites the span when its
-            // React-side text changes (commit/poll), which always matches the
-            // committed DOM text.
-            return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls, 'data-n': String(r.n) },
-              React.createElement('span', { className: 'dsh-fe-ln' }, String(r.n)),
+            return React.createElement('div', { key: 'm' + r.model, className: 'dsh-fe-line ' + cls, 'data-n': String(r.model + 1) },
+              React.createElement('span', { className: 'dsh-fe-ln' }, r.origin >= 0 ? String(r.origin + 1) : String(r.model + 1)),
               React.createElement('span', {
                 className: 'dsh-fe-txwrap',
                 onClick: (ev) => {
@@ -2412,13 +3162,14 @@ window.__ModuleLoader__.load({
                   contentEditable: true,
                   suppressContentEditableWarning: true,
                   spellCheck: false,
-                  title: '可编辑：Enter 提交，Esc 取消',
-                  onFocus: () => { editingRef.idx = idx },
-                  onBlur: (ev) => { commitEdit(idx, ev.currentTarget) },
-                  onInput: (ev) => { syncHl(ev.currentTarget) },
+                  'data-m': String(r.model),
+                  title: '可编辑：Ctrl+S 保存 · Ctrl+Z/Y 撤销/重做 · Tab/Shift+Tab 缩进 · Enter 换行',
+                  ref: (node) => { if (node) m.rowEls.set(r.model, node); else m.rowEls.delete(r.model) },
+                  onFocus: () => { editingRef.idx = r.model },
+                  onBlur: (ev) => { commitRow(ev.currentTarget) },
+                  onInput: (ev) => { syncHl(ev.currentTarget); markTyping(m) },
                   onKeyDown: (ev) => {
-                    if (ev.key === 'Enter') { ev.preventDefault(); ev.currentTarget.blur() }
-                    else if (ev.key === 'Escape') { ev.preventDefault(); ev.currentTarget.textContent = lineText.get(idx); syncHl(ev.currentTarget); ev.currentTarget.blur() }
+                    if (ev.key === 'Escape') { ev.preventDefault(); ev.currentTarget.textContent = m.lines[r.model]; syncHl(ev.currentTarget); ev.currentTarget.blur() }
                   },
                 }, text)))
           }
@@ -2432,7 +3183,7 @@ window.__ModuleLoader__.load({
               error ? React.createElement('div', { className: 'dsh-fe-err' }, String(error)) : null,
               React.createElement('div', { className: 'dsh-fe-diff' },
                 React.createElement('div', { className: 'dsh-fe-code' },
-                  diff.preview.map((t, i) => row('p' + i, '', { n: i + 1, text: t }, false, null, hlPrev)),
+                  diff.preview.map((t, i) => renderRoRow('p' + i, '', i + 1, t, hlPrev)),
                 ),
               ),
             )
@@ -2450,25 +3201,46 @@ window.__ModuleLoader__.load({
           const hunks = diff.hunks || []
           const hunkOrdinal = {}
           for (let hi = 0; hi < hunks.length; hi++) hunkOrdinal[hunks[hi].id] = hi
+          // v1.13: ctx/hunk ranges are described in ORIGIN coordinates while
+          // the rows come from the edit model (which may have inserted and
+          // deleted lines). A single pointer walks the model's ordered row
+          // list once and buckets rows into the block they belong to; rows
+          // keep their origin attribution so hunks stay aligned even after
+          // user insertions/deletions above them.
           const blocks = []
           let cursor = 0
           for (const h of hunks) {
-            if (h.newStart > cursor) {
-              blocks.push({ kind: 'ctx', rows: range(cursor, h.newStart).map((i) => ({ n: i + 1, text: current[i], idx: i })) })
-            }
-            blocks.push({
-              kind: 'hunk', h: h,
-              oldRows: range(0, h.oldLen).map((i) => ({ n: h.oldStart + i + 1, text: baseline[h.oldStart + i] })),
-              newRows: range(0, h.newLen).map((i) => ({ n: h.newStart + i + 1, text: current[h.newStart + i], idx: h.newStart + i })),
-            })
+            if (h.newStart > cursor) blocks.push({ kind: 'ctx', from: cursor, to: h.newStart })
+            blocks.push({ kind: 'hunk', h: h })
             cursor = h.newStart + h.newLen
           }
-          if (cursor < current.length) {
-            blocks.push({ kind: 'ctx', rows: range(cursor, current.length).map((i) => ({ n: i + 1, text: current[i], idx: i })) })
-          }
-          if (current.length === 0) {
-            // Empty file: one placeholder editable line so typing creates line 1.
-            blocks.push({ kind: 'ctx', rows: [{ n: 1, text: '', idx: 0 }] })
+          if (cursor < current.length) blocks.push({ kind: 'ctx', from: cursor, to: current.length })
+          if (current.length === 0) blocks.push({ kind: 'ctx', from: 0, to: 0 })
+          const rowList = m ? m.rows : []
+          const plan = []
+          let ri = 0
+          for (let bi = 0; bi < blocks.length; bi++) {
+            const b = blocks[bi]
+            if (b.kind === 'ctx') {
+              const items = []
+              while (ri < rowList.length && rowList[ri].origin < b.to) {
+                if (rowList[ri].origin >= b.from || rowList[ri].origin < 0) items.push(rowList[ri])
+                ri++
+              }
+              plan.push({ kind: 'ctx', rows: items })
+            } else {
+              const h = b.h
+              const newRows = []
+              while (ri < rowList.length && rowList[ri].origin < h.newStart + h.newLen) {
+                if (rowList[ri].origin >= h.newStart || rowList[ri].origin < 0) newRows.push(rowList[ri])
+                ri++
+              }
+              plan.push({
+                kind: 'hunk', h: h,
+                oldRows: range(0, h.oldLen).map((i) => ({ n: h.oldStart + i + 1, text: baseline[h.oldStart + i] })),
+                newRows: newRows,
+              })
+            }
           }
           // v1.7: diff jump controls. The counter follows manual scrolling
           // as well.
@@ -2580,7 +3352,17 @@ window.__ModuleLoader__.load({
           }
           const jumpRel = (dir) => {
             if (hunks.length === 0) return
-            const positions = hunks.map((h) => h.newStart + 1)
+            // v1.13: positions = the RENDERED (model) line number of each
+            // hunk's first NEW row — user insertions shift the model, so
+            // origin coordinates would mislocate hunks.
+            const positions = hunks.map((h, k) => {
+              const node = hunkRefs[k]
+              const el = node && node.querySelector('.dsh-fe-line.dsh-fe-new[data-n]')
+              if (el) { const n = Number(el.getAttribute('data-n')); if (n > 0) return n }
+              const mm = modelRef.m
+              if (mm && mm.map[h.newStart] >= 0) return mm.map[h.newStart] + 1
+              return h.newStart + 1
+            })
             const caret = caretLineAt()
             // No insertion point in the edit area: position = "before the
             // first line" → next lands on the first hunk, prev wraps to the
@@ -2627,11 +3409,12 @@ window.__ModuleLoader__.load({
                 className: 'dsh-fe-diff',
                 ref: (node) => { diffRef.node = node },
                 onScroll: onDiffScroll,
+                onKeyDown: onCodeKeyDown,
               },
-                blocks.map((b, i) => {
+                plan.map((b, i) => {
                   if (b.kind === 'ctx') {
                     return React.createElement('div', { key: 'c' + i, className: 'dsh-fe-code' },
-                      b.rows.map((r) => row('c' + i + ':' + r.n, '', r, true, r.idx, hlStateCur)))
+                      b.rows.map((r) => renderModelRow(r, '', hlStateCur)))
                   }
                   const hIdx = hunkOrdinal[b.h.id]
                   const isFocus = focusIdx !== null && hIdx === curFocus
@@ -2650,8 +3433,8 @@ window.__ModuleLoader__.load({
                       React.createElement(IconBtn, { tone: 'no', small: true, className: 'dsh-fe-pair', title: '拒绝此块修改', onClick: () => onHunk(b.h, 'reject'), icon: IconCross }),
                     ),
                     React.createElement('div', { className: 'dsh-fe-code' },
-                      b.oldRows.map((r) => row('o' + i + ':' + r.n, 'dsh-fe-old', r, false, null, hlStateBase)),
-                      b.newRows.map((r) => row('n' + i + ':' + r.n, 'dsh-fe-new', r, true, r.idx, hlStateCur)),
+                      b.oldRows.map((r) => renderRoRow('o' + i + ':' + r.n, 'dsh-fe-old', r.n, r.text, hlStateBase)),
+                      b.newRows.map((r) => renderModelRow(r, 'dsh-fe-new', hlStateCur)),
                     ),
                   )
                 }),
@@ -2670,7 +3453,17 @@ window.__ModuleLoader__.load({
           // this component's mount ⟺ the 文件 view is active. The flag drives
           // the modified bar's overlay posture — floating over the editor's
           // bottom edge here, classic in-flow layout on 对话/轨迹.
-          React.useEffect(() => { store.setFileViewActive(true); return () => store.setFileViewActive(false) }, [])
+          React.useEffect(() => {
+            // v1.13: a prompt orphaned by a view switch mid-question must not
+            // linger — clear it ('cancel' = keep the edits as they are).
+            if (store.askSave) {
+              const q = store.askSave
+              store.askSave = null
+              try { q.resolve('cancel') } catch (e) {}
+            }
+            store.setFileViewActive(true)
+            return () => store.setFileViewActive(false)
+          }, [])
           const [dragIdx, setDragIdx] = React.useState(null)
           // v1.8.1: sticky header heights. The tabs bar pins to the top of
           // the scrollport; its measured height feeds the toolbar/jump
@@ -2694,51 +3487,141 @@ window.__ModuleLoader__.load({
             apply()
             return store.onDockH(apply)
           }, [])
+          // v1.13: save-confirmation dialog (requirement 6), rendered as a
+          // fixed overlay here so tab close, close-all and session switches
+          // all ask through the shared store slot.
+          const answerAsk = (choice) => {
+            if (!store.askSave) return
+            const q = store.askSave
+            store.askSave = null
+            store.emit()
+            try { q.resolve(choice) } catch (e) {}
+          }
+          const askOverlay = store.askSave ? React.createElement('div', {
+            className: 'dsh-fe-ask-mask',
+            onClick: () => answerAsk('cancel'),
+          },
+            React.createElement('div', { className: 'dsh-fe-ask-card', onClick: (ev) => ev.stopPropagation() },
+              React.createElement('div', { className: 'dsh-fe-ask-title' }, '保存修改？'),
+              React.createElement('div', { className: 'dsh-fe-ask-body' },
+                '以下文件有未保存的编辑（' + store.askSave.reason + '）：',
+                store.askSave.paths.map((p) => React.createElement('div', { key: p, className: 'dsh-fe-ask-path' }, p)),
+              ),
+              React.createElement('div', { className: 'dsh-fe-ask-actions' },
+                React.createElement('button', { className: 'dsh-fe-btn dsh-fe-btn-ok', onClick: () => answerAsk('save') }, '保存'),
+                React.createElement('button', { className: 'dsh-fe-btn', onClick: () => answerAsk('discard') }, '不保存'),
+                React.createElement('button', { className: 'dsh-fe-btn', onClick: () => answerAsk('cancel') }, '取消'),
+              ),
+            ),
+          ) : null
+          // v1.13: closing a tab with unsaved edits asks first (req 6).
+          const closeTabWithPrompt = async (t) => {
+            const m = editModels.get(editKeyOf(store.root, t))
+            if (m && m.dirty) {
+              const choice = await new Promise((resolve) => {
+                store.askSave = { paths: [t], reason: '关闭标签', resolve: resolve }
+                store.emit()
+              })
+              if (choice === 'cancel') return
+              if (choice === 'save') {
+                const r = await saveModel(m, sid, t)
+                if (r && r.ok) store.requestRefresh()
+                else if (!r || !(r.code === 'stale' && r.payload)) showToast('保存失败：' + ((r && (r.message || r.error)) || '未知错误'))
+              } else {
+                discardModel(m)
+              }
+            }
+            store.closeTab(t)
+          }
+          const closeAllWithPrompt = async () => {
+            const dirtyTabs = store.tabs.filter((t) => {
+              const m = editModels.get(editKeyOf(store.root, t))
+              return m && m.dirty
+            })
+            if (dirtyTabs.length > 0) {
+              const choice = await new Promise((resolve) => {
+                store.askSave = { paths: dirtyTabs, reason: '关闭全部标签', resolve: resolve }
+                store.emit()
+              })
+              if (choice === 'cancel') return
+              if (choice === 'save') {
+                for (const t of dirtyTabs) {
+                  const m = editModels.get(editKeyOf(store.root, t))
+                  if (m) await saveModel(m, sid, t)
+                }
+                store.requestRefresh()
+              } else {
+                for (const t of dirtyTabs) {
+                  const m = editModels.get(editKeyOf(store.root, t))
+                  if (m) discardModel(m)
+                }
+              }
+            }
+            store.closeAll()
+          }
           const tabs = store.tabs
           const active = store.active
-          const modified = store.modified
+          const dirty = store.dirtyFiles
           if (tabs.length === 0) {
             return React.createElement('div', { className: 'dsh-fe-viewer' },
               React.createElement('div', { className: 'dsh-fe-msg' }, '没有打开的文件：在左侧工作区的「项目文件」中点击/双击文件，或点击修改文件列表中的路径。'))
           }
-          return React.createElement('div', { className: 'dsh-fe-viewer', ref: (node) => { viewerRef.node = node } },
-            React.createElement('div', { className: 'dsh-fe-filetabs', ref: (node) => { tabsRef.node = node } },
-              tabs.map((t, i) => React.createElement('span', {
-                key: t,
-                className: 'dsh-fe-filetab' + (t === active ? ' dsh-fe-filetab-on' : '') + (dragIdx === i ? ' dsh-fe-tab-drag' : ''),
-                title: t,
-                draggable: true,
-                onClick: () => store.activate(t),
-                onDragStart: (ev) => { setDragIdx(i); if (ev.dataTransfer) ev.dataTransfer.effectAllowed = 'move' },
-                onDragEnter: (ev) => { ev.preventDefault(); if (dragIdx !== null && dragIdx !== i) { store.moveTab(dragIdx, i); setDragIdx(i) } },
-                onDragOver: (ev) => ev.preventDefault(),
-                onDragEnd: () => setDragIdx(null),
-              },
-                React.createElement('span', { className: 'dsh-fe-tab-ic' }, IconFile()),
-                t.split('/').pop(),
-                modified.has(t) ? React.createElement('span', { className: 'dsh-fe-tab-dot', title: '有待决定的修改' }, null) : null,
+          return React.createElement(React.Fragment, null,
+            React.createElement('div', { className: 'dsh-fe-viewer', ref: (node) => { viewerRef.node = node } },
+              React.createElement('div', { className: 'dsh-fe-filetabs', ref: (node) => { tabsRef.node = node } },
+                tabs.map((t, i) => React.createElement('span', {
+                  key: t,
+                  className: 'dsh-fe-filetab' + (t === active ? ' dsh-fe-filetab-on' : '') + (dragIdx === i ? ' dsh-fe-tab-drag' : ''),
+                  title: t,
+                  draggable: true,
+                  onClick: () => store.activate(t),
+                  onDragStart: (ev) => { setDragIdx(i); if (ev.dataTransfer) ev.dataTransfer.effectAllowed = 'move' },
+                  onDragEnter: (ev) => { ev.preventDefault(); if (dragIdx !== null && dragIdx !== i) { store.moveTab(dragIdx, i); setDragIdx(i) } },
+                  onDragOver: (ev) => ev.preventDefault(),
+                  onDragEnd: () => setDragIdx(null),
+                },
+                  React.createElement('span', { className: 'dsh-fe-tab-ic' }, IconFile()),
+                  t.split('/').pop(),
+                  // v1.13: WHITE dot = unsaved user edits (replaces the old
+                  // DIFF-pending yellow dot, which is removed entirely).
+                  dirty.has(t) ? React.createElement('span', { className: 'dsh-fe-tab-dirty', title: '有未保存的编辑' }, null) : null,
+                  React.createElement(IconBtn, {
+                    small: true,
+                    className: 'dsh-fe-tab-x',
+                    title: '关闭标签',
+                    onClick: (ev) => { ev.stopPropagation(); void closeTabWithPrompt(t) },
+                    icon: IconClose,
+                  }),
+                )),
                 React.createElement(IconBtn, {
-                  small: true,
-                  className: 'dsh-fe-tab-x',
-                  title: '关闭标签',
-                  onClick: (ev) => { ev.stopPropagation(); store.closeTab(t) },
+                  className: 'dsh-fe-tab-closeall',
+                  title: '关闭全部',
+                  onClick: () => void closeAllWithPrompt(),
                   icon: IconClose,
                 }),
-              )),
-              React.createElement(IconBtn, {
-                className: 'dsh-fe-tab-closeall',
-                title: '关闭全部',
-                onClick: () => store.closeAll(),
-                icon: IconClose,
-              }),
+              ),
+              React.createElement(DiffPane, { sid: sid, path: active }),
             ),
-            React.createElement(DiffPane, { sid: sid, path: active }),
+            askOverlay,
           )
         }
 
         // ---------- registrations ----------
         ensureStyle()
         ctx.effect(() => removeStyle, 'dsh-file-edit: stylesheet')
+        // v1.13: flush pending edit-history persists on teardown and on page
+        // unload (best effort — the debounced persist already covers normal
+        // flows; this closes the shutdown window).
+        ctx.effect(() => {
+          const flush = () => {
+            for (const [, h] of persistTimers) { try { h() } catch (e) {} }
+            persistTimers.clear()
+            for (const mm of editModels.values()) persistNow(mm)
+          }
+          let off = null
+          try { window.addEventListener('beforeunload', flush); off = () => window.removeEventListener('beforeunload', flush) } catch (e) {}
+          return () => { flush(); if (off) off() }
+        }, 'dsh-file-edit: edit engine cleanup')
         // Static (non-dynamic) client plugins use the raw slots service, which
         // does NOT auto-assign a shadowing priority — pass one explicitly so
         // this entry renders instead of the shipped sidebar browser (lower

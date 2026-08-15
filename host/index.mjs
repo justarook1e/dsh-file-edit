@@ -766,6 +766,7 @@ export default {
           f.base = cloneEntry(f.cur)
           f.decisions.clear()
           f.rev++
+          f.justRejected = true
           return
         }
         const snap = rec ? await snapshotForUndo(st, path, rec) : null
@@ -801,6 +802,11 @@ export default {
       }
       f.decisions.clear()
       f.rev++
+      // v1.13: reject rewrites disk content behind the client's back. The
+      // next getDiff payload carries justRejected so the client resets the
+      // per-file user edit history (unsaved user edits are discarded — their
+      // base content was just reverted) instead of trying to reconcile.
+      f.justRejected = true
       // A deleted file came back to disk: notify the client so the sidebar
       // file tree reloads (scan-only detection would miss this write).
       if (wasAbsent) bumpTree(st)
@@ -991,7 +997,17 @@ export default {
           } catch (e) {}
         }
         const prev = args && args.rev !== undefined && args.rev !== null ? Number(args.rev) : undefined
-        return diffPayload(f, prev)
+        const payload = diffPayload(f, prev)
+        // v1.13: root lets the client key its per-file user edit history by
+        // (workspace, relative path) — the history then survives closing/
+        // reopening the tab and switching sessions within the workspace.
+        payload.root = st.root
+        // Transient reject marker (consumed once): a reject/undo-reject just
+        // rewrote disk content, so the client should reset user edit history
+        // for this file rather than reconcile against the new content.
+        if (!payload.same) payload.justRejected = f.justRejected === true
+        if (f.justRejected) f.justRejected = false
+        return payload
       },
 
       async applyHunk(args) {
@@ -1104,6 +1120,149 @@ export default {
         // baseline now — align versions so the toolbar hides.
         const newPending = newAll.filter((h) => !f.decisions.has(h.id))
         if (newPending.length === 0 && f.base && f.base.present) {
+          f.base = { ...cloneEntry(f.base), version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length }
+        }
+        f.rev++
+        saveState(st)
+        return diffPayload(f, undefined)
+      },
+
+      // v1.13: whole-content user save. The client's line editor keeps its
+      // own undo/redo model and sends the FULL current content (its own edits
+      // applied on top of whatever the file held). Semantics extend v1.3's
+      // applyEdit to arbitrary multi-line changes:
+      //  * context edits (outside every pending hunk) fold into the baseline
+      //    at the shift-aligned index — user edits never enter the review;
+      //  * edits inside a pending hunk's new range update cur only, so they
+      //    stay visible inside that hunk until accept/reject;
+      //  * the write keeps the file's original EOL style (CRLF/eol flags).
+      // The rev guard prevents clobbering an agent edit the client has not
+      // seen yet; the stale response carries the fresh payload so the client
+      // can merge its edits onto the new content and retry.
+      async saveUserFile(args) {
+        const st = requireState(args)
+        if (!st) return { ok: false, error: 'no-session' }
+        const sid = String(args.sessionId)
+        const path = args && args.path ? String(args.path) : ''
+        const rawLines = Array.isArray(args.lines) ? args.lines : null
+        if (!rawLines) return { ok: false, code: 'bad', message: '无效的保存内容' }
+        const lines = rawLines.map((s) => String(s).replace(/\r/g, ''))
+        if (!st.baseReady) await scan(sid)
+        else {
+          // On-disk freshness check (mirrors getDiff's dirty-branch refresh):
+          // the editor may have been open across an agent edit the scan has
+          // not absorbed yet — refresh this file first so the rev guard below
+          // sees the true state instead of silently overwriting agent work.
+          const f0 = st.files.get(path)
+          if (f0 && f0.cur) {
+            try {
+              const target = await fs.resolve(joinPath(st.root, path))
+              const info = await fs.stat(target)
+              if (!info || !f0.cur.present || f0.cur.version !== info.version || f0.cur.size !== info.size) {
+                if (f0.decisions.size > 0) { f0.decisions.clear(); f0.rev++ }
+                f0.cur = await loadFileEntry(st, path)
+                f0.rev++
+              }
+            } catch (e) {}
+          }
+        }
+        if (st.error) return { ok: false, error: st.error }
+        let f = st.files.get(path)
+        if (!f || !f.cur) {
+          // Never went through a scan: load on demand (same attribution rules
+          // as getDiff — agent-created files stay reviewable as "added").
+          try {
+            const entry = await loadFileEntry(st, path)
+            if (!f) {
+              f = { base: null, cur: null, rev: 0, decisions: new Map() }
+              st.files.set(path, f)
+              bumpTree(st)
+            }
+            f.cur = entry
+            if (f.base === null) {
+              if (st.touched.has(path)) { f.base = absentEntry(); st.touched.delete(path) } else { f.base = cloneEntry(entry) }
+            }
+            f.rev++
+            saveState(st)
+          } catch (e) {
+            return { ok: false, code: 'not-found', message: '文件不存在' }
+          }
+        }
+        if (!f.cur || !f.cur.present) return { ok: false, code: 'deleted', message: '文件已被删除' }
+        f.justRejected = false
+        const wantRev = args && args.rev !== undefined && args.rev !== null ? Number(args.rev) : NaN
+        if (Number.isFinite(wantRev) && f.rev !== wantRev) {
+          return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试', payload: diffPayload(f, undefined) }
+        }
+        const baseLines = entryLines(f.base)
+        const curLines = entryLines(f.cur)
+        const all = computeHunks(baseLines, curLines)
+        const canFold = !!(f.base && f.base.present && f.base.content !== null)
+        let newBase = canFold ? baseLines.slice() : null
+        if (newBase) {
+          // inHunkAt[i] = cur index i sits inside a pending hunk's new range;
+          // shiftAt[i] = Σ(newLen−oldLen) over hunks starting at or before i
+          // (maps a cur index onto the aligned baseline index).
+          const inHunkAt = new Array(curLines.length + 1).fill(false)
+          const shiftAt = new Array(curLines.length + 1).fill(0)
+          for (const h of all) {
+            for (let k = h.newStart; k < h.newStart + h.newLen; k++) inHunkAt[k] = true
+            shiftAt[h.newStart] += h.newLen - h.oldLen
+          }
+          for (let i = 1; i < shiftAt.length; i++) shiftAt[i] += shiftAt[i - 1]
+          const ops = myersOps(curLines, lines)
+          const ctxDel = []
+          const ctxIns = []
+          let insBefore = 0
+          if (ops) {
+            for (const op of ops) {
+              if (op.t === 'e') continue
+              if (op.t === 'd') {
+                const curPos = op.i
+                if (inHunkAt[curPos]) continue
+                ctxDel.push({ idx: curPos - (shiftAt[curPos] || 0) })
+              } else {
+                const curPos = op.j - insBefore
+                insBefore++
+                if (curPos >= 0 && curPos < inHunkAt.length && inHunkAt[curPos]) continue
+                ctxIns.push({ idx: curPos - (shiftAt[curPos] || 0), text: lines[op.j] })
+              }
+            }
+          } else if (all.length === 0) {
+            // Diff engine over budget on a user edit: no pending hunks to
+            // protect, so the whole rewrite counts as a context edit — fold
+            // everything into the baseline (the user owns the new content).
+            newBase = lines.slice()
+          }
+          if (ops) {
+            // Apply in reverse index order so earlier splices stay valid.
+            ctxDel.sort((x, y) => y.idx - x.idx)
+            for (const d of ctxDel) { if (d.idx >= 0 && d.idx < newBase.length) newBase.splice(d.idx, 1) }
+            ctxIns.sort((x, y) => y.idx - x.idx)
+            for (const ins of ctxIns) {
+              const idx = Math.max(0, Math.min(newBase.length, ins.idx))
+              newBase.splice(idx, 0, ins.text)
+            }
+          }
+        }
+        const textOut = joinLines(lines, f.cur.eol, f.cur.crlf)
+        let outcome
+        try {
+          outcome = await writeFile(st, path, textOut)
+        } catch (e) {
+          return { ok: false, error: e && e.message ? String(e.message) : String(e) }
+        }
+        f.cur = { present: true, content: joinLines(lines, f.cur.eol), eol: f.cur.eol, crlf: f.cur.crlf, version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length, binRef: null, binSize: 0, md: f.cur.md === true }
+        if (newBase !== null) f.base = { ...cloneEntry(f.base), content: joinLines(newBase, f.base.eol) }
+        // Hunk topology changed (merged/split/vanished) → drop stale decisions
+        // instead of misapplying them to reshaped hunks (v1.3 rule).
+        const newAll = computeHunks(newBase !== null ? newBase : baseLines, lines)
+        const shapeOf = (h) => h.oldStart + ':' + h.oldLen + ':' + h.newStart + ':' + h.newLen
+        if (all.map(shapeOf).join('|') !== newAll.map(shapeOf).join('|')) f.decisions.clear()
+        const newPending = newAll.filter((h) => !f.decisions.has(h.id))
+        if (newPending.length === 0 && f.base && f.base.present) {
+          // No pending hunks left: the file IS the baseline now — align
+          // versions so isChanged() reports clean (same as applyEdit).
           f.base = { ...cloneEntry(f.base), version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length }
         }
         f.rev++
@@ -1227,6 +1386,9 @@ export default {
             f.cur = await loadFileEntry(st, item.path)
             if (f.decisions.size > 0) f.decisions.clear()
             f.rev++
+            // v1.13: like reject, undoing a reject rewrites disk content —
+            // tell the client to reset this file's user edit history.
+            f.justRejected = true
             // Recreated file: let the sidebar tree know right away; the full
             // scan (dirty) reconciles everything else on the next poll.
             if (expectAbsent) bumpTree(st)
