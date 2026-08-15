@@ -172,6 +172,7 @@ export default {
         return [{ id: 'h0', oldStart: 0, oldLen: a.length, newStart: 0, newLen: b.length, newLines: b.slice() }]
       }
       const hunks = []
+      let shift = 0
       let i = 0
       while (i < ops.length) {
         const op = ops[i]
@@ -183,19 +184,18 @@ export default {
           else { if (h.newStart < 0) h.newStart = o.j; h.newLen++; h.newLines.push(b[o.j]) }
           i++
         }
-        // The fallbacks below must NOT use eqA/eqB: the common prefix/suffix
-        // is trimmed inside myersOps, so the ops array holds no equal ops
-        // and eqA/eqB stay 0 for every trimmed diff. For a pure run the
-        // missing coordinate equals the present one — the trimmed prefix
-        // aligns both files up to the change point, so:
-        //   pure deletion (oldStart set, newStart unset) → newStart = oldStart
-        //   pure insertion (newStart set, oldStart unset) → oldStart = newStart
-        // (The old `= eqA` / `= eqB` fallbacks produced 0 for ANY pure
-        // deletion/insertion: a deleted line's hunk claimed newStart 0, so
-        // the client rendered it at the very top; and an accepted insertion
-        // hunk merged at the top of the file.)
-        if (h.oldStart < 0) h.oldStart = h.newStart
-        if (h.newStart < 0) h.newStart = h.oldStart
+        // Pure runs borrow the counterpart coordinate, corrected by the
+        // CUMULATIVE shift accumulated from every earlier hunk (each prior
+        // change moves the new file's indices by newLen − oldLen). The naive
+        // mirror (newStart = oldStart) was only right for the FIRST hunk —
+        // later pure hunks drifted by one per preceding change (live payload
+        // with three deletions reported 101/197 instead of 100/195, which
+        // also starved the last hunk of its trailing context block and broke
+        // the jump caret chain). Op-derived coordinates (o.i/o.j) are already
+        // absolute full-array indices and need no shift.
+        if (h.oldStart < 0) h.oldStart = h.newStart - shift
+        if (h.newStart < 0) h.newStart = h.oldStart + shift
+        shift += h.newLen - h.oldLen
         hunks.push(h)
       }
       for (let k = 0; k < hunks.length; k++) hunks[k].id = 'h' + k

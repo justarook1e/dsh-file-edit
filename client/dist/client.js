@@ -464,7 +464,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.12.5: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.12.6: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -2557,6 +2557,12 @@ window.__ModuleLoader__.load({
               let editable = targetNode.querySelector('.dsh-fe-tx-edit')
               if (!editable && targetNode.nextElementSibling) {
                 editable = targetNode.nextElementSibling.querySelector('.dsh-fe-tx-edit')
+              }
+              // Deletion at the very end of the file: no following block —
+              // land on the last editable line BEFORE the hunk instead.
+              if (!editable && targetNode.previousElementSibling) {
+                const prevs = targetNode.previousElementSibling.querySelectorAll('.dsh-fe-tx-edit')
+                if (prevs.length > 0) editable = prevs[prevs.length - 1]
               }
               if (!editable) return
               try {
