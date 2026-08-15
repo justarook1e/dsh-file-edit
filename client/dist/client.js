@@ -464,7 +464,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.12.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.12.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
@@ -743,6 +743,13 @@ window.__ModuleLoader__.load({
           // that has never rendered.
           '.dsh-fe-line { content-visibility:auto; contain-intrinsic-size:auto 19px; }',
           '.dsh-fe-md > * { content-visibility:auto; contain-intrinsic-size:auto 24px; }',
+          // ---- v1.12.3: shell StateDot "ongoing" chase, replicated ----
+          // Same color token, keyframe steps and per-cell delays as
+          // ui-primitives/StateDot.module.css (blue --dsw-static-deepseek-450).
+          '.dsh-fe-run-matrix { flex:none; color:var(--dsw-static-deepseek-450, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary))); }',
+          '.dsh-fe-run-cell { fill:currentColor; opacity:.15; animation:dsh-fe-run-chase 1s infinite; }',
+          '@keyframes dsh-fe-run-chase { 0%,12.4% { opacity:1 } 12.5%,24.9% { opacity:.6 } 25%,37.4% { opacity:.35 } 37.5%,100% { opacity:.15 } }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-run-cell { animation:none; opacity:.6 } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -794,6 +801,24 @@ window.__ModuleLoader__.load({
         const IconChevUp = () => React.createElement('svg', { ...svgBase, width: 16, height: 12, viewBox: '0 0 16 12', strokeWidth: 2 }, [P('M2.5 8.5 L8 3 L13.5 8.5')])
         const IconChevDown = () => React.createElement('svg', { ...svgBase, width: 16, height: 12, viewBox: '0 0 16 12', strokeWidth: 2 }, [P('M2.5 3.5 L8 9 L13.5 3.5')])
         const IconClock = () => I(14, '0 0 14 14', [React.createElement('circle', { cx: 7, cy: 7, r: 5.3 }), P('M7 4.2 V7 L9.2 8.4')])
+        // v1.12.3: the shell's own running indicator — StateDot state="ongoing"
+        // (packages/client/ui-primitives/src/StateDot.tsx + StateDot.module.css):
+        // a 3x3 pixel matrix whose 8 outer cells chase clockwise with a stepped
+        // brightness trail. Static client bundles cannot import shell packages,
+        // so this is a faithful replica: same 10x10 viewBox, crispEdges, cell
+        // geometry, keyframe steps and per-rect negative delays
+        // ((index - 8) * 125ms), blue via the same --dsw-static-deepseek-450.
+        const IconRunning = () => React.createElement('svg', {
+          width: 10, height: 10, viewBox: '0 0 10 10',
+          shapeRendering: 'crispEdges', 'aria-hidden': true,
+          className: 'dsh-fe-run-matrix',
+        }, [[0, 0], [4, 0], [8, 0], [8, 4], [8, 8], [4, 8], [0, 8], [0, 4]].map((c, index) =>
+          React.createElement('rect', {
+            key: c[0] + '-' + c[1],
+            className: 'dsh-fe-run-cell',
+            x: c[0], y: c[1], width: 2, height: 2,
+            style: { animationDelay: ((index - 8) * 125) + 'ms' },
+          })))
         const IconPencil = () => I(14, '0 0 14 14', [P('M12 3.6 L10.4 2 a1.1 1.1 0 0 0 -1.6 0 L3.4 7.4 V10.6 H6.6 L12 5.2 a1.1 1.1 0 0 0 0 -1.6 Z'), P('M8.6 2.8 L11.2 5.4')])
         const IconPlus = () => I(12, '0 0 14 14', [P('M7 2.5 V11.5'), P('M2.5 7 H11.5')])
         const IconClose = () => I(11, '0 0 14 14', [P('M4 4 L10 10'), P('M10 4 L4 10')])
@@ -936,7 +961,9 @@ window.__ModuleLoader__.load({
                   onClick: () => ctx.sessions.open(s.id),
                   title: s.id + (s.updatedAt ? '\n' + new Date(s.updatedAt).toLocaleString() : ''),
                 },
-                  React.createElement('span', { className: 'dsh-fe-dot' + (s.running ? ' dsh-fe-dot-run' : (s.completed ? ' dsh-fe-dot-done' : '')) }),
+                  s.running
+                    ? IconRunning()
+                    : React.createElement('span', { className: 'dsh-fe-dot' + (s.completed ? ' dsh-fe-dot-done' : '') }),
                   React.createElement('span', { className: 'dsh-fe-sess-name' }, s.displayTitle),
                   React.createElement('span', { className: 'dsh-fe-sess-time' }, timeAgo(s.updatedAt, Date.now())),
                 )),
@@ -2349,7 +2376,7 @@ window.__ModuleLoader__.load({
             if (editable && idx !== null && idx !== undefined) lineText.set(idx, text)
             const isOld = cls.indexOf('dsh-fe-old') >= 0
             if (!editable) {
-              return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls },
+              return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls, 'data-n': String(r.n) },
                 React.createElement('span', { className: 'dsh-fe-ln' }, String(r.n)),
                 React.createElement('span', { className: 'dsh-fe-txwrap' },
                   React.createElement('span', {
@@ -2365,7 +2392,7 @@ window.__ModuleLoader__.load({
             // the layer imperatively; React only rewrites the span when its
             // React-side text changes (commit/poll), which always matches the
             // committed DOM text.
-            return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls },
+            return React.createElement('div', { key: key, className: 'dsh-fe-line ' + cls, 'data-n': String(r.n) },
               React.createElement('span', { className: 'dsh-fe-ln' }, String(r.n)),
               React.createElement('span', {
                 className: 'dsh-fe-txwrap',
@@ -2439,12 +2466,48 @@ window.__ModuleLoader__.load({
             // Empty file: one placeholder editable line so typing creates line 1.
             blocks.push({ kind: 'ctx', rows: [{ n: 1, text: '', idx: 0 }] })
           }
-          // v1.7: diff jump controls. Wraparound prev/next over the hunk
-          // list; the counter follows manual scrolling as well.
+          // v1.7: diff jump controls. The counter follows manual scrolling
+          // as well.
           // v1.8.2: landing strategy = the hunk's FIRST line, scrolled by the
           // element that ACTUALLY scrolls. The shell's chat scroller — not
           // window — owns page scrolling, so the ancestor walk finds it; the
           // internal diff viewport is preferred when the pane is bounded.
+          // v1.12.3: prev/next no longer step from the tracked focus index —
+          // they resolve the line the user is actually parked at (the pane's
+          // top visible line) and jump to the first hunk strictly BELOW it
+          // (next) / strictly ABOVE it (prev), wrapping around. The tracked
+          // index still drives the counter + current-hunk highlight, and
+          // syncs from the landing jump and from manual scroll.
+          const pickHunkFromTop = (positions, topLine, dir) => {
+            const total = positions.length
+            if (total === 0) return -1
+            if (dir === 'next') {
+              for (let k = 0; k < total; k++) if (positions[k] > topLine) return k
+              return 0
+            }
+            for (let k = total - 1; k >= 0; k--) if (positions[k] < topLine) return k
+            return total - 1
+          }
+          const topLineAt = () => {
+            const pane = paneRef.node
+            if (!pane) return 1
+            const rect = pane.getBoundingClientRect()
+            // Probe below the pane's top edge: the toolbar (and the zero-height
+            // jump strip) may sit there; the first .dsh-fe-line hit is the row
+            // the user is visually parked at. content-visibility guarantees
+            // visible rows are rendered, so elementFromPoint resolves them.
+            for (let y = rect.top + 2; y <= rect.top + 120; y += 7) {
+              let el = null
+              try { el = document.elementFromPoint(rect.left + 8, y) } catch (e) {}
+              if (!el || typeof el.closest !== 'function') continue
+              const line = el.closest('.dsh-fe-line')
+              if (line) {
+                const n = Number(line.getAttribute('data-n'))
+                if (n > 0) return n
+              }
+            }
+            return 1
+          }
           const jumpTo = (k) => {
             const total = hunks.length
             if (total === 0) return
@@ -2474,6 +2537,12 @@ window.__ModuleLoader__.load({
               try { scroller.scrollTop = Math.max(0, target) } catch (e2) { try { node.scrollIntoView() } catch (e3) {} }
             }
           }
+          const jumpRel = (dir) => {
+            if (hunks.length === 0) return
+            const positions = hunks.map((h) => h.newStart + 1)
+            const t = pickHunkFromTop(positions, topLineAt(), dir)
+            if (t >= 0) jumpTo(t)
+          }
           const onDiffScroll = () => {
             if (scrollGate.pending) return
             scrollGate.pending = true
@@ -2498,8 +2567,8 @@ window.__ModuleLoader__.load({
           // Only exists while the file has diff changes; disappears with them.
           const jump = hunks.length > 0 ? React.createElement('div', { className: 'dsh-fe-jump' },
             React.createElement('span', { className: 'dsh-fe-jump-count' }, (curFocus + 1) + ' / ' + hunks.length),
-            React.createElement('button', { type: 'button', className: 'dsh-fe-jump-btn', title: '上一处变更（到最后一块时循环回第一块）', onClick: () => jumpTo(curFocus - 1) }, IconChevUp(), '上一处'),
-            React.createElement('button', { type: 'button', className: 'dsh-fe-jump-btn', title: '下一处变更（到最后一块时循环回第一块）', onClick: () => jumpTo(curFocus + 1) }, '下一处', IconChevDown()),
+            React.createElement('button', { type: 'button', className: 'dsh-fe-jump-btn', title: '上一处变更（按当前视图停留位置向上查找，循环）', onClick: () => jumpRel('prev') }, IconChevUp(), '上一处'),
+            React.createElement('button', { type: 'button', className: 'dsh-fe-jump-btn', title: '下一处变更（按当前视图停留位置向下查找，循环）', onClick: () => jumpRel('next') }, '下一处', IconChevDown()),
           ) : null
           return React.createElement('div', { className: 'dsh-fe-pane', ref: (node) => { paneRef.node = node } },
             toolbar,
