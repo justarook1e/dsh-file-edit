@@ -1,6 +1,6 @@
 # dsh-file-edit 文件编辑器视图 UI 流畅性优化方案
 
-> 状态：**方案已实施（v1.16.0，本地完成，未推送 GitHub）**——第 1–4 步（A-1/A-2/B-1/C-1）已落地并过集成测试；A-3、C-2 与第 4 节 Worker 化留待 Profiler 复测后决定。实施记录见 `dsh-file-edit-plugin-status.md` §28.4。
+> 状态：**方案已实施并推送 GitHub（v1.16.0，commit `5559ed8`）**——第 1–4 步（A-1/A-2/B-1/C-1）已落地并过集成测试；A-3、C-2 与第 4 节 Worker 化留待 Profiler 复测后决定。实施记录见 `dsh-file-edit-plugin-status.md` §28.4。
 > 关联：`dsh-file-edit-plugin-status.md` §24 / §27 / §28.3；代码位置一律以 `client/dist/client.js` **v1.15.3 原行号**为准（v1.16.0 已偏移，行号仅作参考）。
 > 目标：① 修改条（ModifiedBar）展开/收起卡顿 ② 文件编辑器视图下键入卡顿（约 1000 行即卡）。
 
