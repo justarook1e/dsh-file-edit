@@ -401,7 +401,6 @@ window.__ModuleLoader__.load({
         // is harmless: a blocked click never reaches the wrapper; an allowed
         // click is forwarded and at most re-checked once by the wrapper.
         let forwarding = false
-        let diagCount = 0
         const dispatchForward = (btn, original) => {
           forwarding = true
           try {
@@ -438,53 +437,33 @@ window.__ModuleLoader__.load({
         // Installed at BOTH window and document capture (window runs first
         // and survives any document-level stopImmediatePropagation); the
         // __dshFbHandled mark makes the second registration a no-op.
-        const diagLog = (kind, ev, btn, extra) => {
-          if (diagCount >= 100) return
-          diagCount++
-          console.info('[dsh-file-edit] guard-diag: ' + kind + ' #' + diagCount
-            + ' target=' + (ev.target && ev.target.tagName ? ev.target.tagName : '?')
-            + ' btn=' + (btn ? ((btn.getAttribute('aria-label') || '').trim() || (btn.textContent || '').replace(/\s+/g, ' ').trim()).slice(0, 24) : 'NONE')
-            + (extra ? ' ' + extra : ''))
-        }
         const onDocClick = (ev) => {
           if (ev.__dshFbHandled) return
           ev.__dshFbHandled = true
           if (forwarding) return
           const btn = buttonFromEvent(ev)
-          diagLog('click', ev, btn)
           if (!btn || !isNativeNewSessionButton(btn)) return
           ev.preventDefault()
           ev.stopPropagation()
           ev.stopImmediatePropagation()
           const sid = currentSessionId()
-          diagLog('click', ev, btn, 'MATCHED sid=' + sid)
-          if (!sid) { showToast('dsh-file-edit 诊断：捕获原生新会话点击（无当前会话，放行）'); dispatchForward(btn, ev); return }
-          checkThen(sid, () => { showToast('dsh-file-edit 诊断：原生新会话点击已放行'); dispatchForward(btn, ev) })
-        }
-        // pointerdown fires before click and cannot be suppressed by a
-        // re-render between press and release: pure diagnostic channel.
-        const onDocPointerDown = (ev) => {
-          diagLog('pointerdown', ev, buttonFromEvent(ev))
+          if (!sid) { dispatchForward(btn, ev); return }
+          checkThen(sid, () => { dispatchForward(btn, ev) })
         }
         document.addEventListener('click', onDocClick, true)
         try { window.addEventListener('click', onDocClick, true) } catch (e) {}
-        document.addEventListener('pointerdown', onDocPointerDown, true)
-        try { window.addEventListener('pointerdown', onDocPointerDown, true) } catch (e) {}
         // Direct per-button attachment: property handlers live on the
         // elements themselves and ride the SAME event React uses, so they
         // fire even when addEventListener/capture delivery is broken in this
         // page. stopPropagation at target prevents React's root listener.
         let attachRuns = 0
-        let attachToastShown = false
         const attachDirect = () => {
           if (guardDisposed) return
           attachRuns++
           try {
-            let n = 0
             document.querySelectorAll('button').forEach((b) => {
               if (b.__dshFbDirect || !isNativeNewSessionButton(b)) return
               b.__dshFbDirect = true
-              n++
               const allowStartSession = () => {
                 try {
                   const live = ctx.workspaces
@@ -497,23 +476,10 @@ window.__ModuleLoader__.load({
                 ev.preventDefault()
                 ev.stopPropagation()
                 const sid = currentSessionId()
-                diagLog('click', ev, b, 'DIRECT sid=' + sid)
-                if (!sid) { showToast('dsh-file-edit 诊断：捕获原生新会话点击（无当前会话，放行）'); allowStartSession(); return }
-                checkThen(sid, () => { showToast('dsh-file-edit 诊断：原生新会话点击已放行'); allowStartSession() })
+                if (!sid) { allowStartSession(); return }
+                checkThen(sid, () => { allowStartSession() })
               }
             })
-            if (n > 0 && typeof console !== 'undefined' && console.info) {
-              console.info('[dsh-file-edit] guard-diag: direct-attach run=' + attachRuns + ' attached=' + n)
-            }
-            if (typeof console !== 'undefined' && console.info) {
-              console.info('[dsh-file-edit] guard-diag: attach run=' + attachRuns + ' n=' + n + ' totalButtons=' + document.querySelectorAll('button').length)
-            }
-            // Visible confirmation through the toast channel (console output
-            // has proven unreliable in this environment).
-            if (n > 0 && !attachToastShown) {
-              attachToastShown = true
-              showToast('dsh-file-edit 诊断：已接管 ' + n + ' 个原生新会话按钮')
-            }
           } catch (e) {}
         }
         // Self-rescheduling setTimeout loop: this environment has proven
@@ -526,51 +492,13 @@ window.__ModuleLoader__.load({
           if (attachRuns < 30) setTimeout(attachLoop, 2000)
         }
         attachLoop()
-        // Verify the listener plumbing once shortly after boot: dispatch a
-        // probe event through our own listeners and report whether it fired.
-        setTimeout(() => {
-          let fired = 0
-          const probe = () => { fired++ }
-          try {
-            document.addEventListener('dshfb-probe', probe)
-            window.addEventListener('dshfb-probe', probe)
-            document.dispatchEvent(new Event('dshfb-probe', { bubbles: true }))
-            document.removeEventListener('dshfb-probe', probe)
-            window.removeEventListener('dshfb-probe', probe)
-          } catch (e) {}
-          if (typeof console !== 'undefined' && console.info) {
-            console.info('[dsh-file-edit] guard-diag: listener probe fired=' + fired)
-          }
-        }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.13.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.13.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
-        // One-shot inventory of session-labelled buttons after the app
-        // renders (diagnostic; removed once the native path is confirmed).
-        const diagInventory = () => {
-          try {
-            const list = []
-            document.querySelectorAll('button').forEach((b) => {
-              const aria = (b.getAttribute('aria-label') || '').trim()
-              const text = (b.textContent || '').replace(/\s+/g, ' ').trim()
-              if (/会话|Session|New/i.test(aria + ' ' + text)) {
-                list.push({ a: aria.slice(0, 40), t: text.slice(0, 40), guarded: !!b.getAttribute('data-dsh-fe-guarded') })
-              }
-            })
-            console.info('[dsh-file-edit] guard-diag: buttons=' + JSON.stringify(list))
-            // This timer path is PROVEN to run in this environment — attach
-            // from here too (idempotent) in case the dedicated loop is broken.
-            attachDirect()
-          } catch (e) {}
-        }
-        setTimeout(() => { diagInventory() }, 1500)
-        setTimeout(() => { diagInventory() }, 4000)
         ctx.effect(() => () => {
           guardDisposed = true
           document.removeEventListener('click', onDocClick, true)
           try { window.removeEventListener('click', onDocClick, true) } catch (e) {}
-          document.removeEventListener('pointerdown', onDocPointerDown, true)
-          try { window.removeEventListener('pointerdown', onDocPointerDown, true) } catch (e) {}
           try {
             document.querySelectorAll('button').forEach((b) => { if (b.__dshFbDirect) { b.onclick = null; b.__dshFbDirect = false } })
           } catch (e) {}
