@@ -20,7 +20,7 @@
 
 param(
   [switch]$Uninstall,
-  [string]$Profile = 'web',
+  [string]$ProfileName = 'web',
   [string]$Dsh = ''
 )
 
@@ -30,25 +30,28 @@ function Resolve-DshInvocation {
   param([string]$Dsh)
   if (-not [string]::IsNullOrEmpty($Dsh)) { return @{ Exe = $Dsh; Script = $null } }
   $cmd = Get-Command dsh -ErrorAction SilentlyContinue
-  if ($cmd) { return @{ Exe = $cmd.Source; Script = $null } }
+  # Only a real executable/sh script is usable; an alias or function has no
+  # Source, so fall through to the known installation paths.
+  if ($cmd -and $cmd.Source) { return @{ Exe = $cmd.Source; Script = $null } }
   $fallback = Join-Path $env:USERPROFILE 'deepseek-harness\apps\cli\lib\bin.js'
   if (Test-Path -LiteralPath $fallback) { return @{ Exe = 'node'; Script = $fallback } }
   throw "dsh CLI not found on PATH; install dsh or pass -Dsh '<path-to-dsh-cli>'"
 }
 
 function Invoke-Dsh {
-  param($Inv, [string[]]$Args)
-  if ($Inv.Script) { & $Inv.Exe $Inv.Script @Args; return $LASTEXITCODE }
-  & $Inv.Exe @Args
-  return $LASTEXITCODE
+  param($Inv, [string[]]$Rest)
+  # Child stdout flows straight to the console; the native exit code is
+  # picked up by the caller via $LASTEXITCODE (never capture it here, or the
+  # child's output lines would land in the assignment).
+  if ($Inv.Script) { & $Inv.Exe $Inv.Script @Rest } else { & $Inv.Exe @Rest }
 }
 
-$dsh = Resolve-DshInvocation -Dsh $Dsh
+$dshInv = Resolve-DshInvocation -Dsh $Dsh
 
 if ($Uninstall) {
-  "removing dsh-file-edit from profile '$Profile' ..."
-  $code = Invoke-Dsh $dsh @('plugin', '--profile', $Profile, 'remove', 'dsh-file-edit')
-  if ($code -ne 0) { throw "dsh plugin remove failed with exit code $code" }
+  "removing dsh-file-edit from profile '$ProfileName' ..."
+  Invoke-Dsh $dshInv @('plugin', '--profile', $ProfileName, 'remove', 'dsh-file-edit')
+  if ($LASTEXITCODE -ne 0) { throw "dsh plugin remove failed with exit code $LASTEXITCODE" }
   ""
   "Uninstall done. Restart DSH to apply."
   return
@@ -65,11 +68,11 @@ if ($PSScriptRoot -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'package
   "installing from GitHub: $spec"
 }
 
-$code = Invoke-Dsh $dsh @('plugin', '--profile', $Profile, 'add', $spec)
-if ($code -ne 0) { throw "dsh plugin add failed with exit code $code" }
+Invoke-Dsh $dshInv @('plugin', '--profile', $ProfileName, 'add', $spec)
+if ($LASTEXITCODE -ne 0) { throw "dsh plugin add failed with exit code $LASTEXITCODE" }
 
 ""
-"dsh-file-edit installed into profile '$Profile' (managed bundle)."
+"dsh-file-edit installed into profile '$ProfileName' (managed bundle)."
 "Next steps:"
 "  1. restart DSH (loads the new bundle layer)"
 "  2. hard-refresh the web page (Ctrl+F5) so the browser picks up the client bundle"
