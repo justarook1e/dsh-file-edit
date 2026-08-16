@@ -163,6 +163,21 @@ window.__ModuleLoader__.load({
           }, [])
         }
 
+        // v1.13.3: all instant channels used to gate on store.sessionId,
+        // which is only written when the ModifiedBar/FileView components
+        // mount — on views where neither is mounted every channel went
+        // silently dormant (no sse open, no activity wake). Resolve the
+        // current session from the sessions list snapshot instead (the same
+        // source the guard uses), heal the store, and fall back to it.
+        const sidNow = () => {
+          try {
+            const snap = ctx.sessions && ctx.sessions.list ? ctx.sessions.list.getSnapshot() : null
+            const cur = snap && snap.current ? String(snap.current) : ''
+            if (cur && snap.byId && snap.byId[cur]) return cur
+          } catch (e) {}
+          return store.sessionId || null
+        }
+
         // -------- instant refresh watcher (long-poll against host `wait`) --------
         // The host resolves `wait` the instant a mutating tool result lands
         // (write/edit, or a shell/pwsh command matching the host's mutating-
@@ -213,7 +228,7 @@ window.__ModuleLoader__.load({
         }
         const ensureWatcher = () => {
           if (watcherDisposed) return
-          const sid = store.sessionId
+          const sid = sidNow()
           if (!sid || sid === watcherSid) return
           watcherSid = sid
           watcherToken++
@@ -244,8 +259,13 @@ window.__ModuleLoader__.load({
             if (!sseWarned) { sseWarned = true; console.warn('[dsh-file-edit] sse unavailable: EventSource is not defined in this page') }
             return
           }
-          const sid = store.sessionId
-          if (!sid || sid === sseSid) return
+          const sid = sidNow()
+          if (!sid) {
+            if (!sseWarned) { sseWarned = true; console.warn('[dsh-file-edit] sse skip: no current session id (snapshot + store both empty)') }
+            return
+          }
+          if (sid !== store.sessionId) store.setSessionId(sid) // heal the store for other consumers
+          if (sid === sseSid) return
           closeSse()
           try {
             sseConn = new EventSource('/dsh-file-edit/events?sessionId=' + encodeURIComponent(sid))
@@ -273,16 +293,19 @@ window.__ModuleLoader__.load({
         // session while it is running requests ONE refresh, clock-throttled
         // (no timers involved, so nothing of ours can die).
         let lastActRefresh = 0
+        let actWakeLog = 0
         const onSessionsChanged = () => {
           try {
-            const sid = store.sessionId
+            const sid = sidNow()
             if (!sid) return
+            if (sid !== store.sessionId) store.setSessionId(sid) // heal the store
             const snap = ctx.sessions && ctx.sessions.list ? ctx.sessions.list.getSnapshot() : null
             const entry = snap && snap.byId ? snap.byId[sid] : null
             if (!entry || !entry.running) return
             const now = Date.now()
             if (now - lastActRefresh < 1200) return
             lastActRefresh = now
+            if (actWakeLog < 3) { actWakeLog++; console.info('[dsh-file-edit] activity wake: ' + sid) }
             store.requestRefresh()
           } catch (e) {}
         }
