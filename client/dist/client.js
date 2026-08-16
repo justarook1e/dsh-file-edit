@@ -493,7 +493,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.13.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.14.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -768,6 +768,29 @@ window.__ModuleLoader__.load({
           '.dsh-fe-run-cell { fill:currentColor; opacity:.15; animation:dsh-fe-run-chase 1s infinite; }',
           '@keyframes dsh-fe-run-chase { 0%,12.4% { opacity:1 } 12.5%,24.9% { opacity:.6 } 25%,37.4% { opacity:.35 } 37.5%,100% { opacity:.15 } }',
           '@media (prefers-reduced-motion: reduce) { .dsh-fe-run-cell { animation:none; opacity:.6 } }',
+          // ---- v1.14: sticky scope bar (VSCode-style sticky scroll) ----
+          // A zero-height sticky strip (the same pattern as the jump row)
+          // whose body hangs below the sticky header stack. In the bounded
+          // layout it simply sits above the internal diff viewport; when the
+          // chat column scrolls it sticks below tabs+toolbar. The body
+          // overlays the first code line while a definition scope is active
+          // and hides (strip stays zero-height, so no layout shift) when
+          // there is nothing to show. Segments reuse the token palette
+          // classes for fn/cls/tag/key coloring; a dim keyword label (class/
+          // def/func/...) prefixes each level. The bar sits FLUSH against
+          // the toolbar (no gap) and is shorter + visually distinct from
+          // the two header rows above it.
+          '.dsh-fe-scope { position:sticky; top:calc(var(--dsh-fe-tabs-h, 32px) + var(--dsh-fe-toolbar-h, 35px)); z-index:3; height:0; display:flex; align-items:flex-start; }',
+          '.dsh-fe-scope-body { display:flex; align-items:center; gap:1px; width:100%; max-width:100%; overflow:hidden; white-space:nowrap; padding:1px 8px; border-bottom:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-2); font-size:11px; line-height:1.35; font-family:ui-monospace,Consolas,monospace; color:var(--dsw-alias-label-primary); }',
+          '.dsh-fe-scope-body:empty { display:none; }',
+          '.dsh-fe-scope-sep { flex:none; margin:0 3px; color:var(--dsw-alias-label-secondary); opacity:.75; }',
+          '.dsh-fe-scope-seg { flex:none; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:none; background:transparent; padding:0 6px; border-radius:4px; font-size:11px; font-family:inherit; cursor:pointer; line-height:1.35; transition:background .12s ease; }',
+          '.dsh-fe-scope-seg:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 14%, transparent); }',
+          '.dsh-fe-scope-seg:focus-visible { outline:1px solid var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)); outline-offset:-1px; }',
+          '.dsh-fe-scope-kw { color:var(--dsw-alias-label-secondary); font-style:italic; margin-right:4px; }',
+          '@keyframes dsh-fe-scope-flash { from { background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 26%, transparent); } to { background:transparent; } }',
+          '.dsh-fe-line.dsh-fe-scope-flash { animation:dsh-fe-scope-flash .9s ease-out; }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-scope-seg { transition:none; } .dsh-fe-line.dsh-fe-scope-flash { animation:none; } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -2158,6 +2181,327 @@ window.__ModuleLoader__.load({
           return LANG_BY_EXT[ext] || null
         }
 
+        // ---------- sticky scope bar (v1.14) ----------
+        // Definition-line detectors + a one-pass outline builder, shared by
+        // the code view and the large-file preview. The bar shows the chain
+        // of enclosing definitions for the first visible line; clicking a
+        // segment scrolls to its definition. Heuristics, not parsers: rare
+        // false positives are acceptable for a navigation aid and never
+        // touch the document.
+        const CF_CTRL = S('if for while switch return do else case default goto throw new delete sizeof using try catch break continue with when where')
+        const MOD_LISTS = {
+          c: ['static', 'extern', 'inline', 'const', 'volatile', 'register'],
+          cpp: ['static', 'extern', 'inline', 'virtual', 'constexpr', 'const', 'friend', 'public', 'private', 'protected', 'final', 'override', 'explicit', 'noexcept', 'template', 'typename'],
+          java: ['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default', 'strictfp', 'transient', 'volatile'],
+          csharp: ['public', 'private', 'protected', 'internal', 'static', 'virtual', 'override', 'abstract', 'sealed', 'extern', 'unsafe', 'partial', 'readonly', 'new', 'async', 'const', 'ref', 'in', 'out', 'file', 'required'],
+          javascript: ['static', 'async', 'get', 'set', 'public', 'private', 'protected', 'readonly', 'abstract', 'declare', 'override'],
+          typescript: ['static', 'async', 'get', 'set', 'public', 'private', 'protected', 'readonly', 'abstract', 'declare', 'override'],
+          kotlin: ['public', 'private', 'protected', 'internal', 'final', 'open', 'abstract', 'sealed', 'data', 'annotation', 'companion', 'const', 'lateinit', 'override', 'suspend', 'operator', 'infix', 'inline', 'external', 'tailrec', 'crossinline', 'noinline', 'reified', 'value', 'expect', 'actual', 'inner', 'vararg'],
+          swift: ['public', 'private', 'fileprivate', 'internal', 'open', 'final', 'static', 'override', 'required', 'convenience', 'mutating', 'nonmutating', 'lazy', 'indirect', 'dynamic', 'nonisolated'],
+          php: ['public', 'private', 'protected', 'static', 'final', 'abstract', 'readonly'],
+        }
+        // C-family rule: [modifiers] (decl-keyword name | type-seq name()).
+        // Keyword/control-flow/builtin guards plus a trailing-brace or
+        // declaration-shape requirement keep plain call statements out.
+        const cStyleDef = (t, cfg, mods, extraDecl) => {
+          if (!t) return null
+          let s = t
+          let guard = 0
+          while (guard++ < 10) {
+            const mm = /^([A-Za-z_][\w]*)\s+/.exec(s)
+            if (mm && mods && mods.indexOf(mm[1]) >= 0) { s = s.slice(mm[0].length); continue }
+            break
+          }
+          if (/^typedef\b/.test(s)) {
+            let m = /\}\s*([A-Za-z_]\w*)\s*;?\s*$/.exec(s)
+            if (!m) m = /^typedef\s+[^;{}]*\s([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*;?\s*$/.exec(s)
+            if (m) return { name: m[1], kind: 'cls', kw: 'typedef' }
+            return null
+          }
+          const declSet = {}
+          for (const k of Object.keys(cfg.decl || {})) declSet[k.toLowerCase()] = 1
+          for (const k of Object.keys(extraDecl || {})) declSet[k.toLowerCase()] = 1
+          const dm = /^([A-Za-z_]\w*)(?=\s)/.exec(s)
+          if (dm && declSet[dm[1].toLowerCase()]) {
+            if (dm[1] === 'val' || dm[1] === 'var' || dm[1] === 'let' || dm[1] === 'const') return null
+            let rest = s.slice(dm[0].length).replace(/^\s+/, '')
+            const m2 = /^([A-Za-z_~]\w*)(?=\s|\()/.exec(rest)
+            let name = m2 ? m2[1] : null
+            if (m2 && declSet[m2[1].toLowerCase()]) {
+              rest = rest.slice(m2[0].length).replace(/^\s+/, '')
+              const m3 = /^([A-Za-z_~]\w*)/.exec(rest)
+              name = m3 ? m3[1] : null
+            }
+            if (!name || !/^[A-Za-z_~]/.test(name)) return null
+            const w = dm[1].toLowerCase()
+            return { name: name, kind: (w === 'fun' || w === 'func' || w === 'function' || w === 'def' || w === 'fn') ? 'fn' : 'cls', kw: dm[1] }
+          }
+          const mm = /^([A-Za-z_~]\w*(?:[&*<>\s:.]+[A-Za-z_~:.]\w*)*)\s*\(/.exec(s)
+          if (!mm) return null
+          const seq = mm[1]
+          const nm = /([A-Za-z_~]\w*)\s*$/.exec(seq)
+          if (!nm) return null
+          const name = nm[1].replace(/^~+/, '')
+          const fw = /^([A-Za-z_]\w*)/.exec(seq)
+          if (fw && CF_CTRL[fw[1].toLowerCase()]) return null
+          const kw = cfg.kw || {}
+          if (kw[name] || kw[name.toLowerCase()]) return null
+          if (cfg.builtin && (cfg.builtin[name] || cfg.builtin[name.toLowerCase()])) return null
+          if (cfg.const && (cfg.const[name] || cfg.const[name.toLowerCase()])) return null
+          const multiWord = /[\s:&*<>]/.test(seq)
+          if (/\{\s*$/.test(s)) return { name: name, kind: 'fn' }
+          if (multiWord && /\)\s*$/.test(s)) return { name: name, kind: 'fn' }
+          return null
+        }
+        const DEF_RULES = {
+          python: (t) => {
+            let m = /^(?:async\s+)?def\s+([A-Za-z_]\w*)/.exec(t)
+            if (m) return { name: m[1], kind: 'fn', kw: 'def' }
+            m = /^class\s+([A-Za-z_]\w*)/.exec(t)
+            if (m) return { name: m[1], kind: 'cls', kw: 'class' }
+            return null
+          },
+          java: (t) => cStyleDef(t, HL_LANGS.java, MOD_LISTS.java),
+          c: (t) => cStyleDef(t, HL_LANGS.c, MOD_LISTS.c),
+          cpp: (t) => {
+            const u = /^using\s+([A-Za-z_]\w*)\s*=/.exec(t)
+            if (u) return { name: u[1], kind: 'cls' }
+            return cStyleDef(t, HL_LANGS.cpp, MOD_LISTS.cpp, { namespace: 1 })
+          },
+          csharp: (t) => cStyleDef(t, HL_LANGS.csharp, MOD_LISTS.csharp, { namespace: 1 }),
+          javascript: (t) => {
+            let s = t
+            const ex = /^export\s+(?:default\s+)?/.exec(s)
+            if (ex) s = s.slice(ex[0].length)
+            let m = /^(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/.exec(s)
+            if (m) return { name: m[1], kind: 'fn', kw: 'function' }
+            m = /^class\s+([A-Za-z_$][\w$]*)/.exec(s)
+            if (m) return { name: m[1], kind: 'cls', kw: 'class' }
+            m = /^(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.exec(s)
+            if (m) return { name: m[2], kind: 'fn', kw: m[1] }
+            return cStyleDef(s, HL_LANGS.javascript, MOD_LISTS.javascript)
+          },
+          typescript: (t) => {
+            let s = t
+            const ex = /^export\s+(?:default\s+)?/.exec(s)
+            if (ex) s = s.slice(ex[0].length)
+            let m = /^(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/.exec(s)
+            if (m) return { name: m[1], kind: 'fn', kw: 'function' }
+            m = /^(?:declare\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/.exec(s)
+            if (m) return { name: m[1], kind: 'cls', kw: 'class' }
+            m = /^(interface|namespace|enum|type)\s+([A-Za-z_$][\w$]*)/.exec(s)
+            if (m) return { name: m[2], kind: 'cls', kw: m[1] }
+            m = /^(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.exec(s)
+            if (m) return { name: m[2], kind: 'fn', kw: m[1] }
+            return cStyleDef(s, HL_LANGS.typescript, MOD_LISTS.typescript)
+          },
+          go: (t) => {
+            let m = /^func\s*(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/.exec(t)
+            if (m) return { name: m[1], kind: 'fn', kw: 'func' }
+            m = /^type\s+([A-Za-z_]\w*)/.exec(t)
+            if (m) return { name: m[1], kind: 'cls', kw: 'type' }
+            return null
+          },
+          rust: (t) => {
+            let s = t
+            const pm = /^pub\s*(?:\([^)]*\))?\s*/.exec(s)
+            if (pm) s = s.slice(pm[0].length)
+            let m = /^(?:(?:async|unsafe|const|extern)\s+)?(fn|struct|enum|trait|mod|type|const|static)\s+([A-Za-z_]\w*)/.exec(s)
+            if (m) return { name: m[2], kind: m[1] === 'fn' ? 'fn' : 'cls', kw: m[1] }
+            m = /^(?:unsafe\s+)?impl(?:<[^>]*>)?\s+([A-Za-z_]\w*)/.exec(s)
+            if (m) return { name: m[1], kind: 'cls', kw: 'impl' }
+            return null
+          },
+          php: (t) => cStyleDef(t, HL_LANGS.php, MOD_LISTS.php),
+          ruby: (t) => {
+            let m = /^class\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)/.exec(t)
+            if (m) return { name: m[1], kind: 'cls', kw: 'class' }
+            m = /^module\s+([A-Za-z_]\w*)/.exec(t)
+            if (m) return { name: m[1], kind: 'cls', kw: 'module' }
+            m = /^def\s+(?:self\.)?([A-Za-z_]\w*[!?=]?)/.exec(t)
+            if (m) return { name: m[1], kind: 'fn', kw: 'def' }
+            return null
+          },
+          r: (t) => {
+            const m = /^([A-Za-z.][\w.]*)\s*(?:<-|=)\s*function\s*\(/.exec(t)
+            return m ? { name: m[1], kind: 'fn', kw: 'function' } : null
+          },
+          bash: (t) => {
+            let m = /^function\s+([A-Za-z_][\w.-]*)/.exec(t)
+            if (m) return { name: m[1], kind: 'fn', kw: 'function' }
+            m = /^([A-Za-z_][\w.-]*)\s*\(\)\s*\{?/.exec(t)
+            if (m) return { name: m[1], kind: 'fn' }
+            return null
+          },
+          powershell: (t) => {
+            let m = /^(workflow|filter|function)\s+([\w-]+)/i.exec(t)
+            if (m) return { name: m[2], kind: 'fn', kw: m[1].toLowerCase() }
+            m = /^(class|enum)\s+([\w-]+)/i.exec(t)
+            if (m) return { name: m[2], kind: 'cls', kw: m[1].toLowerCase() }
+            return null
+          },
+          swift: (t) => {
+            const m = /^(?:override\s+|public\s+|private\s+|fileprivate\s+|internal\s+|open\s+|final\s+|required\s+|convenience\s+)*(init|deinit|subscript)\b/.exec(t)
+            if (m) return { name: m[1], kind: 'fn', kw: m[1] }
+            // `class` doubles as a member modifier (class func/var) — strip it
+            // only in that position so `class Foo {` still reads as a type.
+            const m1 = /^class\s+(?=var\b|let\b|func\b)/.exec(t)
+            const s = m1 ? t.slice(m1[0].length) : t
+            return cStyleDef(s, HL_LANGS.swift, MOD_LISTS.swift)
+          },
+          kotlin: (t) => cStyleDef(t, HL_LANGS.kotlin, MOD_LISTS.kotlin),
+          sql: (t) => {
+            const m = /^(?:create\s+(?:or\s+replace\s+)?)?(function|procedure|trigger|view|table)\s+([\w"`.[\]]+)/i.exec(t)
+            if (!m) return null
+            const w = m[1].toLowerCase()
+            return { name: m[2], kind: (w === 'function' || w === 'procedure' || w === 'trigger') ? 'fn' : 'cls', kw: w }
+          },
+          json: (t) => {
+            const m = /^"([^"]+)"\s*:\s*[{\[]\s*$/.exec(t)
+            return m ? { name: m[1], kind: 'key' } : null
+          },
+          yaml: (t) => {
+            const m = /^(?:-\s+)?([A-Za-z0-9_-]+|"[^"]*"|'[^']*')\s*:\s*(?:#.*)?$/.exec(t)
+            return m ? { name: m[1].replace(/^["']|["']$/g, ''), kind: 'key' } : null
+          },
+          toml: (t) => {
+            const m = /^(\[\[?)([A-Za-z0-9._"-]+)\]\]?\s*(?:#.*)?$/.exec(t)
+            return m ? { name: m[2], kind: 'key', kw: m[1] === '[[' ? 'array' : 'table' } : null
+          },
+          css: (t) => {
+            if (!/\{\s*$/.test(t) || /^@(?:charset|import)\b/.test(t)) return null
+            const cut = t.lastIndexOf('{')
+            const name = t.slice(0, cut < 0 ? t.length : cut).trim()
+            return name ? { name: name.length > 80 ? name.slice(0, 80) + '…' : name, kind: 'sel' } : null
+          },
+          markdown: (t, ctx) => {
+            if (/^(```|~~~)/.test(t)) { ctx.mdFence = !ctx.mdFence; return null }
+            if (ctx.mdFence) return null
+            const m = /^(#{1,6})\s+(.*)$/.exec(t)
+            if (!m) return null
+            const name = m[2].replace(/\s*\{#[^}]*\}\s*$/, '').trim() || m[2].trim()
+            return { name: name, kind: 'head', level: m[1].length }
+          },
+        }
+        const VOID_TAGS = S('br img input hr meta link area base col embed source track wbr param')
+        // Segment keyword labels when a detector did not capture the source
+        // keyword (markdown headings use the hashes of their level instead).
+        const KIND_LABEL = { fn: 'fn', cls: 'class', tag: 'tag', key: 'key', sel: 'rule' }
+        // One pass over the lines: per-language detectors decide definition
+        // lines; a scope stack (brace depth * 4 + leading whitespace as the
+        // effective indent, tag stack for HTML/XML, heading level for
+        // markdown) assigns each definition its parent and end line.
+        const buildOutline = (lines, langId) => {
+          if (!langId || !lines || !lines.length) return []
+          const isHtml = langId === 'html' || langId === 'xml'
+          const rule = isHtml ? null : DEF_RULES[langId]
+          if (!isHtml && !rule) return []
+          const defs = []
+          const stack = []
+          let braceDepth = 0
+          const hlState = { mode: null }
+          const ctx = { cfg: HL_LANGS[langId] || null, mdFence: false, tagStack: [] }
+          const pushDef = (def, indent) => {
+            def.parent = stack.length ? stack[stack.length - 1].def : null
+            def.end = null
+            defs.push(def)
+            stack.push({ indent: indent, def: def })
+          }
+          const popTo = (indent, lineIdx) => {
+            while (stack.length && stack[stack.length - 1].indent >= indent) {
+              const top = stack.pop()
+              if (top.def.end === null) top.def.end = lineIdx
+            }
+          }
+          for (let i = 0; i < lines.length; i++) {
+            const raw = lines[i]
+            const ws = (raw.match(/^\s*/) || [''])[0].length
+            const t = raw.trim()
+            if (isHtml) {
+              const re = /<(\/?)([A-Za-z][\w-]*)\b([^<>]*?)(\/?)>/g
+              let m
+              while ((m = re.exec(raw))) {
+                const name = m[2].toLowerCase()
+                if (m[1] === '/') {
+                  for (let k = ctx.tagStack.length - 1; k >= 0; k--) {
+                    if (ctx.tagStack[k].name === name) {
+                      const d = ctx.tagStack[k].def
+                      if (d && d.end === null) d.end = i
+                      ctx.tagStack.length = k
+                      break
+                    }
+                  }
+                } else if (m[4] !== '/' && !VOID_TAGS[name]) {
+                  const def = { line: i, name: m[2], kind: 'tag', kw: null, lvl: 0 }
+                  def.parent = ctx.tagStack.length ? ctx.tagStack[ctx.tagStack.length - 1].def : null
+                  def.end = null
+                  defs.push(def)
+                  ctx.tagStack.push({ name: name, def: def })
+                }
+              }
+              continue
+            }
+            let toks = lineTokensCached(raw, langId, hlState)
+            let opens = 0
+            let closes = 0
+            const countBrackets = langId === 'json'
+            if (toks) {
+              for (const tk of toks) {
+                if (tk.c === 'str' || tk.c === 'com') continue
+                for (let c = 0; c < tk.t.length; c++) {
+                  if (tk.t[c] === '{' || (countBrackets && tk.t[c] === '[')) opens++
+                  else if (tk.t[c] === '}' || (countBrackets && tk.t[c] === ']')) closes++
+                }
+              }
+            }
+            const startsClose = countBrackets ? /^[ \t]*[}\]]/.test(raw) : /^[ \t]*\}/.test(raw)
+            const effIndent = (startsClose ? Math.max(0, braceDepth - 1) : braceDepth) * 4 + ws
+            braceDepth = Math.max(0, braceDepth + opens - closes)
+            if (t === '') continue
+            let isComment = false
+            if (toks) {
+              for (const tk of toks) {
+                if (tk.t.trim() === '') continue
+                isComment = tk.c === 'com'
+                break
+              }
+            }
+            if (isComment) continue
+            const d = rule(t, ctx, i, lines)
+            if (d && d.level) {
+              popTo(d.level, i)
+              pushDef({ line: i, name: d.name, kind: d.kind, kw: d.kw || null, lvl: d.level }, d.level)
+            } else if (d) {
+              popTo(effIndent, i)
+              pushDef({ line: i, name: d.name, kind: d.kind, kw: d.kw || null, lvl: 0 }, effIndent)
+            } else if (langId !== 'markdown' && langId !== 'toml') {
+              popTo(effIndent, i)
+            }
+          }
+          popTo(-1, lines.length)
+          return defs
+        }
+        // Innermost enclosing definition at display line F (0-based), then
+        // walk parents for the chain. A tiny backward scan: chains are short
+        // and updates are key-compared, so this stays cheap per scroll tick.
+        const resolveChain = (defs, F) => {
+          if (!defs || !defs.length) return []
+          let d = null
+          for (let k = defs.length - 1; k >= 0; k--) {
+            const dd = defs[k]
+            if (dd.line >= F) continue
+            if (dd.end !== null && dd.end <= F) continue
+            d = dd
+            break
+          }
+          if (!d) return []
+          const chain = []
+          let p = d
+          while (p && chain.length < 8) { chain.push(p); p = p.parent }
+          chain.reverse()
+          return chain
+        }
+
         // ---------- markdown rendering (v1.9) ----------
         // markdown-it v15.0.0 (MIT, https://github.com/markdown-it/markdown-it) —
         // vendored browser UMD build; linkify-it/mdurl/uc.micro bundled inside.
@@ -2710,7 +3054,11 @@ window.__ModuleLoader__.load({
           // v1.12.5: timer for the post-jump caret placement (smooth scroll
           // must settle before the range is moved onto the target line).
           const jumpTimer = React.useState({ t: null })[0]
-          React.useEffect(() => () => { if (jumpTimer.t) clearTimeout(jumpTimer.t) }, [])
+          React.useEffect(() => () => {
+            if (jumpTimer.t) clearTimeout(jumpTimer.t)
+            if (scopeState.flashTimer) clearTimeout(scopeState.flashTimer)
+            if (scopeState.caretTimer) clearTimeout(scopeState.caretTimer)
+          }, [])
           // v1.9.4: the CURRENT path, mirrored every render. fetch responses
           // are dropped when the user has since switched tabs — a late
           // response for the previous file must never overwrite the view of
@@ -2730,6 +3078,241 @@ window.__ModuleLoader__.load({
               if (paneRef.node) paneRef.node.style.setProperty('--dsh-fe-toolbar-h', el.offsetHeight + 'px')
             }
           })
+          // ---------- sticky scope bar (v1.14) ----------
+          // VSCode-style sticky scroll: the definition chain enclosing the
+          // first visible line sticks below the header stack; clicking a
+          // segment scrolls to that definition (and lands the caret when
+          // the line is editable). The bar is filled imperatively — the
+          // thousands-of-lines diff must not re-render on every scroll tick.
+          const scopeRef = React.useState({ node: null })[0]
+          const scopeState = React.useState({ key: '', flashTimer: null, caretTimer: null })[0]
+          const scopeGate = React.useState({ pending: false })[0]
+          const outlineRef = React.useState({ list: [] })[0]
+          const outline = React.useMemo(() => {
+            if (diff && diff.note === 'large' && Array.isArray(diff.preview)) return buildOutline(diff.preview, lang)
+            if (!m || !Array.isArray(m.lines)) return []
+            return buildOutline(m.lines, lang)
+          }, [m, modelVersion, diff, lang])
+          outlineRef.list = outline
+          // First-visible-line probe → scope chain → imperative bar update.
+          // The 25ms gate collapses scroll bursts; the key comparison skips
+          // no-op updates entirely. v1.14 fix: the bar's sticky offset and
+          // the probe line are taken from the toolbar's LIVE rect every tick
+          // (the measured CSS vars can go stale when the toolbar wraps after
+          // a window resize and then covers the bar); the probe also tries
+          // several points and falls back to uniform-row math.
+          const updateScopeBar = () => {
+            const bar = scopeRef.node
+            const code = diffRef.node
+            if (!bar || !code) return
+            const body = bar.firstElementChild
+            if (!body) return
+            const defs = outlineRef.list
+            const crect = code.getBoundingClientRect()
+            const vw = window.innerWidth || 1200
+            const vh = window.innerHeight || 800
+            const internal = code.scrollHeight > code.clientHeight + 1
+            if (crect.bottom <= 0 || crect.top >= vh) return
+            // Sticky offset: pin right below the toolbar's REAL bottom,
+            // expressed relative to the actual scrollport (chat column in
+            // page mode; in internal mode the strip never sticks and the
+            // inline top is inert).
+            const tb = toolbarRef.node
+            let headerBottom = (store.tabH || 32) + (store.toolH || 35)
+            if (tb && bar.style) {
+              const r = tb.getBoundingClientRect()
+              if (r.bottom > 0 && r.bottom < vh + 40) {
+                headerBottom = Math.max(headerBottom, r.bottom)
+                if (!internal) {
+                  let spTop = 0
+                  let p = code
+                  while (p && p !== document.body) {
+                    const oy = getComputedStyle(p).overflowY
+                    if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && p.scrollHeight > p.clientHeight + 1) { spTop = p.getBoundingClientRect().top; break }
+                    p = p.parentElement
+                  }
+                  const wanted = Math.max(0, r.bottom - spTop)
+                  if (bar.style.top !== wanted + 'px') bar.style.top = wanted + 'px'
+                }
+              }
+            }
+            let F = -1
+            let deletedTop = false
+            try {
+              let probeTop = headerBottom + 2
+              if (body.childElementCount > 0) {
+                const br = body.getBoundingClientRect()
+                if (br.bottom > 0) probeTop = br.bottom + 2
+              }
+              // Probe candidates: the primary point, then a few offsets —
+              // the first hit on a code line wins.
+              const candidates = [
+                [Math.min(Math.max(crect.left + 60, 4), vw - 4), probeTop],
+                [Math.min(Math.max(crect.left + 220, 4), vw - 4), probeTop],
+                [Math.min(Math.max(crect.left + 60, 4), vw - 4), probeTop + 14],
+                [Math.min(Math.max(crect.left + 60, 4), vw - 4), probeTop + 30],
+              ]
+              for (const cand of candidates) {
+                const x = cand[0]
+                const y = Math.min(cand[1], vh - 2)
+                if (y <= 0) continue
+                const hit = document.elementFromPoint(x, y)
+                if (!hit || !hit.closest) continue
+                const lineEl = hit.closest('.dsh-fe-line')
+                if (!lineEl) continue
+                // Deleted (old) rows get no scope bar — the feature does not
+                // apply to deleted diff regions.
+                if (lineEl.classList.contains('dsh-fe-old')) { deletedTop = true; break }
+                const n = Number(lineEl.getAttribute('data-n'))
+                if (n > 0) { F = n - 1 }
+                break
+              }
+            } catch (e) {}
+            // Last resort: uniform ~19px rows from scroll geometry (code
+            // rows are white-space:pre and never wrap). Slightly approximate
+            // around hunk heads, but only runs when the DOM probe finds
+            // nothing at all.
+            if (F < 0 && !deletedTop) {
+              F = internal
+                ? Math.max(0, Math.floor((code.scrollTop || 0) / 19))
+                : Math.max(0, Math.floor((headerBottom + 4 - crect.top) / 19))
+            }
+            const chain = deletedTop ? [] : resolveChain(defs, F)
+            const key = chain.map((d) => d.line + ':' + d.name).join('|')
+            if (key === scopeState.key) return
+            scopeState.key = key
+            body.textContent = ''
+            if (chain.length === 0) return
+            let show = chain
+            let ellipsis = false
+            if (show.length > 3) { show = show.slice(show.length - 3); ellipsis = true }
+            const frag = document.createDocumentFragment()
+            if (ellipsis) {
+              const ell = document.createElement('span')
+              ell.className = 'dsh-fe-scope-sep'
+              ell.textContent = '…'
+              frag.append(ell)
+            }
+            show.forEach((d, k) => {
+              if (k > 0) {
+                const sep = document.createElement('span')
+                sep.className = 'dsh-fe-scope-sep'
+                sep.textContent = '›'
+                frag.append(sep)
+              }
+              const b = document.createElement('button')
+              b.type = 'button'
+              b.className = 'dsh-fe-scope-seg dsh-fe-tk-' + (d.kind === 'cls' ? 'cls' : d.kind === 'tag' ? 'tag' : d.kind === 'fn' ? 'fn' : 'key')
+              const kw = d.kw || (d.kind === 'head' ? '#'.repeat(d.lvl || 1) : (KIND_LABEL[d.kind] || ''))
+              if (kw) {
+                const ks = document.createElement('span')
+                ks.className = 'dsh-fe-scope-kw'
+                ks.textContent = kw
+                b.append(ks)
+              }
+              b.append(document.createTextNode(d.name.length > 60 ? d.name.slice(0, 57) + '…' : d.name))
+              b.title = '第 ' + (d.line + 1) + ' 行 — 点击跳转到定义'
+              b.setAttribute('data-line', String(d.line))
+              frag.append(b)
+            })
+            body.append(frag)
+          }
+          // Scroll to a definition line: the same scroller walk as jumpTo
+          // (the diff viewport itself when bounded, else the chat column),
+          // aligned just below the sticky headers + bar, with a brief flash
+          // on the landed line and a caret drop when it is editable.
+          const jumpToLine = (idx) => {
+            const code = diffRef.node
+            if (!code) return
+            const el = code.querySelector('.dsh-fe-line:not(.dsh-fe-old)[data-n="' + (idx + 1) + '"]')
+            if (!el) return
+            let scroller = null
+            // v1.14 fix: walk from the TARGET LINE so the bounded diff
+            // viewport itself is a candidate (the old walk started at the
+            // code element's parent and could never detect internal mode).
+            let p = el
+            while (p && p !== document.body) {
+              const oy = getComputedStyle(p).overflowY
+              if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && p.scrollHeight > p.clientHeight + 1) { scroller = p; break }
+              p = p.parentElement
+            }
+            if (!scroller) scroller = document.scrollingElement || document.documentElement
+            const barH = (scopeRef.node && scopeRef.node.firstElementChild && scopeRef.node.firstElementChild.offsetHeight) || 0
+            const internal = scroller === code
+            const box = el.getBoundingClientRect()
+            const sb = scroller.getBoundingClientRect()
+            let headerH = internal ? barH + 1 : ((store.tabH || 32) + (store.toolH || 35) + barH + 2)
+            // Prefer the toolbar's live bottom over the measured vars (same
+            // staleness fix as the bar's sticky offset).
+            if (!internal && toolbarRef.node) {
+              const r = toolbarRef.node.getBoundingClientRect()
+              if (r.bottom > 0 && r.bottom - sb.top > 0) headerH = Math.max(headerH, r.bottom - sb.top + barH + 2)
+            }
+            const target = scroller.scrollTop + (box.top - sb.top) - headerH
+            try {
+              scroller.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
+            } catch (e) {
+              try { scroller.scrollTop = Math.max(0, target) } catch (e2) { try { el.scrollIntoView() } catch (e3) {} }
+            }
+            el.classList.add('dsh-fe-scope-flash')
+            if (scopeState.flashTimer) clearTimeout(scopeState.flashTimer)
+            scopeState.flashTimer = setTimeout(() => { scopeState.flashTimer = null; el.classList.remove('dsh-fe-scope-flash') }, 900)
+            if (scopeState.caretTimer) clearTimeout(scopeState.caretTimer)
+            scopeState.caretTimer = setTimeout(() => {
+              scopeState.caretTimer = null
+              const ed = el.querySelector('.dsh-fe-tx-edit')
+              if (!ed) return
+              try {
+                ed.focus({ preventScroll: true })
+                const sel = window.getSelection()
+                if (sel) {
+                  sel.removeAllRanges()
+                  const range = document.createRange()
+                  range.selectNodeContents(ed)
+                  range.collapse(true)
+                  sel.addRange(range)
+                }
+              } catch (e) {}
+            }, 300)
+          }
+          const onScopeClick = (ev) => {
+            if (!ev.target || !ev.target.closest) return
+            const seg = ev.target.closest('.dsh-fe-scope-seg')
+            if (!seg) return
+            const line = Number(seg.getAttribute('data-line'))
+            if (isNaN(line) || line < 0) return
+            jumpToLine(line)
+          }
+          React.useEffect(() => {
+            const bar = scopeRef.node
+            const code = diffRef.node
+            if (!bar || !code) return
+            if (bar.firstElementChild) bar.firstElementChild.textContent = ''
+            scopeState.key = ''
+            const tick = () => {
+              if (scopeGate.pending) return
+              scopeGate.pending = true
+              setTimeout(() => {
+                scopeGate.pending = false
+                updateScopeBar()
+              }, 25)
+            }
+            // Capture-phase scroll: element scroll events (the bounded diff
+            // viewport) and page scrolls (the chat column) both arrive here.
+            window.addEventListener('scroll', tick, true)
+            window.addEventListener('resize', tick)
+            updateScopeBar()
+            return () => {
+              window.removeEventListener('scroll', tick, true)
+              window.removeEventListener('resize', tick)
+            }
+          }, [diff, path, lang])
+          React.useEffect(() => { updateScopeBar() }, [outline])
+          const scopeBar = React.createElement('div', {
+            className: 'dsh-fe-scope',
+            ref: (node) => { scopeRef.node = node },
+            onClick: onScopeClick,
+          }, React.createElement('div', { className: 'dsh-fe-scope-body' }))
           // v1.13: reconcile a full payload with the per-file edit model.
           // * fingerprint unchanged → keep the model, refresh the host rev;
           // * changed + dirty → external change with unsaved edits: reject/
@@ -3235,6 +3818,7 @@ window.__ModuleLoader__.load({
               React.createElement('div', { className: 'dsh-fe-msg' },
                 '文件过大，无法逐块审阅；仅显示前 ' + diff.preview.length + ' 行' + (diff.lineCount ? '（共 ' + diff.lineCount + ' 行）' : '') + '。'),
               error ? React.createElement('div', { className: 'dsh-fe-err' }, String(error)) : null,
+              scopeBar,
               React.createElement('div', { className: 'dsh-fe-diff' },
                 React.createElement('div', { className: 'dsh-fe-code' },
                   diff.preview.map((t, i) => renderRoRow('p' + i, '', i + 1, t, hlPrev)),
@@ -3459,6 +4043,7 @@ window.__ModuleLoader__.load({
               // below the sticky header stack while the page scrolls, and is
               // simply absent when the file has no hunks.
               jump ? React.createElement('div', { className: 'dsh-fe-jumprow' }, jump) : null,
+              scopeBar,
               React.createElement('div', {
                 className: 'dsh-fe-diff',
                 ref: (node) => { diffRef.node = node },
