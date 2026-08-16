@@ -493,7 +493,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.14.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.15.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -791,6 +791,25 @@ window.__ModuleLoader__.load({
           '@keyframes dsh-fe-scope-flash { from { background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 26%, transparent); } to { background:transparent; } }',
           '.dsh-fe-line.dsh-fe-scope-flash { animation:dsh-fe-scope-flash .9s ease-out; }',
           '@media (prefers-reduced-motion: reduce) { .dsh-fe-scope-seg { transition:none; } .dsh-fe-line.dsh-fe-scope-flash { animation:none; } }',
+          // ---- v1.15: git VCS annotations + ignored-file graying ----
+          // The host decorates tree nodes with a git letter (M modified /
+          // U untracked / A added / D deleted / R renamed) and an ignored
+          // flag from git check-ignore. The letter badge pins to the row's
+          // right edge (the name grows into the gap via flex:1 so long names
+          // keep ellipsizing) and is tinted with the plugin's decision
+          // palette: M=warn yellow, A/U=success green, D=error red,
+          // R=business blue — each with a soft 16% tinted pill background.
+          // Ignored files/folders fade to gray (secondary label at 55%).
+          // The host also sorts directories before files, each group
+          // alphabetically, so the client renders the tree as-is.
+          '.dsh-fe-name { flex:1; min-width:0; }',
+          '.dsh-fe-git { margin-left:auto; flex:none; font-family:ui-monospace,Consolas,monospace; font-size:10.5px; font-weight:700; line-height:1.5; padding:0 4px; border-radius:4px; letter-spacing:.03em; }',
+          '.dsh-fe-git-m { color:var(--dsw-alias-state-warn-primary); background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 16%, transparent); }',
+          '.dsh-fe-git-a, .dsh-fe-git-u { color:var(--dsw-alias-state-success-primary); background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 16%, transparent); }',
+          '.dsh-fe-git-d { color:var(--dsw-alias-state-error-primary); background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent); }',
+          '.dsh-fe-git-r { color:var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)); background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 16%, transparent); }',
+          '.dsh-fe-row-ignored .dsh-fe-name { color:color-mix(in srgb, var(--dsw-alias-label-secondary) 55%, transparent); }',
+          '.dsh-fe-row-ignored .dsh-fe-ic, .dsh-fe-row-ignored .dsh-fe-chev { color:color-mix(in srgb, var(--dsw-alias-label-secondary) 55%, transparent); }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -871,31 +890,55 @@ window.__ModuleLoader__.load({
         }, props.icon ? props.icon() : null)
 
         // ---------- file tree node ----------
+        // v1.15: the host decorates tree nodes with git VCS letters
+        // (node.git: M/U/A/D/R) and an ignored flag (node.ignored, from
+        // git check-ignore). The badge sits at the row's right edge; ignored
+        // files/folders gray out. Titles explain the letter on hover.
+        const GIT_TITLES = {
+          M: 'Modified — 已修改（未提交）',
+          U: 'Untracked — 未跟踪',
+          A: 'Added — 已暂存的新增',
+          D: 'Deleted — 已删除',
+          R: 'Renamed — 已重命名',
+        }
         function TreeNode(props) {
           const node = props.node
           const depth = props.depth || 0
           const [open, setOpen] = React.useState(depth < 1)
+          const badge = node.git
+            ? React.createElement('span', { className: 'dsh-fe-git dsh-fe-git-' + String(node.git).toLowerCase(), title: GIT_TITLES[node.git] || node.git }, node.git)
+            : null
+          const rowCls = 'dsh-fe-row' + (node.type === 'directory' ? ' dsh-fe-dir' : ' dsh-fe-file') +
+            (node.type === 'directory' && open ? ' dsh-fe-open' : '') +
+            (node.ignored ? ' dsh-fe-row-ignored' : '')
+          const ignoredNote = node.ignored ? '（被 .gitignore 排除）\n' : ''
           if (node.type === 'directory') {
             const kids = node.children || []
             return React.createElement('div', null,
-              React.createElement('div', { className: 'dsh-fe-row dsh-fe-dir' + (open ? ' dsh-fe-open' : ''), onClick: () => setOpen(!open) },
+              React.createElement('div', {
+                className: rowCls,
+                onClick: () => setOpen(!open),
+                title: ignoredNote + (node.path || node.name),
+              },
                 React.createElement('span', { className: 'dsh-fe-chev' }, IconChevron()),
                 React.createElement('span', { className: 'dsh-fe-ic' }, IconFolder()),
                 React.createElement('span', { className: 'dsh-fe-name' }, node.name),
+                badge,
               ),
               open ? React.createElement('div', { className: 'dsh-fe-children' },
                 kids.map((c) => React.createElement(TreeNode, { key: c.name, node: c, depth: depth + 1, onOpen: props.onOpen }))) : null,
             )
           }
           return React.createElement('div', {
-            className: 'dsh-fe-row dsh-fe-file',
-            title: node.path,
+            className: rowCls,
+            title: ignoredNote + node.path,
             onClick: () => props.onOpen(node.path),
             onDoubleClick: () => props.onOpen(node.path),
           },
             React.createElement('span', { className: 'dsh-fe-chev' }, null),
             React.createElement('span', { className: 'dsh-fe-ic' }, IconFile()),
             React.createElement('span', { className: 'dsh-fe-name' }, node.name),
+            badge,
           )
         }
 

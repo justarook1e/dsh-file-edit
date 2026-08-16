@@ -4,7 +4,8 @@
 // Per-session review state (baseline + pending decisions) is persisted under
 // ~/.dsh/dsh-file-edit-state/<sessionId>.json so accept/reject survives restarts.
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 
@@ -526,6 +527,11 @@ export default {
           const wasPending = (f) => !!(f && f.base && f.cur &&
             (f.base.present !== f.cur.present || f.base.version !== f.cur.version))
           let treeChanged = false
+          // v1.15: content-only changes (no file set change) now bump the
+          // tree stamp too — the sidebar reloads and the git VCS letters
+          // (M/U/A/D/R) refresh right after an agent edit instead of waiting
+          // for a manual ⟳.
+          let contentChanged = false
           for (const w of walked) {
             seen.add(w.rel)
             const before = st.files.get(w.rel)
@@ -537,6 +543,7 @@ export default {
               (before.base.present !== beforeCur.present || before.base.version !== beforeCur.version))
             const f = await refreshOne(st, w.rel, w)
             if (!before || !beforeCur || beforeCur.present !== f.cur.present) treeChanged = true
+            else if (beforeCur.present && f.cur.present && beforeCur.version !== f.cur.version) contentChanged = true
             // First scan: baseline = current content (everything is baseline,
             // nothing is reviewed). Later scans decide by attribution.
             if (f.base === null) {
@@ -578,7 +585,7 @@ export default {
           for (const rel of seen) st.touched.delete(rel)
           st.scannedAt = Date.now()
           st.error = null
-          if (treeChanged && !firstScan) bumpTree(st)
+          if ((treeChanged || contentChanged) && !firstScan) bumpTree(st)
           saveState(st)
           } catch (e) {
             st.error = e && e.message ? String(e.message) : String(e)
@@ -625,23 +632,231 @@ export default {
       }
     }
 
-    async function treeNode(dirTarget, rel, depth, count) {
+    async function treeNode(dirTarget, rel, depth, count, paths) {
       if (depth > MAX_DEPTH || count.n >= MAX_ENTRIES) return null
       let entries
       try { entries = await fs.listDir(dirTarget) } catch (e) { return null }
-      const node = { name: rel === '' ? '.' : rel.split('/').pop(), type: 'directory', children: [] }
+      const node = { name: rel === '' ? '.' : rel.split('/').pop(), type: 'directory', path: rel, children: [] }
+      if (paths) paths.push(rel)
       for (const e of entries) {
         if (count.n >= MAX_ENTRIES) break
         if (e.type === 'directory') {
           if (SKIP_DIRS.has(e.name)) continue
-          const child = await treeNode(e.target, rel ? rel + '/' + e.name : e.name, depth + 1, count)
+          const child = await treeNode(e.target, rel ? rel + '/' + e.name : e.name, depth + 1, count, paths)
           if (child) node.children.push(child)
         } else if (e.type === 'file') {
           count.n++
           node.children.push({ name: e.name, type: 'file', size: e.size !== undefined ? e.size : 0, path: rel ? rel + '/' + e.name : e.name })
+          if (paths) paths.push(rel ? rel + '/' + e.name : e.name)
         }
       }
+      // v1.15: directories first, files after; each group alphabetical
+      // (case-insensitive). The fs listing order is not guaranteed to be
+      // alphabetical, so the tree used to render in arbitrary order.
+      node.children.sort(function (x, y) {
+        const dx = x.type === 'directory' ? 0 : 1
+        const dy = y.type === 'directory' ? 0 : 1
+        if (dx !== dy) return dx - dy
+        return String(x.name).localeCompare(String(y.name), undefined, { sensitivity: 'base' })
+      })
       return node
+    }
+
+    // ---------- git VCS annotations (v1.15) ----------
+    // The sidebar tree gets VSCode-style version-control decorations: a git
+    // status letter per file (M modified / U untracked / A added / D deleted /
+    // R renamed — staged or unstaged, whichever is the "newer" side wins) and
+    // gray styling for .gitignore-excluded files/folders. Status comes from
+    // one `git status --porcelain=v2 -z` call per workspace (cached briefly so
+    // tree reload bursts share it); exclusions come from a single batched
+    // `git check-ignore --stdin -z` fed with every walked path. Both are
+    // optional decorations: no git → no letters, no failure path breaks the
+    // tree. The whole section is process-local (no state persistence needed).
+    const GIT_TTL = 2000
+    const GIT_CANDIDATES = ['git', 'C:\\Program Files\\Git\\cmd\\git.exe', 'C:\\Program Files\\Git\\bin\\git.exe', 'C:\\Program Files (x86)\\Git\\cmd\\git.exe']
+    const gitCache = new Map()
+    function findRepoRoot(root) {
+      let cur = root
+      for (let i = 0; i < 10 && cur; i++) {
+        if (existsSync(join(cur, '.git'))) return cur
+        const parent = join(cur, '..')
+        if (parent === cur) break
+        cur = parent
+      }
+      return null
+    }
+    function runGit(bin, args, cwd, input) {
+      return new Promise((resolve) => {
+        let settled = false
+        const out = []
+        const err = []
+        let child
+        try {
+          child = spawn(bin, args, { cwd: cwd, windowsHide: true, env: Object.assign({}, process.env, { GIT_OPTIONAL_LOCKS: '0' }) })
+        } catch (e) {
+          resolve({ ok: false, spawnError: e })
+          return
+        }
+        const kill = setTimeout(() => { try { child.kill() } catch (e) {} }, 20000)
+        child.on('error', (e) => {
+          if (settled) return
+          settled = true
+          clearTimeout(kill)
+          resolve({ ok: false, spawnError: e })
+        })
+        if (child.stdout) child.stdout.on('data', (d) => out.push(d))
+        if (child.stderr) child.stderr.on('data', (d) => err.push(d))
+        child.on('close', (code) => {
+          if (settled) return
+          settled = true
+          clearTimeout(kill)
+          resolve({ ok: true, code: code, stdout: Buffer.concat(out), stderr: Buffer.concat(err) })
+        })
+        try { child.stdin.end(input === undefined ? '' : input) } catch (e) {}
+      })
+    }
+    // XY pair → single letter. The worktree column (Y) wins when both are
+    // set — it is the state the tree actually shows on disk. Untracked `?`
+    // records (porcelain v2 lists them as a bare `? path` field) map to U;
+    // copied/typechange/unmerged collapse to M (the closest review state).
+    function gitLetterOf(xy) {
+      const x = xy ? xy.charAt(0) : ''
+      const y = xy ? xy.charAt(1) : ''
+      const c = (y && y !== '.' && y !== ' ') ? y : x
+      if (c === '?') return 'U'
+      if (c === 'A') return 'A'
+      if (c === 'D') return 'D'
+      if (c === 'R') return 'R'
+      if (c === 'C' || c === 'T' || c === 'M' || c === 'U') return 'M'
+      return null
+    }
+    // porcelain v2 + -z: RECORDS are NUL-terminated but the fields INSIDE a
+    // record stay space-separated (verified against git 2.55); a pathname
+    // containing spaces arrives C-quoted (`"my file.txt"`). This unquotes the
+    // minimal C-escape set git's quote.c uses.
+    function gitUnquote(s) {
+      if (typeof s !== 'string' || s.charAt(0) !== '"') return s
+      let out = ''
+      for (let k = 1; k < s.length - 1; k++) {
+        const ch = s.charAt(k)
+        if (ch === '\\' && k + 1 < s.length - 1) {
+          k++
+          const n = s.charAt(k)
+          if (n === 'n') out += '\n'
+          else if (n === 't') out += '\t'
+          else out += n
+        } else out += ch
+      }
+      return out
+    }
+    async function gitInfoFor(root, relPaths) {
+      // relPaths: workspace-relative paths of every walked file AND directory
+      // ('' = the workspace root itself). Cached per root with a short TTL so
+      // a burst of tree reloads shares one status computation.
+      const key = process.platform === 'win32' ? String(root).toLowerCase() : String(root)
+      const hit = gitCache.get(key)
+      if (hit && Date.now() - hit.t < GIT_TTL) return hit.p
+      const p = (async () => {
+        const repoRoot = findRepoRoot(root)
+        if (!repoRoot) return null
+        let prefix = relative(repoRoot, root).replace(/\\/g, '/')
+        if (prefix === '.') prefix = ''
+        let statusOut = null
+        for (const bin of GIT_CANDIDATES) {
+          const r = await runGit(bin, ['-c', 'core.quotepath=false', '-c', 'status.renames=true', 'status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=none'], repoRoot)
+          if (r.spawnError) continue
+          if (!r.ok || r.code !== 0) return null // not a git repo (or git broken) → no decorations
+          statusOut = r.stdout
+          break
+        }
+        if (statusOut === null) return null
+        const statuses = new Map()
+        const records = statusOut.toString('utf8').split('\0')
+        for (const rec of records) {
+          if (rec === '') continue
+          const t = rec.charAt(0)
+          if (t === '1' || t === '2' || t === 'u') {
+            // Split on spaces: every field up to the pathname is guaranteed
+            // space-free, and the pathname is the rest of the record (so a
+            // path containing spaces survives as one quoted tail element).
+            const parts = rec.split(' ')
+            const pathAt = t === '1' ? 8 : t === '2' ? 9 : 10
+            const xy = parts.length > 1 ? parts[1] : ''
+            const letter = gitLetterOf(xy)
+            if (!letter) continue
+            const path = gitUnquote(parts.slice(pathAt).join(' '))
+            if (path) statuses.set(path, letter)
+          } else if (t === '?') {
+            // untracked: the whole record is `? <path>` (v2 quirk)
+            const path = gitUnquote(rec.slice(2))
+            if (path) statuses.set(path, 'U')
+          }
+          // anything else: unknown record shape — skip defensively
+        }
+        // .gitignore exclusions: one check-ignore process for the whole
+        // tree. An ignored directory is reported itself AND each path under
+        // it, so folders gray out with their contents; negation patterns
+        // (`!keep.log`) are honored by git itself. Exit 0 = some ignored,
+        // exit 1 = none ignored (empty set, not an error).
+        const ignored = new Set()
+        const repoPaths = relPaths.map((r) => (prefix ? prefix + '/' + r : r)).filter((r) => r !== '')
+        if (repoPaths.length > 0) {
+          for (const bin of GIT_CANDIDATES) {
+            const r = await runGit(bin, ['check-ignore', '--stdin', '-z'], repoRoot, repoPaths.join('\0') + '\0')
+            if (r.spawnError) continue
+            if (r.ok && r.code === 0) {
+              const s = r.stdout.toString('utf8')
+              for (const p of s.split('\0')) if (p !== '') ignored.add(p)
+            }
+            // code 1 (nothing ignored) or any failure: leave the set empty
+            break
+          }
+        }
+        return { prefix: prefix, statuses: statuses, ignored: ignored }
+      })().catch(() => null)
+      gitCache.set(key, { t: Date.now(), p: p })
+      return p
+    }
+    // Post-order decoration pass: files take their own letter; a directory
+    // takes the strongest letter among its descendants (D > A > R > M > U) so
+    // a folder containing any change is itself flagged. Deleted files (D)
+    // never appear as tree nodes (they are gone from disk), so their letters
+    // reach ancestor directories through the status map instead. The ignored
+    // flag is per node — every walked path was fed to check-ignore
+    // individually.
+    const GIT_PRIORITY = { U: 1, M: 2, R: 3, A: 4, D: 5 }
+    function annotateTree(node, git) {
+      const repoRel = (rel) => (git.prefix ? git.prefix + '/' + rel : rel)
+      // Aggregate every status path's letter into each of its ancestor
+      // directories (repo-relative keys) — O(entries × depth), depth ≤ 16.
+      const dirAgg = new Map()
+      for (const entry of git.statuses) {
+        const letter = entry[1]
+        const prio = GIT_PRIORITY[letter] || 1
+        const segs = entry[0].split('/')
+        for (let k = 0; k < segs.length; k++) {
+          const d = segs.slice(0, k).join('/')
+          const cur = dirAgg.get(d)
+          if (!cur || cur.p < prio) dirAgg.set(d, { p: prio, letter: letter })
+        }
+      }
+      const visit = (node, rel) => {
+        let best = 0
+        if (node.type === 'directory') {
+          const agg = dirAgg.get(repoRel(rel))
+          if (agg && agg.p > best) { best = agg.p; node.git = agg.letter }
+          for (const c of node.children || []) {
+            const r = visit(c, rel ? rel + '/' + c.name : c.name)
+            if (r > best) { best = r; if (c.git) node.git = c.git }
+          }
+        } else {
+          const l = git.statuses.get(repoRel(rel))
+          if (l) { node.git = l; best = GIT_PRIORITY[l] || 1 }
+        }
+        if (git.ignored.has(repoRel(rel))) node.ignored = true
+        return best
+      }
+      visit(node, '')
     }
 
     // ---------- analysis ----------
@@ -924,10 +1139,23 @@ export default {
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
         const rootOverride = args && args.root ? String(args.root) : null
+        // Build the tree and decorate it with git VCS annotations (v1.15).
+        // The walk collects every visited path so one check-ignore batch can
+        // gray out .gitignore-excluded entries; a non-git workspace simply
+        // skips the decorations.
+        const build = async (rootPath) => {
+          const rootTarget = await fs.resolve(rootPath)
+          const paths = []
+          const tree = await treeNode(rootTarget, '', 0, { n: 0 }, paths)
+          if (tree) {
+            const git = await gitInfoFor(rootPath, paths)
+            if (git) annotateTree(tree, git)
+          }
+          return tree
+        }
         if (rootOverride) {
           try {
-            const rootTarget = await fs.resolve(rootOverride)
-            const tree = await treeNode(rootTarget, '', 0, { n: 0 })
+            const tree = await build(rootOverride)
             return { ok: true, root: rootOverride, tree: tree }
           } catch (e) {
             return { ok: false, error: e && e.message ? String(e.message) : String(e) }
@@ -936,8 +1164,7 @@ export default {
         await scan(sid)
         if (st.error) return { ok: false, error: st.error }
         try {
-          const rootTarget = await fs.resolve(st.root)
-          const tree = await treeNode(rootTarget, '', 0, { n: 0 })
+          const tree = await build(st.root)
           return { ok: true, root: st.root, tree: tree }
         } catch (e) {
           return { ok: false, error: e && e.message ? String(e.message) : String(e) }
