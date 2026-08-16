@@ -493,7 +493,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.15.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.15.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -973,14 +973,16 @@ window.__ModuleLoader__.load({
           const [treeError, setTreeError] = React.useState(null)
           const [treeLoading, setTreeLoading] = React.useState(false)
           const [query, setQuery] = React.useState('')
-          const loadFiles = async (force) => {
+          // v1.15.1: `silent` reloads skip the '…' busy indicator — the 20s
+          // background re-check below must not flash the refresh button.
+          const loadFiles = async (force, silent) => {
             if (!force && (tree || treeError)) return
             if (!sid) { setTreeError('打开会话后可用'); return }
-            setTreeLoading(true)
+            if (!silent) setTreeLoading(true)
             const r = await call('listTree', { sessionId: sid, root: ws.path })
             if (r.ok) { setTree(r.tree); setTreeError(null) }
             else setTreeError(r.error || '加载失败')
-            setTreeLoading(false)
+            if (!silent) setTreeLoading(false)
           }
           // v1.11: history ordered by recency — newest session on top (the
           // host's sessionIds order reflects creation/attachment, not
@@ -993,8 +995,34 @@ window.__ModuleLoader__.load({
           const toggleFiles = () => {
             const next = !secFiles
             setSecFiles(next)
-            if (next) void loadFiles(false)
+            // v1.15.1: expanding ALWAYS forces a fresh load (walk + git
+            // status): "glancing at it means it is fresh" — external commits
+            // or edits made while the section was closed show up immediately.
+            if (next) void loadFiles(true)
           }
+          // v1.15.1: periodic silent re-check while the files section is
+          // open. The tool channel cannot see external git commits or
+          // external-editor writes (they change .git or bypass every event),
+          // so a low-frequency re-ask of git status is the only way the
+          // badges stay eventually consistent — bounded to ≤20s. Gated on
+          // the section being open AND the tab being visible: hidden tabs
+          // pay nothing, opening the section re-checks anyway.
+          const pollRef = React.useState({ cancel: null })[0]
+          React.useEffect(() => {
+            const stop = () => { if (pollRef.cancel) { try { pollRef.cancel() } catch (e) {} pollRef.cancel = null } }
+            if (open && secFiles) {
+              const loop = () => {
+                pollRef.cancel = ctx.timeout(() => {
+                  pollRef.cancel = null
+                  const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
+                  if (!hidden) void loadFiles(true, true)
+                  loop()
+                }, 20000)
+              }
+              loop()
+            } else stop()
+            return stop
+          }, [open, secFiles])
           // Auto-refresh: the host bumps a per-session treeStamp whenever the
           // file SET changes (create/delete — including agent tool calls and
           // reject-deletions). The ModifiedBar poll publishes it into the

@@ -53,6 +53,13 @@ export default {
     // change the workspace get through: read-only traffic (Get-ChildItem,
     // node --version, git status, ...) now costs nothing.
     const MUTATING_SHELL_RE = /Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|Rename-Item|del\s|rm\s|rmdir/i
+    // v1.15.1: git commands that change the worktree↔HEAD relationship (the
+    // thing the VCS badges answer). commit/checkout/reset/... never touch a
+    // worktree byte the scanner could see, so they need their own trigger
+    // that bumps the tree stamp directly. Read-only git (status/log/diff/...)
+    // stays untriggered. Substring false positives (echo 'git commit') cost
+    // one extra walk — same acceptable trade as MUTATING_SHELL_RE.
+    const MUTATING_GIT_RE = /\bgit\s+(?:add|commit|checkout|co|reset|clean|restore|stash|rm|mv|merge|rebase|pull|cherry-pick|apply|am|switch|init)\b/i
     const knownSessions = new Set()
     // Undo safety: reject overwrites disk with baseline content, so every
     // reject snapshots the pre-reject bytes first (one undo level per
@@ -675,6 +682,17 @@ export default {
     const GIT_TTL = 2000
     const GIT_CANDIDATES = ['git', 'C:\\Program Files\\Git\\cmd\\git.exe', 'C:\\Program Files\\Git\\bin\\git.exe', 'C:\\Program Files (x86)\\Git\\cmd\\git.exe']
     const gitCache = new Map()
+    const gitKeyOf = (root) => (process.platform === 'win32' ? String(root).toLowerCase() : String(root))
+    // v1.15.1: the plugin's own disk writes (reject / undo-reject / user
+    // save) change the worktree↔HEAD relationship directly, so the 2s cached
+    // git snapshot for that workspace would be stale on the very next tree
+    // load (which the same action just scheduled via a treeStamp bump). Drop
+    // the cache entry so the reload re-asks git and the badges tell the truth
+    // immediately.
+    function invalidateGitCacheFor(root) {
+      if (!root) return
+      gitCache.delete(gitKeyOf(root))
+    }
     function findRepoRoot(root) {
       let cur = root
       for (let i = 0; i < 10 && cur; i++) {
@@ -753,7 +771,7 @@ export default {
       // relPaths: workspace-relative paths of every walked file AND directory
       // ('' = the workspace root itself). Cached per root with a short TTL so
       // a burst of tree reloads shares one status computation.
-      const key = process.platform === 'win32' ? String(root).toLowerCase() : String(root)
+      const key = gitKeyOf(root)
       const hit = gitCache.get(key)
       if (hit && Date.now() - hit.t < GIT_TTL) return hit.p
       const p = (async () => {
@@ -1051,7 +1069,6 @@ export default {
       }
     }
     async function doReject(st, f, path, rec) {
-      const wasAbsent = !f.cur || !f.cur.present
       if (!f.base || !f.base.present) {
         // Added file: reject = delete. If it is already gone (agent deleted
         // it after our scan), converge idempotently instead of making the
@@ -1103,9 +1120,16 @@ export default {
       // per-file user edit history (unsaved user edits are discarded — their
       // base content was just reverted) instead of trying to reconcile.
       f.justRejected = true
-      // A deleted file came back to disk: notify the client so the sidebar
-      // file tree reloads (scan-only detection would miss this write).
-      if (wasAbsent) bumpTree(st)
+      // v1.15.1: reject wrote disk (restored content or deleted the file),
+      // which changes the worktree↔HEAD relationship the VCS badges answer.
+      // Reload the tree unconditionally — not only for resurrected files —
+      // and drop the cached git snapshot so the reload re-asks git. Note the
+      // badge is NOT "cleared" here: baseline ≠ HEAD in general, so the
+      // re-query may legitimately show an M (or remove one — when the
+      // baseline equals HEAD, as after rejecting a committed-then-edited
+      // file). Let git say what is true.
+      bumpTree(st)
+      invalidateGitCacheFor(st.root)
     }
     async function doAccept(st, f, path) {
       // A binary baseline needs its bytes for a future reject; snapshot them
@@ -1352,6 +1376,11 @@ export default {
             if (snap) { snap.afterVersion = outcome.version; rec.files.push(snap) }
           }
           commitUndo(st, rec)
+          // v1.15.1: hunk-reject wrote disk (merged content or deleted the
+          // file) → reload the tree and drop the cached git snapshot so the
+          // VCS badges re-ask git immediately (same reasoning as doReject).
+          bumpTree(st)
+          invalidateGitCacheFor(st.root)
         }
         let pendingCount = 0
         for (const h of all) if (!f.decisions.has(h.id)) pendingCount++
@@ -1431,6 +1460,11 @@ export default {
           f.base = { ...cloneEntry(f.base), version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length }
         }
         f.rev++
+        // v1.15.1: user edit wrote disk → the worktree↔HEAD relationship may
+        // have changed (editing a committed file makes it M). Reload the tree
+        // and drop the cached git snapshot so the badges re-ask git.
+        bumpTree(st)
+        invalidateGitCacheFor(st.root)
         saveState(st)
         return diffPayload(f, undefined)
       },
@@ -1574,6 +1608,11 @@ export default {
           f.base = { ...cloneEntry(f.base), version: outcome.version, size: outcome.size !== undefined ? outcome.size : textOut.length }
         }
         f.rev++
+        // v1.15.1: user save wrote disk → the worktree↔HEAD relationship may
+        // have changed. Reload the tree and drop the cached git snapshot so
+        // the badges re-ask git immediately (same as applyEdit).
+        bumpTree(st)
+        invalidateGitCacheFor(st.root)
         saveState(st)
         return diffPayload(f, undefined)
       },
@@ -1697,13 +1736,17 @@ export default {
             // v1.13: like reject, undoing a reject rewrites disk content —
             // tell the client to reset this file's user edit history.
             f.justRejected = true
-            // Recreated file: let the sidebar tree know right away; the full
-            // scan (dirty) reconciles everything else on the next poll.
-            if (expectAbsent) bumpTree(st)
             st.dirty = true
           } catch (e) {
             skipped.push({ path: item.path, reason: e && e.message ? String(e.message) : String(e) })
           }
+        }
+        // v1.15.1: any restored file changed disk → reload the tree and drop
+        // the cached git snapshot so the VCS badges re-ask git (undo-reject
+        // restores the pre-reject bytes, which may differ from HEAD).
+        if (restored.length > 0) {
+          bumpTree(st)
+          invalidateGitCacheFor(st.root)
         }
         try { rmSync(join(undoRoot(st.sid), rec.opId), { recursive: true, force: true }) } catch (e) {}
         st.lastReject = null
@@ -1785,19 +1828,32 @@ export default {
       // write/edit attribution always fell back to the whole-window sweep.
       const args = exec && (exec.arguments ?? exec.args)
       let mutating = false
+      let cmd = ''
       if (name === 'write' || name === 'edit') mutating = true
       else if (name === 'shell' || name === 'pwsh') {
         // Only commands that can change the workspace trigger a refresh.
         // A command text we cannot inspect is treated as non-mutating
         // (strict per requirement: everything else must not trigger).
-        const cmd = args && typeof args.command === 'string' ? args.command : ''
-        mutating = cmd !== '' && MUTATING_SHELL_RE.test(cmd)
+        // v1.15.1: mutating GIT commands count too — commit/checkout/... do
+        // not match the shell-mutation list but still change the state the
+        // VCS badges answer.
+        cmd = args && typeof args.command === 'string' ? args.command : ''
+        mutating = cmd !== '' && (MUTATING_SHELL_RE.test(cmd) || MUTATING_GIT_RE.test(cmd))
       }
       if (!mutating) return
       const st = stateFor(sid)
       if (!st.baseReady) return
       st.dirty = true
       st.mutationStamp = (st.mutationStamp || 0) + 1
+      // v1.15.1: any agent mutation can change the VCS letters — drop the
+      // cached git snapshot for this workspace so the next tree load re-asks
+      // git (the 2s cache would otherwise serve a pre-mutation snapshot).
+      // Mutating GIT commands get more: commit/checkout/reset/... change
+      // mostly .git or content the scanner already attributes, and the scan
+      // may legitimately detect nothing to bump — so bump the tree stamp
+      // directly (the client reloads the tree, which re-runs git status).
+      invalidateGitCacheFor(st.root)
+      if (MUTATING_GIT_RE.test(cmd)) bumpTree(st)
       // v1.8 change attribution (direction B): only changes that flowed
       // through the agent's tool channel enter the review. write/edit carry
       // an explicit file_path — attribute exactly that file. Mutating shell/
