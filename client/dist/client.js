@@ -493,7 +493,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.15.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.15.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -822,6 +822,30 @@ window.__ModuleLoader__.load({
           // can never accidentally be displayed on top of the sticky-scroll
           // row. The background keeps the original translucent tint.
           '.dsh-fe-hunk-head { z-index:1; }',
+          // ---- v1.15.3: modified-bar 5-row cap + MD edit/read switch ----
+          // More than five modified files: the bar body scrolls inside the
+          // 5-row cap (measured per-row height via --dsh-fe-row-h, set by
+          // ModifiedBar; the +4px slack peeks the sixth row as a scroll
+          // affordance). The MD-only switch is a segmented slider in the
+          // file toolbar's far-left slot: 编辑 and 阅读 sit side by side and
+          // a neutral (no accent color) light-gray track carries a flat pill
+          // — LEFT = 编辑 (checked), RIGHT = 阅读 (unchecked). The pill is
+          // optically centered (top:50% + translateY(-50% − 0.5px): the
+          // 1px shadow under it would otherwise read as sitting low) with a
+          // faint 1px shadow and a thin border for a hint of depth; the
+          // active label darkens and the other stays secondary.
+          '.dsh-fe-bar-scroll .dsh-fe-body-inner { overflow-y:auto; max-height:calc(5 * var(--dsh-fe-row-h, 25px) + 4px); }',
+          '.dsh-fe-mdswitch { display:inline-flex; align-items:center; cursor:pointer; user-select:none; flex:none; margin-left:2px; }',
+          '.dsh-fe-mdswitch input { position:absolute; opacity:0; width:0; height:0; pointer-events:none; }',
+          '.dsh-fe-mdswitch-track { position:relative; display:inline-flex; align-items:center; padding:2px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:color-mix(in srgb, var(--dsw-alias-label-secondary) 9%, transparent); }',
+          '.dsh-fe-mdswitch-pill { position:absolute; top:50%; transform:translateY(calc(-50% - 0.5px)); left:2px; width:calc(50% - 3px); height:calc(100% - 4px); border-radius:6px; background:var(--dsw-alias-bg-layer-1); border:1px solid color-mix(in srgb, var(--dsw-alias-label-secondary) 20%, transparent); box-shadow:0 1px 1px color-mix(in srgb, var(--dsw-alias-label-primary) 8%, transparent); transition:left .12s ease; }',
+          '.dsh-fe-mdswitch input:checked + .dsh-fe-mdswitch-track .dsh-fe-mdswitch-pill { left:2px; }',
+          '.dsh-fe-mdswitch input:not(:checked) + .dsh-fe-mdswitch-track .dsh-fe-mdswitch-pill { left:calc(50% + 1px); }',
+          '.dsh-fe-mdswitch-seg { position:relative; z-index:1; flex:1; text-align:center; font-size:11.5px; line-height:1.4; padding:1px 7px; color:var(--dsw-alias-label-secondary); transition:color .12s ease; }',
+          '.dsh-fe-mdswitch input:checked + .dsh-fe-mdswitch-track .dsh-fe-mdswitch-edit { color:var(--dsw-alias-label-primary); font-weight:600; }',
+          '.dsh-fe-mdswitch input:not(:checked) + .dsh-fe-mdswitch-track .dsh-fe-mdswitch-read { color:var(--dsw-alias-label-primary); font-weight:600; }',
+          '.dsh-fe-mdswitch input:focus-visible + .dsh-fe-mdswitch-track { outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-mdswitch-pill,.dsh-fe-mdswitch-seg { transition:none; } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -1221,6 +1245,16 @@ window.__ModuleLoader__.load({
           const barRef = React.useState({ node: null })[0]
           const anchorRef = React.useState({ node: null })[0]
           const [overlayBottom, setOverlayBottom] = React.useState(null)
+          // v1.15.3: the modified-file list is capped at 5 visible rows;
+          // more files scroll inside the bar body (.dsh-fe-bar-scroll). The
+          // cap is computed from a REAL row's height (fonts differ across
+          // platforms) and stored as a CSS var on the bar root.
+          React.useLayoutEffect(() => {
+            const bar = barRef.node
+            if (!bar) return
+            const row = bar.querySelector('.dsh-fe-file-row')
+            if (row && row.offsetHeight > 0) bar.style.setProperty('--dsh-fe-row-h', row.offsetHeight + 'px')
+          }, [rowSet])
           // v1.11.2: background refreshes are SILENT — no busy state, no
           // flickering "…" next to the file count. The old busy span toggled
           // on every poll tick (every 1.5s while the agent runs), and its
@@ -1365,7 +1399,7 @@ window.__ModuleLoader__.load({
             React.createElement('span', { ref: (node) => { anchorRef.node = node }, className: 'dsh-fe-dock-anchor' }),
             React.createElement('div', {
               ref: (node) => { barRef.node = node },
-              className: 'dsh-fe-bar' + (collapsed ? ' dsh-fe-bar-collapsed' : '') + (overlay ? ' dsh-fe-bar-overlay' : ''),
+              className: 'dsh-fe-bar' + (collapsed ? ' dsh-fe-bar-collapsed' : '') + (overlay ? ' dsh-fe-bar-overlay' : '') + (rowSet.length > 5 ? ' dsh-fe-bar-scroll' : ''),
               style: barStyle,
             },
               head,
@@ -3097,6 +3131,17 @@ window.__ModuleLoader__.load({
           const diffRef = React.useState({ node: null })[0]
           const scrollGate = React.useState({ pending: false })[0]
           const editingRef = React.useState({ idx: null })[0]
+          // v1.15.3: MD edit/read toggle. null = automatic (the legacy
+          // behavior): pending diffs show the editable review view, clean
+          // files show the rendered document. Explicit true/false force the
+          // source/rendered view respectively and persist until the tab
+          // switches. mdEditRef mirrors the EFFECTIVE mode for applyPayload
+          // (async fetches must see the latest value regardless of closure
+          // age); it is cleared on tab switch so a stale "edit" cannot leak
+          // into the next file's model creation.
+          const [mdEdit, setMdEdit] = React.useState(null)
+          const mdEditRef = React.useState({ v: null })[0]
+          React.useEffect(() => { setMdEdit(null); mdEditRef.v = null }, [path, sid])
           // v1.13: the per-file edit model drives the code area. modelKey
           // identifies the model in the module-level registry; modelVersion
           // re-renders after every structural model change (undo/redo/Enter/
@@ -3411,9 +3456,10 @@ window.__ModuleLoader__.load({
             // active-row pointer must not survive into the new DOM.
             const mAny = editModels.get(editKeyOf(r.root || store.root, path))
             if (mAny) mAny.activeIdx = null
-            // Clean markdown renders read-only (no model); PENDING markdown
-            // keeps the diff/审阅 view whose lines stay editable.
-            const editable = !r.deleted && !r.zero && !r.note && (lang !== 'markdown' || r.changed === true)
+            // Clean markdown renders read-only (no model) UNLESS the user
+            // explicitly toggled 编辑 (mdEditRef); PENDING markdown keeps the
+            // diff/审阅 view whose lines stay editable.
+            const editable = !r.deleted && !r.zero && !r.note && (lang !== 'markdown' || r.changed === true || mdEditRef.v === true)
             if (!editable) {
               if (r.deleted || r.zero) {
                 const key = editKeyOf(store.root, path)
@@ -3587,11 +3633,17 @@ window.__ModuleLoader__.load({
           if (!diff) {
             return React.createElement('div', { className: 'dsh-fe-msg' }, busy ? '加载中…' : '文件不存在或无法读取')
           }
-          // v1.9: markdown files render directly (no toggle, no preview cap).
-          // Pending review (`changed`) keeps the diff/accept-reject view so
-          // edits stay visible; once clean, the tab shows the rendered doc.
+          // v1.9: markdown files render directly (no preview cap).
+          // v1.15.3: the edit/read toggle overrides the automatic mode —
+          // pending diffs default to the editable review view, clean files
+          // to the rendered document; an explicit toggle sticks until the
+          // tab switches. Read mode renders the CURRENT content, so pending
+          // changes stay visible in the rendered doc and the toolbar keeps
+          // its accept-all/reject-all actions.
           const isMd = lang === 'markdown'
-          const mdRender = isMd && !diff.deleted && !diff.zero && diff.changed !== true && diff.current && diff.current.length > 0
+          const mdEditOn = mdEdit === null ? (diff.changed === true) : mdEdit
+          mdEditRef.v = mdEditOn
+          const mdRender = isMd && !diff.deleted && !diff.zero && !mdEditOn && diff.current && diff.current.length > 0
           // v1.13: review actions flush + save unsaved user edits FIRST so
           // the host computes hunks over the up-to-date content (a reject
           // then legitimately resets the history via justRejected).
@@ -3620,6 +3672,31 @@ window.__ModuleLoader__.load({
             if (r.ok) store.requestRefresh()
           }
           const statusText = mdRender ? 'Markdown' : (diff.status === 'added' ? '新增' : diff.status === 'deleted' ? '删除' : '修改')
+          // v1.15.3: MD-only edit/read switch (slider) at the far-left edge
+          // of the toolbar row. Checked = 编辑 (source + inline editing),
+          // unchecked = 阅读 (rendered markdown). Switching to 编辑 pulls a
+          // full payload so the edit model materializes; switching back to
+          // 阅读 flushes unsaved edits first so the rendered document
+          // reflects them (a failed save keeps the edit view).
+          const onMdToggle = async () => {
+            const next = !mdEditOn
+            if (!next) {
+              if (!(await ensureSaved())) return
+            }
+            setMdEdit(next)
+            if (next) void fetch(true)
+          }
+          const mdToggle = isMd && !diff.deleted && !diff.zero ? React.createElement('label', {
+            className: 'dsh-fe-mdswitch',
+            title: mdEditOn ? '当前：编辑模式（源代码，可编辑）。点击切换到阅读模式（渲染的 Markdown）' : '当前：阅读模式（渲染的 Markdown）。点击切换到编辑模式（源代码，可编辑）',
+          },
+            React.createElement('input', { type: 'checkbox', checked: mdEditOn, onChange: onMdToggle }),
+            React.createElement('span', { className: 'dsh-fe-mdswitch-track' },
+              React.createElement('span', { className: 'dsh-fe-mdswitch-pill' }),
+              React.createElement('span', { className: 'dsh-fe-mdswitch-seg dsh-fe-mdswitch-edit' }, '编辑'),
+              React.createElement('span', { className: 'dsh-fe-mdswitch-seg dsh-fe-mdswitch-read' }, '阅读'),
+            ),
+          ) : null
           // Accept-all / reject-all / refresh only exist while there is a
           // reviewable diff (the host stamps `changed` on the payload).
           const showActions = diff.changed === true
@@ -3629,17 +3706,20 @@ window.__ModuleLoader__.load({
             React.createElement(IconBtn, { key: 'rf', title: '刷新', onClick: () => fetch(), icon: IconRefresh }),
           ] : null
           const toolbar = React.createElement('div', { className: 'dsh-fe-toolbar', ref: (node) => { toolbarRef.node = node } },
+            mdToggle,
             React.createElement('span', { className: 'dsh-fe-tb-name', title: path }, path.split('/').pop()),
             React.createElement('span', { className: 'dsh-fe-chip' }, statusText),
             React.createElement('span', { className: 'dsh-fe-stats' },
-              mdRender ? ('渲染视图 · ' + diff.current.length + ' 行') : (diff.deleted ? '文件已删除' : (diff.note ? (diff.note === 'binary' ? '二进制文件' : '文件过大') : (diff.hunks && diff.hunks.length > 0
-                ? [
-                  React.createElement('span', { key: 'a', className: 'dsh-fe-stat-add' }, '+' + diff.hunks.reduce((s, h) => s + h.newLen, 0)),
-                  ' ',
-                  React.createElement('span', { key: 'd', className: 'dsh-fe-stat-del' }, '−' + diff.hunks.reduce((s, h) => s + h.oldLen, 0)),
-                  ' · ' + diff.hunks.length + ' 处未决定',
-                ]
-                : '无未决定修改')))),
+              mdRender
+                ? ('渲染视图 · ' + diff.current.length + ' 行' + (showActions ? ' · ' + (diff.hunks ? diff.hunks.length : 0) + ' 处未决定' : ''))
+                : (diff.deleted ? '文件已删除' : (diff.note ? (diff.note === 'binary' ? '二进制文件' : '文件过大') : (diff.hunks && diff.hunks.length > 0
+                  ? [
+                    React.createElement('span', { key: 'a', className: 'dsh-fe-stat-add' }, '+' + diff.hunks.reduce((s, h) => s + h.newLen, 0)),
+                    ' ',
+                    React.createElement('span', { key: 'd', className: 'dsh-fe-stat-del' }, '−' + diff.hunks.reduce((s, h) => s + h.oldLen, 0)),
+                    ' · ' + diff.hunks.length + ' 处未决定',
+                  ]
+                  : '无未决定修改')))),
             React.createElement('span', { className: 'dsh-fe-spacer' }, null),
             actionButtons,
           )
@@ -4026,11 +4106,27 @@ window.__ModuleLoader__.load({
             if (!scroller) scroller = document.scrollingElement || document.documentElement
             const box = node.getBoundingClientRect()
             const sb = scroller.getBoundingClientRect()
-            // Inside the diff's own viewport the sticky headers live OUTSIDE
-            // the scroller, so no offset. For any outer scroller (the chat
-            // column) the stuck tabs+toolbar cover the top — offset by them.
+            // v1.15.3: the target hunk's summary row (line range + accept/
+            // reject buttons) must land FULLY VISIBLE — below the stuck tabs
+            // and toolbar (their LIVE heights: the measured vars go stale
+            // when the toolbar wraps) AND below the sticky scope strip when
+            // it is showing (it overlays the first code strip), plus a small
+            // reserved margin. Inside the diff's own viewport the header
+            // stack lives OUTSIDE the scroller, so only the hanging scope
+            // strip needs room.
             const internal = scroller === diffRef.node
-            const headerH = internal ? 0 : ((store.tabH || 32) + (store.toolH || 35) + 2)
+            const barH = (scopeRef.node && scopeRef.node.firstElementChild && scopeRef.node.firstElementChild.childElementCount > 0
+              ? scopeRef.node.firstElementChild.offsetHeight : 0) || 0
+            let headerH
+            if (internal) {
+              headerH = barH + 4
+            } else {
+              headerH = (store.tabH || 32) + (store.toolH || 35) + barH + 8
+              if (toolbarRef.node) {
+                const r = toolbarRef.node.getBoundingClientRect()
+                if (r.bottom > 0 && r.bottom - sb.top > 0) headerH = Math.max(headerH, r.bottom - sb.top + barH + 8)
+              }
+            }
             const target = scroller.scrollTop + (box.top - sb.top) - headerH
             try {
               scroller.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
