@@ -361,15 +361,71 @@ export default {
     const waiters = new Map()
     function notify(sid) {
       const set = waiters.get(sid)
-      if (!set || set.size === 0) return
-      waiters.delete(sid)
-      for (const resolve of set) { try { resolve({ ok: true, changed: true }) } catch (e) {} }
+      if (set && set.size > 0) {
+        waiters.delete(sid)
+        for (const resolve of set) { try { resolve({ ok: true, changed: true }) } catch (e) {} }
+      }
+      // v1.13.3: SSE push channel. The long-poll wait chain has proven
+      // unreliable in the real browser (its self-managed loop can silently
+      // die), so every wake also broadcasts to connected EventSource clients.
+      // EventSource reconnects natively — nothing of ours has to stay alive.
+      const sse = sseClients.get(sid)
+      if (sse && sse.size > 0) {
+        for (const res of sse) { try { res.write('data: changed\n\n') } catch (e) {} }
+      }
     }
     const notifyTimers = new Map()
     function scheduleNotify(sid, delay) {
       const existing = notifyTimers.get(sid)
       if (existing) clearTimeout(existing)
       notifyTimers.set(sid, setTimeout(() => { notifyTimers.delete(sid); notify(sid) }, delay))
+    }
+
+    // ---------- SSE push channel ----------
+    // GET /dsh-file-edit/events?sessionId=... holds a text/event-stream
+    // connection; every coalesced mutation wake writes one `data: changed`
+    // frame. Pattern mirrors the harness's own HMR SSE route
+    // (packages/client/hmr): comment ping on connect, per-res close cleanup,
+    // destroy on teardown.
+    const sseClients = new Map()
+    function handleSse(req, res) {
+      let sid = ''
+      try {
+        const u = new URL(req.url, 'http://localhost')
+        sid = u.searchParams.get('sessionId') || ''
+      } catch (e) {}
+      if (!sid) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'no-session' }))
+        return
+      }
+      // The connection itself proves this session is being watched: register
+      // it so tools/result wakes are not dropped for pages that have not
+      // issued an API call yet.
+      knownSessions.add(sid)
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      })
+      try { res.write(': connected\n\n') } catch (e) {}
+      let set = sseClients.get(sid)
+      if (!set) { set = new Set(); sseClients.set(sid, set) }
+      set.add(res)
+      const cleanup = () => {
+        clearInterval(hb)
+        const s = sseClients.get(sid)
+        if (s) { s.delete(res); if (s.size === 0) sseClients.delete(sid) }
+      }
+      // Heartbeat: keep proxies/browsers from closing an idle stream, and
+      // surface dead sockets (the write throw routes into cleanup).
+      const hb = setInterval(() => {
+        try { res.write(': ping\n\n') } catch (e) { cleanup() }
+      }, 20000)
+      let closed = false
+      const onClose = () => { if (!closed) { closed = true; cleanup() } }
+      try { req.on('close', onClose) } catch (e) {}
+      try { res.on('close', onClose) } catch (e) {}
     }
     function requireState(args) {
       const sid = args && args.sessionId ? String(args.sessionId) : ''
@@ -1435,6 +1491,10 @@ export default {
       path: '/dsh-file-edit',
       handler: async (req, res) => {
         try {
+          if (req.method === 'GET' && req.url && req.url.startsWith('/dsh-file-edit/events')) {
+            handleSse(req, res)
+            return
+          }
           if (req.method !== 'POST' || req.url !== '/dsh-file-edit/api') {
             res.writeHead(404, { 'Content-Type': 'application/json' })
             res.end(JSON.stringify({ ok: false, error: 'not found' }))
@@ -1476,6 +1536,11 @@ export default {
         set.clear()
       }
       waiters.clear()
+      for (const [, set] of sseClients) {
+        for (const res of set) { try { res.destroy() } catch (e) {} }
+        set.clear()
+      }
+      sseClients.clear()
       for (const [, h] of notifyTimers) clearTimeout(h)
       notifyTimers.clear()
     }, 'dsh-file-edit: wait cleanup')
@@ -1486,13 +1551,19 @@ export default {
       const sid = agent && agent.session ? agent.session.id : undefined
       if (!sid || !knownSessions.has(sid)) return
       const name = exec && exec.name ? exec.name : ''
+      // v1.13.3 bugfix: the harness ToolExecution carries the parsed tool
+      // arguments under `exec.arguments` (packages/core/tools: ToolExecution),
+      // NOT `exec.args`. Reading `exec.args` yielded undefined, so shell/pwsh
+      // command text was never inspected (Remove-Item never triggered) and
+      // write/edit attribution always fell back to the whole-window sweep.
+      const args = exec && (exec.arguments ?? exec.args)
       let mutating = false
       if (name === 'write' || name === 'edit') mutating = true
       else if (name === 'shell' || name === 'pwsh') {
         // Only commands that can change the workspace trigger a refresh.
         // A command text we cannot inspect is treated as non-mutating
         // (strict per requirement: everything else must not trigger).
-        const cmd = exec.args && typeof exec.args.command === 'string' ? exec.args.command : ''
+        const cmd = args && typeof args.command === 'string' ? args.command : ''
         mutating = cmd !== '' && MUTATING_SHELL_RE.test(cmd)
       }
       if (!mutating) return
@@ -1509,7 +1580,7 @@ export default {
       // also falls back to the window so agent work is never silently folded.
       let attributed = false
       if (name === 'write' || name === 'edit') {
-        const raw = exec.args && typeof exec.args.file_path === 'string' ? exec.args.file_path : ''
+        const raw = args && typeof args.file_path === 'string' ? args.file_path : ''
         const rel = normalizeRelPath(st.root, raw)
         if (rel) { st.touched.add(rel); attributed = true }
       }

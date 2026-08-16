@@ -227,6 +227,33 @@ window.__ModuleLoader__.load({
           offWatcherSub()
         }, 'dsh-file-edit: instant refresh watcher')
 
+        // -------- SSE push channel (primary instant refresh, v1.13.3) --------
+        // The long-poll watcher above has proven unreliable in this
+        // environment (its self-managed async loop can silently die), so the
+        // host now ALSO pushes mutation wakes over Server-Sent Events. The
+        // browser's EventSource reconnects natively — no loop of ours has to
+        // stay alive — and onmessage drives the same requestRefresh() wake as
+        // the watcher, so one host wake = one getModified per mutation burst.
+        let sseConn = null
+        let sseSid = null
+        const closeSse = () => { if (sseConn) { try { sseConn.close() } catch (e) {} } sseConn = null; sseSid = null }
+        const ensureSse = () => {
+          if (typeof EventSource === 'undefined') return
+          const sid = store.sessionId
+          if (!sid || sid === sseSid) return
+          closeSse()
+          try {
+            sseConn = new EventSource('/dsh-file-edit/events?sessionId=' + encodeURIComponent(sid))
+            sseSid = sid
+            sseConn.onmessage = () => { store.requestRefresh() }
+            sseConn.onopen = () => { console.info('[dsh-file-edit] sse open: ' + sid) }
+            sseConn.onerror = () => {} // EventSource retries by itself
+          } catch (e) { closeSse() }
+        }
+        const offSseSub = store.subscribe(ensureSse)
+        ensureSse()
+        ctx.effect(() => { closeSse(); offSseSub() }, 'dsh-file-edit: sse channel')
+
         // ---------- new-session guard ----------
         // Every New Session entry point in the shell (sidebar top button,
         // wordmark, workspace rows, agent-preset flows) funnels into
