@@ -185,4 +185,4 @@ if (-not $ok) { throw 'install verification failed: some package files are missi
 "  1. restart DSH (loads the host plugin and the new mount entry)"
 "  2. hard-refresh the web page (Ctrl+F5) so the browser picks up the client bundle"
 "  3. verify: sidebar workspace tree + the Files tab + modified-file bar appear,"
-"     and the console shows '[dsh-file-edit] guard v1.10.0'"
+"     and the console shows '[dsh-file-edit] guard v1.16.0'"

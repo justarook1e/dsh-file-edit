@@ -60,12 +60,20 @@ window.__ModuleLoader__.load({
           // old `modified` set (yellow dot for pending agent DIFFs) is gone —
           // that indicator collided semantically with the new dirty dot.
           dirtyFiles: new Set(),
+          // v1.16.0: dirty changes ride their OWN channel (dirtySubs), not
+          // the global emit. The old emit re-rendered FileView + every
+          // store subscriber on the FIRST keystroke of each editing session
+          // (markTyping → setDirty → emit → thousand-line DiffPane tree),
+          // and FileView's white dot was the only consumer of the signal.
+          dirtySubs: new Set(),
           setDirty(path, v) {
             const on = !!v
             if (on === this.dirtyFiles.has(path)) return
             if (on) this.dirtyFiles.add(path); else this.dirtyFiles.delete(path)
-            this.emit()
+            const subs = Array.from(this.dirtySubs)
+            for (const f of subs) { try { f() } catch (e) {} }
           },
+          onDirty(f) { this.dirtySubs.add(f); return () => { this.dirtySubs.delete(f) } },
           // Current session's workspace root (from getModified/getDiff).
           // Used to key per-file edit histories by (root, path).
           root: null,
@@ -126,6 +134,14 @@ window.__ModuleLoader__.load({
         const useStore = () => {
           const [, force] = React.useState(0)
           React.useEffect(() => store.subscribe(() => force((n) => n + 1)), [])
+        }
+        // v1.16.0: narrow store channel for dirty-file changes. setDirty no
+        // longer emits globally (the white tab dot was its only consumer),
+        // so FileView subscribes here and force-re-renders itself — DiffPane
+        // is memo'd and props are unchanged, so only the tab strip updates.
+        const useDirty = () => {
+          const [, force] = React.useState(0)
+          React.useEffect(() => store.onDirty(() => force((n) => n + 1)), [])
         }
         // v1.13.3: NO fast arm. The old 1.5s running-cadence poll fired
         // getModified/getDiff every 1.5s while the agent was mid-turn and
@@ -493,7 +509,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.15.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.16.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -1237,7 +1253,50 @@ window.__ModuleLoader__.load({
           // removed rows animate out before unmounting.
           const [rowSet, setRowSet] = React.useState([])
           const animRef = React.useState({ t: null })[0]
-          React.useEffect(() => () => { if (animRef.t) clearTimeout(animRef.t) }, [])
+          React.useEffect(() => () => { if (animRef.t) clearTimeout(animRef.t); if (scrollTimer.t) clearTimeout(scrollTimer.t) }, [])
+          // v1.16.0: the 5-row scroll mode must not fight the grid-rows
+          // expand/collapse transition. While the body animates, the inner
+          // keeps plain overflow:hidden (clipped, no scrollbar relayout per
+          // frame — the v1.15.3 jank on every toggle); the scroll class is
+          // applied only once the expansion has settled (300ms > the 260ms
+          // transition), removed synchronously on collapse, and applied
+          // immediately when no animation is running (mount / threshold
+          // crossings).
+          const [scrollClass, setScrollClass] = React.useState(false)
+          const scrollTimer = React.useState({ t: null })[0]
+          React.useEffect(() => {
+            const need = !collapsed && rowSet.length > 5
+            if (!need) {
+              if (scrollTimer.t) clearTimeout(scrollTimer.t)
+              scrollTimer.t = null
+              if (scrollClass) setScrollClass(false)
+              return
+            }
+            if (scrollClass) return
+            // An expand animation is in flight (the toggle armed the settle
+            // timer): let the timer apply the scroller once the grid-rows
+            // transition has finished. Otherwise (mount / threshold crossed
+            // with no animation running) apply immediately — no 6-row-then-
+            // 5-row jump.
+            if (scrollTimer.t) return
+            setScrollClass(true)
+          }, [collapsed, rowSet.length])
+          const onToggle = () => {
+            const next = !collapsed
+            setCollapsed(next)
+            if (next) {
+              // collapsing: drop the scroller up front so the shrink animates
+              // with a clipped overflow (no scrollbar mid-animation).
+              if (scrollTimer.t) clearTimeout(scrollTimer.t)
+              scrollTimer.t = null
+              setScrollClass(false)
+            } else if (rowSet.length > 5) {
+              // expanding: arm the settle timer (300ms > the 260ms
+              // transition); the effect above skips while it is pending.
+              if (scrollTimer.t) clearTimeout(scrollTimer.t)
+              scrollTimer.t = setTimeout(() => { scrollTimer.t = null; setScrollClass(true) }, 300)
+            }
+          }
           // v1.12: overlay posture plumbing. The anchor is a zero-height
           // in-flow span that keeps the dock row measurable; the bar root
           // gets position:absolute (class) + a measured `bottom` offset so it
@@ -1372,7 +1431,7 @@ window.__ModuleLoader__.load({
             // v1.8.1: centered between the left group and the action buttons;
             // the glyph shows what CLICKING will do (expanded → collapse down,
             // collapsed → expand up), not the current state.
-            React.createElement(IconBtn, { title: collapsed ? '展开修改文件列表' : '收起修改文件列表（折叠为一行）', onClick: () => setCollapsed(!collapsed), icon: collapsed ? IconChevUp : IconChevDown }),
+            React.createElement(IconBtn, { title: collapsed ? '展开修改文件列表' : '收起修改文件列表（折叠为一行）', onClick: onToggle, icon: collapsed ? IconChevUp : IconChevDown }),
             React.createElement('span', { className: 'dsh-fe-spacer' }, null),
             React.createElement(IconBtn, { tone: 'ok', title: '全部接受', onClick: () => actAll('acceptAll'), icon: IconDoubleCheck }),
             React.createElement(IconBtn, { tone: 'no', className: 'dsh-fe-pair', title: '全部拒绝', onClick: () => actAll('rejectAll'), icon: IconRejectAll }),
@@ -1399,7 +1458,7 @@ window.__ModuleLoader__.load({
             React.createElement('span', { ref: (node) => { anchorRef.node = node }, className: 'dsh-fe-dock-anchor' }),
             React.createElement('div', {
               ref: (node) => { barRef.node = node },
-              className: 'dsh-fe-bar' + (collapsed ? ' dsh-fe-bar-collapsed' : '') + (overlay ? ' dsh-fe-bar-overlay' : '') + (rowSet.length > 5 ? ' dsh-fe-bar-scroll' : ''),
+              className: 'dsh-fe-bar' + (collapsed ? ' dsh-fe-bar-collapsed' : '') + (overlay ? ' dsh-fe-bar-overlay' : '') + (rowSet.length > 5 && scrollClass ? ' dsh-fe-bar-scroll' : ''),
               style: barStyle,
             },
               head,
@@ -2241,10 +2300,20 @@ window.__ModuleLoader__.load({
         // Live-editing sync: after the browser mutates a contentEditable line,
         // the pointer-events:none highlight layer below must mirror the new
         // text (imperative, no React render involved).
-        const syncHl = (el) => {
+        // v1.16.0: input bursts are coalesced through requestAnimationFrame —
+        // fast typing used to run one full re-tokenize + span rebuild per
+        // keystroke (the editable line's text changes every time, so the
+        // token cache always missed). Now at most one rebuild per frame, and
+        // the callback re-reads the LIVE text so no keystroke is skipped.
+        const hlPending = new Set()
+        let hlRaf = 0
+        const hlRafReq = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 16)
+        const hlRafCancel = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : clearTimeout
+        const paintHlNow = (el) => {
+          hlPending.delete(el)
+          if (!el || !el.parentNode) return
           try {
-            const wrap = el && el.parentNode
-            if (!wrap) return
+            const wrap = el.parentNode
             const hl = wrap.querySelector('.dsh-fe-hl')
             if (!hl) return
             const text = (el.textContent || '').replace(/\n/g, '')
@@ -2262,6 +2331,16 @@ window.__ModuleLoader__.load({
               hl.textContent = text
             }
           } catch (e) {}
+        }
+        const syncHl = (el) => {
+          if (!el) return
+          hlPending.add(el)
+          if (hlRaf) return
+          hlRaf = hlRafReq(() => {
+            hlRaf = 0
+            const els = Array.from(hlPending)
+            for (const e of els) paintHlNow(e)
+          })
         }
 
         const LANG_BY_EXT = {
@@ -3115,7 +3194,14 @@ window.__ModuleLoader__.load({
         }
 
         // ---------- file view ----------
-        function DiffPane(props) {
+        // v1.16.0: DiffPane is memo'd. FileView re-renders on every global
+        // store emit (tab opens, dirty flips, refresh ticks); without memo
+        // that forced the whole thousand-line pane tree to re-render each
+        // time — the typing jank on ~1000-line files. Props are only
+        // { sid, path }, so memo blocks re-renders while the same file is
+        // open; the pane's own narrow subscriptions (refreshTick, dockH)
+        // still update it.
+        const DiffPane = React.memo(function DiffPane(props) {
           const sid = props.sid
           const path = props.path
           const [diff, setDiff] = React.useState(null)
@@ -3627,9 +3713,23 @@ window.__ModuleLoader__.load({
           }, [path, sid])
           // Bar-side accept/reject bumps the shared tick: refetch right away
           // so this pane's toolbar stats stay in sync with the modified bar.
-          useStore()
-          const refreshTick = store.refreshTick
-          React.useEffect(() => { if (refreshTick) void fetch() }, [refreshTick])
+          // v1.16.0: a NARROW subscription replaces useStore() here. The old
+          // global subscription force-re-rendered the whole thousand-line
+          // pane tree on every store emit; now a refreshTick change only
+          // calls fetch() directly and the pane re-renders solely when the
+          // fetch lands new data (setDiff). The ref box keeps the latest
+          // fetch closure (same pattern as usePoll) since the effect runs
+          // once.
+          const refreshRef = React.useState({ fn: null })[0]
+          refreshRef.fn = fetch
+          const tickRef = React.useState({ v: store.refreshTick })[0]
+          React.useEffect(() => store.subscribe(() => {
+            const t = store.refreshTick
+            if (t !== tickRef.v) {
+              tickRef.v = t
+              void refreshRef.fn()
+            }
+          }), [])
           if (!diff) {
             return React.createElement('div', { className: 'dsh-fe-msg' }, busy ? '加载中…' : '文件不存在或无法读取')
           }
@@ -4260,11 +4360,13 @@ window.__ModuleLoader__.load({
               ),
             ),
           )
-        }
+        })
 
         function FileView(props) {
           const sid = props.sessionId
           useStore()
+          // v1.16.0: white-dot updates ride the narrow dirty channel.
+          useDirty()
           React.useEffect(() => { if (sid) store.setSessionId(sid) }, [sid])
           // v1.12: the shell renders ONLY the active conversation view
           // (ConversationSession's renderSlot passes `only: active.id`), so
@@ -4435,6 +4537,10 @@ window.__ModuleLoader__.load({
             for (const [, h] of persistTimers) { try { h() } catch (e) {} }
             persistTimers.clear()
             for (const mm of editModels.values()) persistNow(mm)
+            // v1.16.0: drop any pending coalesced highlight repaints; their
+            // elements are being detached.
+            if (hlRaf) { hlRafCancel(hlRaf); hlRaf = 0 }
+            hlPending.clear()
           }
           let off = null
           try { window.addEventListener('beforeunload', flush); off = () => window.removeEventListener('beforeunload', flush) } catch (e) {}
