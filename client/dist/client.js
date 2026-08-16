@@ -493,7 +493,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.15.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.15.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -810,6 +810,18 @@ window.__ModuleLoader__.load({
           '.dsh-fe-git-r { color:var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)); background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 16%, transparent); }',
           '.dsh-fe-row-ignored .dsh-fe-name { color:color-mix(in srgb, var(--dsw-alias-label-secondary) 55%, transparent); }',
           '.dsh-fe-row-ignored .dsh-fe-ic, .dsh-fe-row-ignored .dsh-fe-chev { color:color-mix(in srgb, var(--dsw-alias-label-secondary) 55%, transparent); }',
+          // ---- v1.15.2: hunk summary rows never paint above sticky rows ----
+          // The per-diff summary row (line range + accept/reject) stays in
+          // normal document flow — its position relative to the code lines
+          // is fixed and it scrolls away naturally, no pinning. The only
+          // guarantee added here is paint order: the row is positioned
+          // (sticky left:0 keeps the horizontal gutter stickiness) and now
+          // carries an explicit z-index:1, which keeps it above the plain
+          // scrolling lines but strictly BELOW the sticky rows — scope
+          // strip (3), jump pill (4), toolbar (5), file tabs (6) — so it
+          // can never accidentally be displayed on top of the sticky-scroll
+          // row. The background keeps the original translucent tint.
+          '.dsh-fe-hunk-head { z-index:1; }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
