@@ -1,0 +1,7 @@
+# dsh-file-edit bundle patch: one plugin row added to the host composition.
+# Applied as a profile bundle layer (declared by dsh.bundle in package.json);
+# the row joins the Loader entry list, mounting the host half and serving
+# lib/client.js into the boot graph.
+- insert:
+    - id: dsh-file-edit
+      name: dsh-file-edit
