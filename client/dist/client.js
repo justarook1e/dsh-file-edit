@@ -236,23 +236,65 @@ window.__ModuleLoader__.load({
         // the watcher, so one host wake = one getModified per mutation burst.
         let sseConn = null
         let sseSid = null
+        let sseWarned = false
+        let sseErrLog = 0
         const closeSse = () => { if (sseConn) { try { sseConn.close() } catch (e) {} } sseConn = null; sseSid = null }
         const ensureSse = () => {
-          if (typeof EventSource === 'undefined') return
+          if (typeof EventSource === 'undefined') {
+            if (!sseWarned) { sseWarned = true; console.warn('[dsh-file-edit] sse unavailable: EventSource is not defined in this page') }
+            return
+          }
           const sid = store.sessionId
           if (!sid || sid === sseSid) return
           closeSse()
           try {
             sseConn = new EventSource('/dsh-file-edit/events?sessionId=' + encodeURIComponent(sid))
             sseSid = sid
+            sseErrLog = 0
             sseConn.onmessage = () => { store.requestRefresh() }
-            sseConn.onopen = () => { console.info('[dsh-file-edit] sse open: ' + sid) }
-            sseConn.onerror = () => {} // EventSource retries by itself
-          } catch (e) { closeSse() }
+            sseConn.onopen = () => { sseErrLog = 0; console.info('[dsh-file-edit] sse open: ' + sid) }
+            sseConn.onerror = () => { if (sseErrLog < 2) { sseErrLog++; console.warn('[dsh-file-edit] sse error (browser will retry)') } }
+          } catch (e) {
+            console.warn('[dsh-file-edit] sse open failed: ' + (e && e.message ? e.message : String(e)))
+            closeSse()
+          }
         }
         const offSseSub = store.subscribe(ensureSse)
         ensureSse()
         ctx.effect(() => { closeSse(); offSseSub() }, 'dsh-file-edit: sse channel')
+
+        // -------- session-activity refresh (event-driven backbone, v1.13.3) ----
+        // This environment has proven hostile to timer chains and long-held
+        // connections (the poll arms and the wait watcher can silently die),
+        // but the shell's OWN session list store notifies synchronously on
+        // every session activity frame — running flips, tool results, new
+        // messages (the sidebar's relative-time labels ride the same feed).
+        // Ride that signal: each notification that touches the current
+        // session while it is running requests ONE refresh, clock-throttled
+        // (no timers involved, so nothing of ours can die).
+        let lastActRefresh = 0
+        const onSessionsChanged = () => {
+          try {
+            const sid = store.sessionId
+            if (!sid) return
+            const snap = ctx.sessions && ctx.sessions.list ? ctx.sessions.list.getSnapshot() : null
+            const entry = snap && snap.byId ? snap.byId[sid] : null
+            if (!entry || !entry.running) return
+            const now = Date.now()
+            if (now - lastActRefresh < 1200) return
+            lastActRefresh = now
+            store.requestRefresh()
+          } catch (e) {}
+        }
+        let offSessSub = null
+        try {
+          if (ctx.sessions && ctx.sessions.list && typeof ctx.sessions.list.subscribe === 'function') {
+            offSessSub = ctx.sessions.list.subscribe(onSessionsChanged)
+          }
+        } catch (e) {}
+        ctx.effect(() => {
+          if (offSessSub) { try { offSessSub() } catch (e) {} offSessSub = null }
+        }, 'dsh-file-edit: session activity refresh')
 
         // ---------- new-session guard ----------
         // Every New Session entry point in the shell (sidebar top button,
