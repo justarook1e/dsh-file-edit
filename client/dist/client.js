@@ -509,7 +509,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.16.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.17.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -972,7 +972,9 @@ window.__ModuleLoader__.load({
                 onClick: () => setOpen(!open),
                 title: ignoredNote + (node.path || node.name),
               },
-                React.createElement('span', { className: 'dsh-fe-chev' }, IconChevron()),
+                // v1.17: a wholly gitignored directory arrives as a grayed
+                // leaf (children: []) — no chevron, nothing to expand.
+                React.createElement('span', { className: 'dsh-fe-chev' }, kids.length > 0 ? IconChevron() : null),
                 React.createElement('span', { className: 'dsh-fe-ic' }, IconFolder()),
                 React.createElement('span', { className: 'dsh-fe-name' }, node.name),
                 badge,
