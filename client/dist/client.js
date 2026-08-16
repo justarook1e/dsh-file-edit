@@ -204,7 +204,9 @@ window.__ModuleLoader__.load({
         let watcherSid = null
         let watcherTimer = null
         const watcherLoop = async (token) => {
-          const sid = store.sessionId
+          // sidNow(): the store may not be healed yet when the loop first
+          // starts — resolve from the snapshot like every other channel.
+          const sid = sidNow()
           if (!sid || token !== watcherToken) return
           try {
             const r = await call('wait', { sessionId: sid }, 20000)
@@ -236,7 +238,7 @@ window.__ModuleLoader__.load({
         }
         const offWatcherSub = store.subscribe(ensureWatcher)
         ensureWatcher()
-        ctx.effect(() => {
+        ctx.effect(() => () => {
           watcherDisposed = true
           if (watcherTimer) { clearTimeout(watcherTimer); watcherTimer = null }
           offWatcherSub()
@@ -281,7 +283,7 @@ window.__ModuleLoader__.load({
         }
         const offSseSub = store.subscribe(ensureSse)
         ensureSse()
-        ctx.effect(() => { closeSse(); offSseSub() }, 'dsh-file-edit: sse channel')
+        ctx.effect(() => () => { closeSse(); offSseSub() }, 'dsh-file-edit: sse channel')
 
         // -------- session-activity refresh (event-driven backbone, v1.13.3) ----
         // This environment has proven hostile to timer chains and long-held
@@ -315,7 +317,7 @@ window.__ModuleLoader__.load({
             offSessSub = ctx.sessions.list.subscribe(onSessionsChanged)
           }
         } catch (e) {}
-        ctx.effect(() => {
+        ctx.effect(() => () => {
           if (offSessSub) { try { offSessSub() } catch (e) {} offSessSub = null }
         }, 'dsh-file-edit: session activity refresh')
 
@@ -563,7 +565,7 @@ window.__ModuleLoader__.load({
         }
         setTimeout(() => { diagInventory() }, 1500)
         setTimeout(() => { diagInventory() }, 4000)
-        ctx.effect(() => {
+        ctx.effect(() => () => {
           guardDisposed = true
           document.removeEventListener('click', onDocClick, true)
           try { window.removeEventListener('click', onDocClick, true) } catch (e) {}
