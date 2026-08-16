@@ -44,10 +44,14 @@ export default {
     const MAX_ENTRIES = 8000
     const MAX_DEPTH = 16
     const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', '.next', '.dsh', '.idea', '.vscode', '.cache', '.turbo', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.eslintcache', '.DS_Store'])
-    // shell/pwsh included: agent-side deletions (rm / Remove-Item) run through
-    // the shell tool, not the fs write tools. Scans are lazy + coalesced by the
-    // client's 6s poll, so the extra coverage costs at most one walk per poll.
-    const MUTATING_TOOLS = new Set(['write', 'edit', 'shell', 'pwsh'])
+    // v1.13.3: change triggers are event-driven and NARROW — the client no
+    // longer fast-polls (its fixed 20s arm is only a failsafe), so a trigger
+    // here must be both precise and cheap. write/edit always mutate and carry
+    // an explicit file_path. shell/pwsh are opaque text, so instead of
+    // "any shell call dirties the session" only commands that can actually
+    // change the workspace get through: read-only traffic (Get-ChildItem,
+    // node --version, git status, ...) now costs nothing.
+    const MUTATING_SHELL_RE = /Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|Rename-Item|del\s|rm\s|rmdir/i
     const knownSessions = new Set()
     // Undo safety: reject overwrites disk with baseline content, so every
     // reject snapshots the pre-reject bytes first (one undo level per
@@ -1482,18 +1486,27 @@ export default {
       const sid = agent && agent.session ? agent.session.id : undefined
       if (!sid || !knownSessions.has(sid)) return
       const name = exec && exec.name ? exec.name : ''
-      if (!MUTATING_TOOLS.has(name)) return
+      let mutating = false
+      if (name === 'write' || name === 'edit') mutating = true
+      else if (name === 'shell' || name === 'pwsh') {
+        // Only commands that can change the workspace trigger a refresh.
+        // A command text we cannot inspect is treated as non-mutating
+        // (strict per requirement: everything else must not trigger).
+        const cmd = exec.args && typeof exec.args.command === 'string' ? exec.args.command : ''
+        mutating = cmd !== '' && MUTATING_SHELL_RE.test(cmd)
+      }
+      if (!mutating) return
       const st = stateFor(sid)
       if (!st.baseReady) return
       st.dirty = true
       st.mutationStamp = (st.mutationStamp || 0) + 1
       // v1.8 change attribution (direction B): only changes that flowed
       // through the agent's tool channel enter the review. write/edit carry
-      // an explicit file_path — attribute exactly that file. shell/pwsh
-      // commands are opaque text, so they fall back to a session-wide window
-      // the next scan consumes (conservative: everything non-pending found
-      // by that scan is attributed). An unparseable write/edit path also
-      // falls back to the window so agent work is never silently folded.
+      // an explicit file_path — attribute exactly that file. Mutating shell/
+      // pwsh commands are opaque text, so they fall back to a session-wide
+      // window the next scan consumes (conservative: everything non-pending
+      // found by that scan is attributed). An unparseable write/edit path
+      // also falls back to the window so agent work is never silently folded.
       let attributed = false
       if (name === 'write' || name === 'edit') {
         const raw = exec.args && typeof exec.args.file_path === 'string' ? exec.args.file_path : ''
@@ -1502,7 +1515,9 @@ export default {
       }
       if (!attributed) st.shellWindow = true
       // Wake any long-polling client right away (bursts of tool results in
-      // one agent turn coalesce into a single wake-up).
+      // one agent turn coalesce into a single wake-up). The woken client
+      // pulls getModified once, whose dirty branch runs the lazy scan —
+      // exactly one walk per mutation burst, zero periodic polling.
       scheduleNotify(sid, 300)
     })
   },

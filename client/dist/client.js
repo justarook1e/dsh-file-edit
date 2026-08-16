@@ -1,4 +1,4 @@
-﻿// dsh-file-edit — static client bundle (web plugin).
+// dsh-file-edit — static client bundle (web plugin).
 // Loaded by the client module system as a classic script; registers a factory
 // via window.__ModuleLoader__.load. The factory body runs at materialization;
 // require('react') resolves through the shell's static module table.
@@ -127,19 +127,14 @@ window.__ModuleLoader__.load({
           const [, force] = React.useState(0)
           React.useEffect(() => store.subscribe(() => force((n) => n + 1)), [])
         }
-        // v1.9.3: the poll cadence is DYNAMIC. While the agent is mid-turn
-        // (session `running`), tick every 1.5s so edits/adds/deletes surface
-        // within ~1.5s of the tool result — the RELIABLE backbone of the
-        // instant-refresh path (the long-poll watcher above is best-effort;
-        // this environment has shown it can silently die). Idle sessions
-        // drop back to the 30s low-frequency failsafe.
-        const pollDelayFor = (sid) => {
-          try {
-            const snap = ctx.sessions && ctx.sessions.list ? ctx.sessions.list.getSnapshot() : null
-            if (snap && sid && snap.byId && snap.byId[sid] && snap.byId[sid].running) return 1500
-          } catch (e) {}
-          return 30000
-        }
+        // v1.13.3: NO fast arm. The old 1.5s running-cadence poll fired
+        // getModified/getDiff every 1.5s while the agent was mid-turn and
+        // caused jank when browsing files during RUNNING — it is gone.
+        // Instant updates now ride the long-poll `wait` watcher exclusively
+        // (the host wakes it the moment a mutating tool result lands); this
+        // fixed 20s arm is only the failsafe for what the watcher cannot
+        // cover (external/manual edits, a dead long-poll chain).
+        const pollDelayFor = (sid) => 20000
         const usePoll = (fn, delayOf) => {
           const ref = React.useState({ fn: fn, delayOf: delayOf })[0]
           ref.fn = fn
@@ -160,38 +155,22 @@ window.__ModuleLoader__.load({
                 arm()
               })
             }
-            // The moment the session flips to running (user sent a message,
-            // agent started working), cancel the slow idle timer and tick NOW
-            // — otherwise the first edit of the turn could wait out a whole
-            // 30s idle arm before the fast cadence kicks in.
-            let wasFast = ref.delayOf() <= 2000
-            let off = null
-            try {
-              if (ctx.sessions && ctx.sessions.list && typeof ctx.sessions.list.subscribe === 'function') {
-                off = ctx.sessions.list.subscribe(() => {
-                  if (disposed) return
-                  const fast = ref.delayOf() <= 2000
-                  if (fast && !wasFast) {
-                    if (handle) { handle(); handle = null }
-                    tick()
-                  }
-                  wasFast = fast
-                })
-              }
-            } catch (e) {}
             // No immediate first tick: initial loads are explicit effects in
-            // the consumers (ModifiedBar/DiffPane refetch on sid/path).
+            // the consumers (ModifiedBar/DiffPane refetch on sid/path), and
+            // mid-turn updates come from the long-poll watcher, not this arm.
             arm()
-            return () => { disposed = true; if (handle) handle(); if (off) off() }
+            return () => { disposed = true; if (handle) handle() }
           }, [])
         }
 
         // -------- instant refresh watcher (long-poll against host `wait`) --------
-        // The host resolves `wait` the instant an agent mutation (write/edit/
-        // shell/pwsh tool result) marks the session dirty, so the modified bar
-        // and open diff panes refresh right away instead of waiting for the
-        // poll. requestRefresh() makes both the ModifiedBar and every open
-        // DiffPane refetch, so a single wake-up covers all surfaces.
+        // The host resolves `wait` the instant a mutating tool result lands
+        // (write/edit, or a shell/pwsh command matching the host's mutating-
+        // command list — v1.13.3 narrowed the trigger from "any shell call"),
+        // so the modified bar and open diff panes refresh right away instead
+        // of waiting for the poll. requestRefresh() makes both the ModifiedBar
+        // and every open DiffPane refetch, so a single wake-up covers all
+        // surfaces.
         //
         // v1.9.3 hardening (this environment has shown it can silently kill
         // apply-time loops, so the watcher must be unable to die or wedge):
@@ -203,8 +182,8 @@ window.__ModuleLoader__.load({
         //    request cannot freeze the loop forever;
         //  * a token invalidates an in-flight iteration when the session
         //    changes, so a new session starts its own loop immediately.
-        // Best-effort accelerator only: the adaptive poll (fast while the
-        // agent is running) is the reliable backbone; this makes it sub-second.
+        // v1.13.3: this chain is now the PRIMARY instant channel (the 1.5s
+        // fast poll is gone); the fixed 20s poll is only the failsafe.
         let watcherDisposed = false
         let watcherToken = 0
         let watcherSid = null
@@ -470,7 +449,7 @@ window.__ModuleLoader__.load({
           }
         }, 1000)
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.13.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.13.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click+pointerdown) + direct button attach (setTimeout loop)')
         }
         // One-shot inventory of session-labelled buttons after the app
         // renders (diagnostic; removed once the native path is confirmed).
