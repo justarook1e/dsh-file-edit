@@ -519,7 +519,7 @@ export default {
           try {
           const stamp = st.mutationStamp || 0
           const rootTarget = await fs.resolve(res.root)
-          // v1.17: the gitignore-excluded set decides which entries consume
+          // v1.17: the gitignore-excluded set exempts ignored entries from
           // the walk budget (see walkFiles); one git call per scan burst
           // (TTL-cached together with the VCS decorations).
           const ignored = await ignoredInfoFor(res.root)
@@ -629,16 +629,14 @@ export default {
         const repoRel = ignored && ignored.prefix ? ignored.prefix + '/' + childRel : childRel
         if (e.type === 'directory') {
           if (SKIP_DIRS.has(e.name)) continue
-          // v1.17: a wholly gitignored directory consumes no walk budget and
-          // contributes nothing reviewable — skip it outright (the tree still
-          // shows it as a grayed leaf via treeNode).
-          if (ignored && ignored.dirs.has(repoRel)) continue
+          // v1.17: wholly-ignored directories still descend — their files
+          // stay reviewable. Only the budget accounting skips them.
           await walkFiles(e.target, childRel, out, depth + 1, count, ignored)
         } else if (e.type === 'file') {
-          // v1.17: individually gitignored files stay outside the review map
-          // and outside the budget (the tree still shows them grayed).
-          if (ignored && ignored.files.has(repoRel)) continue
-          count.n++
+          // v1.17: gitignored files stay fully in the review map (baseline +
+          // diff) — they simply don't consume the MAX_ENTRIES budget.
+          const isIgnored = !!(ignored && ignored.files.has(repoRel))
+          if (!isIgnored) count.n++
           let version = e.version !== undefined ? e.version : null
           let size = e.size !== undefined ? e.size : 0
           if (version === null) {
@@ -664,19 +662,13 @@ export default {
         const repoRel = ignored && ignored.prefix ? ignored.prefix + '/' + childRel : childRel
         if (e.type === 'directory') {
           if (SKIP_DIRS.has(e.name)) continue
-          // v1.17: wholly gitignored directory → grayed leaf node (no
-          // descent, no budget). Negation patterns are honored by git itself:
-          // a dir with un-ignored exceptions is never reported as collapsed.
-          if (ignored && ignored.dirs.has(repoRel)) {
-            node.children.push({ name: e.name, type: 'directory', path: childRel, children: [], ignored: true })
-            if (paths) paths.push(childRel)
-            continue
-          }
+          // v1.17: ignored directories keep their full children in the tree
+          // (grayed) — only the budget accounting skips ignored entries.
           const child = await treeNode(e.target, childRel, depth + 1, count, paths, ignored)
           if (child) node.children.push(child)
         } else if (e.type === 'file') {
-          // v1.17: individually ignored files stay visible (grayed) but do not
-          // consume the tree budget either.
+          // v1.17: gitignored files stay in the tree (grayed by annotateTree)
+          // with the same budget exemption as the scan.
           const isIgnored = !!(ignored && ignored.files.has(repoRel))
           if (!isIgnored) count.n++
           const fileNode = { name: e.name, type: 'file', size: e.size !== undefined ? e.size : 0, path: childRel }
@@ -711,7 +703,7 @@ export default {
     const GIT_CANDIDATES = ['git', 'C:\\Program Files\\Git\\cmd\\git.exe', 'C:\\Program Files\\Git\\bin\\git.exe', 'C:\\Program Files (x86)\\Git\\cmd\\git.exe']
     const gitCache = new Map()
     // v1.17: cached gitignore-excluded path set (same TTL as the VCS cache) —
-    // the walk budget (MAX_ENTRIES) must only be spent on reviewable entries.
+    // ignored entries still walk, scan and review; only MAX_ENTRIES skips them.
     const ignoredCache = new Map()
     const gitKeyOf = (root) => (process.platform === 'win32' ? String(root).toLowerCase() : String(root))
     // v1.15.1: the plugin's own disk writes (reject / undo-reject / user
@@ -872,14 +864,13 @@ export default {
     }
     // v1.17: gitignore-excluded entries must not consume the walk budget.
     // The ignored set comes from ONE `git ls-files --others --ignored
-    // --exclude-standard --directory -z` call: git collapses each wholly
-    // ignored directory into a single trailing-slash entry, and honors
-    // negation patterns itself (a directory with `!keep.log` exceptions is
-    // NOT collapsed — the remaining ignored files arrive individually). So a
-    // dir entry means "nothing inside is reviewable" and the walk may skip it
-    // outright; a file entry means the file is individually ignored. Tracked
-    // files are never reported (git cannot ignore tracked files). Non-git
-    // workspaces and git failures return null = the pre-v1.17 behavior.
+    // --exclude-standard -z` call listing every ignored file individually
+    // (negation patterns such as `!keep.log` are honored by git itself:
+    // un-ignored files are simply absent from the list; tracked files are
+    // never reported — git cannot ignore them). Ignored entries still walk,
+    // scan and review exactly as before — only the MAX_ENTRIES accounting
+    // skips them. Non-git workspaces and git failures return null = the
+    // pre-v1.17 behavior.
     async function ignoredInfoFor(root) {
       const key = gitKeyOf(root)
       const hit = ignoredCache.get(key)
@@ -891,22 +882,19 @@ export default {
         if (prefix === '.') prefix = ''
         let out = null
         for (const bin of GIT_CANDIDATES) {
-          const r = await runGit(bin, ['-c', 'core.quotepath=false', 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], repoRoot)
+          const r = await runGit(bin, ['-c', 'core.quotepath=false', 'ls-files', '-z', '--others', '--ignored', '--exclude-standard'], repoRoot)
           if (r.spawnError) continue
           if (!r.ok || r.code !== 0) return null // git broken / not a repo
           out = r.stdout
           break
         }
         if (out === null) return null
-        const dirs = new Set()
         const files = new Set()
         for (const part of out.toString('utf8').split('\0')) {
           if (part === '') continue
-          const rel = part.replace(/\\/g, '/')
-          if (rel.endsWith('/')) dirs.add(rel.slice(0, -1))
-          else files.add(rel)
+          files.add(part.replace(/\\/g, '/'))
         }
-        return { prefix: prefix, dirs: dirs, files: files }
+        return { prefix: prefix, files: files }
       })().catch(() => null)
       ignoredCache.set(key, { t: Date.now(), p: p })
       return p
@@ -1246,9 +1234,8 @@ export default {
         // skips the decorations.
         const build = async (rootPath) => {
           const rootTarget = await fs.resolve(rootPath)
-          // v1.17: the ignored set collapses wholly gitignored directories
-          // into grayed leaf nodes and keeps individually ignored files out of
-          // the budget (see treeNode).
+          // v1.17: the ignored set exempts gitignored entries from the tree
+          // budget; they still render (grayed) with their full children.
           const ignored = await ignoredInfoFor(rootPath)
           const paths = []
           const tree = await treeNode(rootTarget, '', 0, { n: 0 }, paths, ignored)
