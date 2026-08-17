@@ -509,7 +509,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.17.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.18.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true

@@ -60,6 +60,14 @@ export default {
     // stays untriggered. Substring false positives (echo 'git commit') cost
     // one extra walk — same acceptable trade as MUTATING_SHELL_RE.
     const MUTATING_GIT_RE = /\bgit\s+(?:add|commit|checkout|co|reset|clean|restore|stash|rm|mv|merge|rebase|pull|cherry-pick|apply|am|switch|init)\b/i
+    // v1.18: git commands that change ONLY the index/HEAD relationship (never
+    // a worktree byte the scanner could see). They still bump the tree stamp
+    // so the VCS badges re-ask git, but they must NOT set dirty — a full
+    // walk after every `git add`/`git commit` was pure waste on big
+    // workspaces. Worktree-mutating git (checkout/reset/clean/restore/rm/mv/
+    // merge/rebase/pull/cherry-pick/apply/am/switch/stash) keeps the dirty
+    // path, resolved precisely when the command names its files.
+    const GIT_INDEX_ONLY_RE = /\bgit\s+(?:add|commit|init)\b/i
     const knownSessions = new Set()
     // Undo safety: reject overwrites disk with baseline content, so every
     // reject snapshots the pre-reject bytes first (one undo level per
@@ -70,6 +78,13 @@ export default {
     // DEMAND when the file is opened, bounded by this payload ceiling
     // (32MB — shipping more than that as JSON would defeat the purpose).
     const MAX_MD_RENDER_BYTES = 32 * 1024 * 1024
+    // v1.18: the client's failsafe poll runs every 20s, and the whole-workspace
+    // walk is now reserved for exactly that cadence (plus the first scan and
+    // the "could not locate the changed file" fallback). Every getModified/
+    // getDiff/listTree/mutation RPC re-checks freshness: a session whose last
+    // full scan is older than this TTL gets one full walk, otherwise precise
+    // per-path refreshes (or nothing) keep the state current.
+    const FULL_SCAN_TTL = 20000
 
     // ---------- text / path helpers ----------
     function splitLines(text) {
@@ -107,6 +122,136 @@ export default {
       }
       if (p === '' || p.split('/').some((s) => s === '' || s === '.' || s === '..')) return null
       return p
+    }
+    // ---------- precise path extraction from shell/pwsh/git commands (v1.18) ----------
+    // The whole-workspace walk is reserved for the 20s failsafe and for
+    // mutations whose file targets cannot be located. For the others we
+    // extract the target paths from the command TEXT so the review state can
+    // be refreshed per file. This is best-effort: anything ambiguous
+    // (wildcards, `$` variables, cmd %vars%, unquoted weirdness, paths that
+    // do not resolve under the workspace root) makes the extractor return
+    // null and the caller fall back to the full scan — false fallbacks are
+    // safe (one walk), false precision would silently miss agent changes.
+    const PS_PARAM_RE = /-(?:Path|LiteralPath|FilePath|Destination|NewName)\s+((?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')|[^\s;|&]+)/gi
+    const PS_CMDLET_RE = /\b(?:Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|Rename-Item|rm|rmdir|del)\b([^;|&]*)/gi
+    // PowerShell value-taking parameters on the cmdlets above (a following
+    // token is that flag's value, not a positional path); switches do not
+    // consume a value. A flag outside both lists conservatively consumes its
+    // next token (avoids misreading a value as a path).
+    const PS_VALUE_FLAGS = new Set(['path', 'literalpath', 'filepath', 'destination', 'newname', 'value', 'itemtype', 'encoding', 'filter', 'include', 'exclude', 'name', 'indent', 'width', 'delimiter', 'noheader', 'inputobject'])
+    const PS_SWITCHES = new Set(['force', 'recurse', 'confirm', 'whatif', 'append', 'noclobber', 'passthru', 'quiet', 'compress', 'verbose', 'debug'])
+    function tokenizeWords(rest) {
+      return String(rest || '').match(/"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s]+/g) || []
+    }
+    function unquoteCmd(raw) {
+      const s = String(raw || '').replace(/,$/, '')
+      if (s.length >= 2 && s[0] === "'" && s[s.length - 1] === "'") return s.slice(1, -1).replace(/''/g, "'")
+      if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') return s.slice(1, -1).replace(/\\(.)/g, '$1')
+      return s
+    }
+    function splitCommas(raw) {
+      if (raw.length >= 2 && (raw[0] === "'" || raw[0] === '"') && raw[raw.length - 1] === raw[0]) return [raw]
+      return String(raw).split(',')
+    }
+    // Validate one unquoted, comma-split token into a workspace-relative
+    // path. Returns the rel path or null (suspect token: wildcard, variable,
+    // empty, or outside the workspace root). Degenerate separators ('' or
+    // ',') are SKIPPED by the callers, not treated as suspects.
+    function cmdPathToRel(root, s) {
+      if (s === '') return null
+      // Trailing slashes (`rm -rf build/`) are directory noise, not path
+      // segments; the backtick is PowerShell's escape character (a literal
+      // backtick in a path is vanishingly rare, and misreading an escaped
+      // token as a path would be a false-precision bug).
+      s = s.replace(/\/+$/, '')
+      if (s === '') return null
+      if (/[*?[\]$%~`]/.test(s)) return null
+      return normalizeRelPath(root, s)
+    }
+    // PowerShell forms: `-Path/-LiteralPath/-FilePath/-Destination/-NewName
+    // <value>` plus positional tokens. Positional scanning skips a token
+    // right after a value-taking flag (its value), and skips switch flags
+    // entirely. Bash forms (rm/del/rmdir) never consume a value after a flag,
+    // so every non-flag token is a target. Returns null when no target can be
+    // reliably enumerated.
+    function extractCommandPaths(cmd, root) {
+      if (typeof cmd !== 'string' || cmd === '') return null
+      const out = new Set()
+      let m
+      PS_PARAM_RE.lastIndex = 0
+      while ((m = PS_PARAM_RE.exec(cmd))) {
+        for (const part of splitCommas(m[1])) {
+          const s = unquoteCmd(part)
+          if (s === '' || s === ',') continue
+          const rel = cmdPathToRel(root, s)
+          if (!rel) return null
+          out.add(rel)
+        }
+      }
+      PS_CMDLET_RE.lastIndex = 0
+      while ((m = PS_CMDLET_RE.exec(cmd))) {
+        const name = m[0].split(/\s+/)[0].toLowerCase()
+        const bashForm = name === 'rm' || name === 'rmdir' || name === 'del'
+        const tokens = tokenizeWords(m[1])
+        let i = 0
+        while (i < tokens.length) {
+          const raw = tokens[i]
+          if (raw === '--') { i++; continue }
+          const flag = /^[-/][A-Za-z]/.test(raw)
+          if (flag) {
+            if (!bashForm) {
+              const flagName = raw.replace(/^[-/]/, '').toLowerCase()
+              if (!PS_SWITCHES.has(flagName)) i++ // value-taking flag: skip its value
+            }
+            i++
+            continue
+          }
+          for (const part of splitCommas(raw)) {
+            const s = unquoteCmd(part)
+            if (s === '' || s === ',') continue
+            const rel = cmdPathToRel(root, s)
+            if (!rel) return null
+            out.add(rel)
+          }
+          i++
+        }
+      }
+      return out.size > 0 ? out : null
+    }
+    // git worktree-mutating commands with explicit file targets:
+    //   git rm|mv <path...>            — positional paths
+    //   git checkout|co|restore|reset -- <path...>  — paths after `--`
+    // Anything else (merge/rebase/pull/switch/clean/reset without `--`,
+    // checkout without `--`, revisions as targets) returns null → fallback.
+    function extractGitPaths(cmd, root) {
+      if (typeof cmd !== 'string' || cmd === '') return null
+      const m = /\bgit\s+(rm|mv|checkout|co|restore|reset)\b([^;|&]*)/i.exec(cmd)
+      if (!m) return null
+      const sub = m[1].toLowerCase()
+      const rest = m[2]
+      const out = new Set()
+      let tokens
+      if (sub === 'checkout' || sub === 'co' || sub === 'restore' || sub === 'reset') {
+        // Paths come after a STANDALONE `--` separator. A `--` glued to a
+        // flag (`git reset --hard`) is not a separator — `--hard` is the
+        // reset mode, so no paths can be located → fallback.
+        const sep = /(?:^|\s)--(?=\s|$)/.exec(rest)
+        if (!sep) return null
+        tokens = tokenizeWords(rest.slice(sep.index + sep[0].length))
+      } else {
+        tokens = tokenizeWords(rest)
+      }
+      for (const t of tokens) {
+        if (/^[-/][A-Za-z]/.test(t)) continue
+        for (const part of splitCommas(t)) {
+          const s = unquoteCmd(part)
+          if (s === '' || s === ',') continue
+          const rel = cmdPathToRel(root, s)
+          if (!rel) return null
+          out.add(rel)
+        }
+      }
+      return out.size > 0 ? out : null
     }
     // v1.9: markdown files get a full rendered view in the client. The flag
     // rides the entry so diffPayload can ship the whole document (no line
@@ -260,9 +405,19 @@ export default {
       try {
         const files = {}
         for (const entry of st.files) {
+          const base = entry[1].base
+          const cur = entry[1].cur
+          // v1.18: a clean file (base === cur on every axis) needs only its
+          // baseline persisted — loadState reconstructs cur as a clone of it.
+          // Big workspaces (15K entries, BM_automation) used to serialize
+          // EVERY file's content twice; halving the state blob is what makes
+          // per-file accept/reject saves tolerable on the debounced path.
+          const redundantCur = !!(base && cur && base.present === cur.present &&
+            base.version === cur.version && base.size === cur.size &&
+            (cur.content === null || base.content === cur.content))
           files[entry[0]] = {
-            base: entry[1].base,
-            cur: entry[1].cur,
+            base: base,
+            cur: redundantCur ? undefined : cur,
             rev: entry[1].rev,
             decisions: Object.fromEntries(entry[1].decisions),
           }
@@ -287,6 +442,22 @@ export default {
         console.error('[dsh-file-edit] saveState failed:', e)
       }
     }
+    // v1.18: state saves are DEBOUNCED (250ms per session). Serializing the
+    // whole review map can take seconds on big workspaces; a user clicking
+    // accept on several files in a row (or accept-all) must not block on a
+    // full JSON.stringify per click — one save after the burst covers them
+    // all, and the RPC response is sent before the timer fires. Destructive
+    // paths (reject / undo-reject / hunk-reject) pass force=true: their undo
+    // records must hit disk immediately. The teardown effect flushes any
+    // pending save so a stop/update cannot drop the last accept.
+    const saveTimers = new Map()
+    function scheduleSave(st, force) {
+      const sid = st.sid
+      const existing = saveTimers.get(sid)
+      if (existing) { clearTimeout(existing.t); saveTimers.delete(sid) }
+      if (force) { saveState(st); return }
+      saveTimers.set(sid, { st: st, t: setTimeout(() => { saveTimers.delete(sid); saveState(st) }, 250) })
+    }
     function loadState(sid) {
       try {
         const raw = readFileSync(stateFile(sid), 'utf8')
@@ -300,7 +471,9 @@ export default {
           const base = f.base ?? absentEntry()
           if (base.crlf === undefined) base.crlf = false
           if (typeof base.binRef !== 'string') base.binRef = null
-          const cur = f.cur ?? null
+          // v1.18: clean files persist only their baseline; reconstruct the
+          // redundant cur as a clone of it.
+          const cur = f.cur ?? (base ? cloneEntry(base) : null)
           if (cur && cur.crlf === undefined) cur.crlf = false
           if (cur && typeof cur.binRef !== 'string') cur.binRef = null
           files.set(key, {
@@ -341,6 +514,19 @@ export default {
         // page/turn should not re-review already-folded user files).
         touched: new Set(),
         shellWindow: false,
+        // v1.18 precise DIFF refresh: `pendingTargets` is either a Set of
+        // workspace-relative paths the next resolution should refresh
+        // per-file (write/edit, or a shell/git command whose targets we could
+        // extract), or null = the mutation could NOT be located precisely and
+        // the next resolution must run the full walk (fallback). `targetTask`
+        // dedups concurrent targeted refreshes (mirror of `scanning`).
+        pendingTargets: new Set(),
+        targetTask: null,
+        // v1.18: git index-only commands (add/commit/init) change no worktree
+        // byte, so they must not dirty the session — but the client still
+        // needs to reload the tree (VCS badges re-ask git). getModified
+        // consumes this flag without scanning.
+        treeDirty: false,
         // Monotonic counter bumped by every mutating tool result. The scan
         // snapshots it at entry and clears `dirty` only when no mutation
         // landed mid-scan (a mid-scan write must not be swallowed by the
@@ -501,6 +687,14 @@ export default {
       return f
     }
 
+    // "The file is under review" — presence or on-disk version differs from
+    // the baseline. Used by the scan, the targeted refresh and the deletion
+    // sweep to decide whether a change belongs to the review.
+    function isPending(f) {
+      return !!(f && f.base && f.cur &&
+        (f.base.present !== f.cur.present || f.base.version !== f.cur.version))
+    }
+
     async function scan(sid) {
       const st = stateFor(sid)
       if (st.scanning) return st.scanning
@@ -535,8 +729,6 @@ export default {
           // silently fold a decision the user has not made).
           const shellWindow = st.shellWindow === true
           const attrib = (rel) => shellWindow || st.touched.has(rel)
-          const wasPending = (f) => !!(f && f.base && f.cur &&
-            (f.base.present !== f.cur.present || f.base.version !== f.cur.version))
           let treeChanged = false
           // v1.15: content-only changes (no file set change) now bump the
           // tree stamp too — the sidebar reloads and the git VCS letters
@@ -550,8 +742,7 @@ export default {
             // values must be captured first — comparing before.cur against
             // f.cur afterwards would compare the object with itself.
             const beforeCur = before && before.cur ? before.cur : null
-            const pending = !!(before && before.base && beforeCur &&
-              (before.base.present !== beforeCur.present || before.base.version !== beforeCur.version))
+            const pending = isPending(before)
             const f = await refreshOne(st, w.rel, w)
             if (!before || !beforeCur || beforeCur.present !== f.cur.present) treeChanged = true
             else if (beforeCur.present && f.cur.present && beforeCur.version !== f.cur.version) contentChanged = true
@@ -575,7 +766,7 @@ export default {
             const rel = entry[0], f = entry[1]
             if (!seen.has(rel) && f.cur && f.cur.present) {
               treeChanged = true
-              const pending = wasPending(f)
+              const pending = isPending(f)
               if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
               f.cur = { present: false, content: null, eol: false, version: null, size: 0 }
               f.rev++
@@ -590,14 +781,23 @@ export default {
           if ((st.mutationStamp || 0) === stamp) {
             st.dirty = false
             st.shellWindow = false
+            // v1.18: a full walk consumed every pending precise target (they
+            // are all covered by it). When a fallback (pendingTargets = null)
+            // landed mid-walk, the guard above leaves dirty set AND keeps
+            // pendingTargets = null → the next resolution walks again.
+            st.pendingTargets = new Set()
           }
           // Consume only the touched paths this scan actually saw; a path
           // added mid-scan (or skipped by walk caps) survives to the next.
           for (const rel of seen) st.touched.delete(rel)
           st.scannedAt = Date.now()
           st.error = null
-          if ((treeChanged || contentChanged) && !firstScan) bumpTree(st)
-          saveState(st)
+          if (treeChanged || contentChanged) {
+            if (!firstScan) bumpTree(st)
+            // v1.18: only persist when something actually changed — a
+            // no-change failsafe walk must not re-serialize a huge state blob.
+            scheduleSave(st)
+          }
           } catch (e) {
             st.error = e && e.message ? String(e.message) : String(e)
           }
@@ -617,6 +817,145 @@ export default {
       st.scanning = task
       try { await task } finally { if (st.scanning === task) st.scanning = null }
       return task
+    }
+
+    // ---------- precise per-path refresh (v1.18) ----------
+    // The review state can be refreshed for exactly the files a mutation
+    // named (write/edit file_path, or paths extracted from a shell/git
+    // command), without walking the whole workspace. Semantics mirror the
+    // full scan's per-file handling: reload changed content, mark deletions,
+    // assign baselines by attribution, fold non-attributed changes, bump the
+    // tree stamp on set/content changes. A target that is a DIRECTORY (e.g.
+    // New-Item -ItemType Directory, rm -rf on a folder) cannot be enumerated
+    // precisely → returns { fallback: true } and the caller runs the full
+    // scan instead.
+    function addTarget(st, rel) {
+      if (st.pendingTargets instanceof Set) st.pendingTargets.add(rel)
+      // pendingTargets === null (a fallback is already pending) stays null:
+      // the full scan covers this path anyway.
+    }
+    function fallbackWindow(st) {
+      st.pendingTargets = null
+      st.shellWindow = true
+    }
+    async function targetedRefresh(sid) {
+      const st = stateFor(sid)
+      if (st.targetTask) return st.targetTask
+      const task = (async () => {
+        try {
+          const res = resolveSession(sid)
+          if (res.error) {
+            // Same retry semantics as scan: keep dirty, resolve later.
+            st.error = res.error
+            return
+          }
+          st.root = res.root
+          st.policy = res.policy
+          const stamp = st.mutationStamp || 0
+          const targets = st.pendingTargets instanceof Set ? Array.from(st.pendingTargets) : []
+          st.pendingTargets = new Set()
+          if (targets.length === 0) {
+            if ((st.mutationStamp || 0) === stamp) { st.dirty = false; st.shellWindow = false }
+            return
+          }
+          let treeChanged = false
+          let contentChanged = false
+          for (const rel of targets) {
+            let info
+            try {
+              info = await fs.stat(await fs.resolve(joinPath(st.root, rel)))
+            } catch (e) { info = undefined }
+            if (info && info.type === 'directory') {
+              // A directory target: the mutation's full footprint is unknown
+              // (every file under it may be affected) → fall back to the walk.
+              st.pendingTargets = null
+              st.shellWindow = true
+              st.dirty = true
+              return { fallback: true }
+            }
+            const before = st.files.get(rel)
+            const beforeCur = before && before.cur ? before.cur : null
+            const pending = isPending(before)
+            const attrib = st.touched.has(rel)
+            if (!info) {
+              // Target is gone from disk. Only entries we already tracked as
+              // present become "deleted" review items; never-seen paths have
+              // nothing to review (same as the scan's deletion sweep).
+              if (before && before.cur && before.cur.present) {
+                treeChanged = true
+                if (before.decisions.size > 0) { before.decisions.clear(); before.rev++ }
+                before.cur = { present: false, content: null, eol: false, crlf: false, version: null, size: 0, binRef: null, binSize: 0 }
+                before.rev++
+                if (!pending && !attrib) before.base = absentEntry()
+              }
+              continue
+            }
+            const f = before || { base: null, cur: null, rev: 0, decisions: new Map() }
+            if (!f.cur || !f.cur.present || f.cur.version !== info.version || f.cur.size !== info.size) {
+              if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
+              f.cur = await loadFileEntry(st, rel)
+              f.rev++
+            }
+            if (!before) st.files.set(rel, f)
+            if (!before || !beforeCur || beforeCur.present !== f.cur.present) treeChanged = true
+            else if (beforeCur.present && f.cur.present && beforeCur.version !== f.cur.version) contentChanged = true
+            // First sight of this file (never scanned): the agent channel
+            // decides the baseline — touched → "added" review, otherwise fold.
+            if (f.base === null) {
+              f.base = attrib ? absentEntry() : cloneEntry(f.cur)
+            }
+            // Non-pending change outside the agent channel → fold silently
+            // (mirror of the scan; prevents the open viewer flashing a diff
+            // the next scan would accept anyway).
+            if (before && beforeCur && beforeCur.present && f.cur.present &&
+                beforeCur.version !== f.cur.version && !pending && !attrib) {
+              f.base = cloneEntry(f.cur)
+              if (f.decisions.size > 0) f.decisions.clear()
+              f.rev++
+            }
+          }
+          // Consume the touched entries we handled (mirror of the scan).
+          for (const rel of targets) st.touched.delete(rel)
+          if ((st.mutationStamp || 0) === stamp) {
+            st.dirty = false
+            st.shellWindow = false
+          }
+          st.scannedAt = Date.now()
+          st.error = null
+          if (treeChanged || contentChanged) {
+            bumpTree(st)
+            scheduleSave(st)
+          }
+        } catch (e) {
+          st.error = e && e.message ? String(e.message) : String(e)
+        }
+      })()
+      st.targetTask = task
+      try { await task } finally { if (st.targetTask === task) st.targetTask = null }
+      return task
+    }
+
+    // The freshness rule shared by every RPC that needs the review state:
+    //  * not scanned yet            → full scan (first scan builds the baseline);
+    //  * dirty with precise targets → targeted per-file refresh;
+    //  * dirty without targets      → full scan (the mutation could not be
+    //    located precisely — the fallback the user asked to keep);
+    //  * treeDirty (git add/commit) → consume the flag, no scan at all;
+    //  * last full scan older than FULL_SCAN_TTL → one full walk (the 20s
+    //    failsafe the client's poll rides on).
+    async function ensureFresh(st, sid) {
+      if (!st.baseReady) { await scan(sid); return }
+      if (st.dirty) {
+        if (st.pendingTargets instanceof Set && st.pendingTargets.size > 0) {
+          const r = await targetedRefresh(sid)
+          if (r && r.fallback) await scan(sid)
+        } else {
+          await scan(sid)
+        }
+        return
+      }
+      if (st.treeDirty) st.treeDirty = false
+      if (st.scannedAt === 0 || Date.now() - st.scannedAt >= FULL_SCAN_TTL) await scan(sid)
     }
 
     async function walkFiles(dirTarget, rel, out, depth, count, ignored) {
@@ -946,6 +1285,39 @@ export default {
     function entryLines(entry) {
       return entry.present && entry.content !== null ? splitLines(entry.content) : []
     }
+    // v1.18: per-entry review stats cache. Computing the stats runs the Myers
+    // diff over the file's lines, which for a session with hundreds of
+    // modified files made EVERY getModified (and acceptAll's list) pay the
+    // full diff pass. The cache is keyed on f.rev — every mutation of
+    // (base, cur, decisions) bumps rev, so a hit is exact. Not persisted
+    // (saveState picks explicit fields only).
+    function fileStats(f) {
+      if (f.statsCache && f.statsCache.rev === f.rev) return f.statsCache
+      const status = !f.base || !f.base.present ? 'added' : (!f.cur.present ? 'deleted' : 'modified')
+      const note = (f.base && f.base.note) || f.cur.note || null
+      let s
+      if (note) {
+        s = { status: status, note: note, pending: 1, added: 0, removed: 0 }
+      } else {
+        const baseLines = entryLines(f.base)
+        const curLines = entryLines(f.cur)
+        if (baseLines.length > MAX_DIFF_LINES || curLines.length > MAX_DIFF_LINES) {
+          s = { status: status, note: 'large', pending: 1, added: 0, removed: 0 }
+        } else {
+          const hunks = computeHunks(baseLines, curLines)
+          let added = 0, removed = 0, pending = 0
+          for (const h of hunks) {
+            if (f.decisions.has(h.id)) continue
+            pending++
+            added += h.newLen
+            removed += h.oldLen
+          }
+          s = { status: status, note: null, pending: pending, added: added, removed: removed }
+        }
+      }
+      f.statsCache = { rev: f.rev, ...s }
+      return f.statsCache
+    }
     function modifiedFiles(st) {
       const files = []
       for (const entry of st.files) {
@@ -955,27 +1327,8 @@ export default {
         // text. A fresh mtime with identical text is a touch, not a change.
         if (!f.cur || !isChanged(f)) continue
         if (f.base && f.base.content !== null && f.base.content === f.cur.content) continue
-        const status = !f.base || !f.base.present ? 'added' : (!f.cur.present ? 'deleted' : 'modified')
-        const note = (f.base && f.base.note) || f.cur.note || null
-        if (note) {
-          files.push({ path: rel, status: status, note: note, pending: 1, added: 0, removed: 0 })
-          continue
-        }
-        const baseLines = entryLines(f.base)
-        const curLines = entryLines(f.cur)
-        if (baseLines.length > MAX_DIFF_LINES || curLines.length > MAX_DIFF_LINES) {
-          files.push({ path: rel, status: status, note: 'large', pending: 1, added: 0, removed: 0 })
-          continue
-        }
-        const hunks = computeHunks(baseLines, curLines)
-        let added = 0, removed = 0, pending = 0
-        for (const h of hunks) {
-          if (f.decisions.has(h.id)) continue
-          pending++
-          added += h.newLen
-          removed += h.oldLen
-        }
-        files.push({ path: rel, status: status, pending: pending, added: added, removed: removed })
+        const s = fileStats(f)
+        files.push({ path: rel, status: s.status, note: s.note, pending: s.pending, added: s.added, removed: s.removed })
       }
       files.sort(function (x, y) { return x.path < y.path ? -1 : (x.path > y.path ? 1 : 0) })
       return files
@@ -1253,7 +1606,11 @@ export default {
             return { ok: false, error: e && e.message ? String(e.message) : String(e) }
           }
         }
-        await scan(sid)
+        // v1.18: the tree walk itself reflects disk, so a full scan here is
+        // only needed to keep the review state fresh (first scan / dirty /
+        // 20s failsafe) — not on every tree expansion.
+        if (!st.root) await scan(sid)
+        else await ensureFresh(st, sid)
         if (st.error) return { ok: false, error: st.error }
         try {
           const tree = await build(st.root)
@@ -1267,11 +1624,10 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        if (!st.baseReady) {
-          await scan(sid)
-        } else if (st.dirty) {
-          await scan(sid)
-        }
+        // v1.18: precise mutations refresh only their files; the full walk
+        // runs on the first scan, the unlocatable-mutation fallback, and the
+        // 20s failsafe cadence (ensureFresh).
+        await ensureFresh(st, sid)
         if (st.error) return { ok: false, error: st.error }
         return { ok: true, root: st.root, files: modifiedFiles(st), treeStamp: st.treeStamp, undo: st.lastReject ? { opId: st.lastReject.opId, count: st.lastReject.files.length, ts: st.lastReject.ts } : null }
       },
@@ -1311,37 +1667,46 @@ export default {
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
         const path = args && args.path ? String(args.path) : ''
+        // v1.18: resolve pending mutations precisely (targeted refresh) or by
+        // the full-walk fallback, then the 20s failsafe cadence.
         if (!st.baseReady) {
           await scan(sid)
         } else if (st.dirty) {
-          try {
-            const f = st.files.get(path)
-            if (f && f.cur) {
-              const target = await fs.resolve(joinPath(st.root, path))
-              const info = await fs.stat(target)
-              const changed = !f.cur.present || !info || f.cur.version !== info.version || f.cur.size !== info.size
-              if (changed && f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
-              if (changed) {
-                const pending = !!(f.base && (f.base.present !== f.cur.present || f.base.version !== f.cur.version))
-                f.cur = await loadFileEntry(st, path)
+          if (st.pendingTargets instanceof Set && st.pendingTargets.size > 0) {
+            const r = await targetedRefresh(sid)
+            if (r && r.fallback) await scan(sid)
+          } else {
+            await scan(sid)
+          }
+        } else if (st.scannedAt === 0 || Date.now() - st.scannedAt >= FULL_SCAN_TTL) {
+          await scan(sid)
+        }
+        // Single-file freshness check for the OPEN file: one cheap stat that
+        // keeps the viewer current even when the mutation targeted another
+        // file or came from outside the agent channel (v1.8 fold semantics).
+        try {
+          const f = st.files.get(path)
+          if (f && f.cur) {
+            const target = await fs.resolve(joinPath(st.root, path))
+            const info = await fs.stat(target)
+            const changed = !f.cur.present || !info || f.cur.version !== info.version || f.cur.size !== info.size
+            if (changed && f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
+            if (changed) {
+              const pending = isPending(f)
+              f.cur = await loadFileEntry(st, path)
+              f.rev++
+              // v1.8 attribution: a non-pending file changed outside the
+              // agent channel (the user's own edit) folds into the baseline
+              // right away, so the open viewer never flashes a diff that the
+              // next scan would silently accept.
+              if (!pending && !st.touched.has(path) && st.shellWindow !== true && f.cur.present) {
+                f.base = cloneEntry(f.cur)
+                f.decisions.clear()
                 f.rev++
-                // v1.8 attribution: a non-pending file changed outside the
-                // agent channel (the user's own edit) folds into the baseline
-                // right away, so the open viewer never flashes a diff that the
-                // next scan would silently accept.
-                if (!pending && !st.touched.has(path) && st.shellWindow !== true && f.cur.present) {
-                  f.base = cloneEntry(f.cur)
-                  f.decisions.clear()
-                  f.rev++
-                }
               }
             }
-            // NOTE: dirty deliberately stays set. Only a full scan() clears it
-            // (getModified's poll triggers that scan). Clearing it here used to
-            // swallow files created/deleted after the last scan — they never
-            // entered the map and the UI showed "file unavailable" forever.
-          } catch (e) {}
-        }
+          }
+        } catch (e) {}
         if (st.error) return { ok: false, error: st.error }
         let f = st.files.get(path)
         // Files that never went through a scan (created after the last one,
@@ -1374,7 +1739,7 @@ export default {
               }
             }
             f.rev++
-            saveState(st)
+            scheduleSave(st)
           } catch (e) {
             return { ok: true, missing: true }
           }
@@ -1417,7 +1782,7 @@ export default {
         const path = args && args.path ? String(args.path) : ''
         const hunkId = args && args.hunkId ? String(args.hunkId) : ''
         const action = args && args.action === 'reject' ? 'reject' : 'accept'
-        await scan(sid)
+        await ensureFresh(st, sid)
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         if (f.rev !== Number(args.rev)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
@@ -1457,7 +1822,9 @@ export default {
           f.decisions.clear()
         }
         f.rev++
-        saveState(st)
+        // v1.18: hunk-reject committed an undo record → persist immediately;
+        // accept-only decisions can ride the debounced save.
+        scheduleSave(st, action === 'reject')
         return diffPayload(f, undefined)
       },
 
@@ -1476,7 +1843,7 @@ export default {
         const idx = Number(args.idx)
         const text = args && typeof args.text === 'string' ? args.text.replace(/\r/g, '') : ''
         if (!Number.isInteger(idx) || idx < 0) return { ok: false, code: 'stale', message: '编辑位置无效' }
-        await scan(sid)
+        await ensureFresh(st, sid)
         const f = st.files.get(path)
         if (!f || !f.cur || !f.cur.present) return { ok: false, code: 'not-found', message: '文件不存在' }
         if (f.rev !== Number(args.rev)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
@@ -1533,7 +1900,7 @@ export default {
         // and drop the cached git snapshot so the badges re-ask git.
         bumpTree(st)
         invalidateGitCacheFor(st.root)
-        saveState(st)
+        scheduleSave(st)
         return diffPayload(f, undefined)
       },
 
@@ -1557,9 +1924,9 @@ export default {
         const rawLines = Array.isArray(args.lines) ? args.lines : null
         if (!rawLines) return { ok: false, code: 'bad', message: '无效的保存内容' }
         const lines = rawLines.map((s) => String(s).replace(/\r/g, ''))
-        if (!st.baseReady) await scan(sid)
-        else {
-          // On-disk freshness check (mirrors getDiff's dirty-branch refresh):
+        await ensureFresh(st, sid)
+        if (st.baseReady) {
+          // On-disk freshness check (mirrors getDiff's single-file refresh):
           // the editor may have been open across an agent edit the scan has
           // not absorbed yet — refresh this file first so the rev guard below
           // sees the true state instead of silently overwriting agent work.
@@ -1593,7 +1960,7 @@ export default {
               if (st.touched.has(path)) { f.base = absentEntry(); st.touched.delete(path) } else { f.base = cloneEntry(entry) }
             }
             f.rev++
-            saveState(st)
+            scheduleSave(st)
           } catch (e) {
             return { ok: false, code: 'not-found', message: '文件不存在' }
           }
@@ -1681,7 +2048,7 @@ export default {
         // the badges re-ask git immediately (same as applyEdit).
         bumpTree(st)
         invalidateGitCacheFor(st.root)
-        saveState(st)
+        scheduleSave(st)
         return diffPayload(f, undefined)
       },
 
@@ -1690,11 +2057,13 @@ export default {
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
         const path = args && args.path ? String(args.path) : ''
-        await scan(sid)
+        // v1.18: no unconditional walk — accept only needs the review state
+        // fresh (first scan / dirty / 20s failsafe), not a disk re-sync.
+        await ensureFresh(st, sid)
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         await doAccept(st, f, path)
-        saveState(st)
+        scheduleSave(st)
         return { ok: true }
       },
 
@@ -1703,14 +2072,16 @@ export default {
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
         const path = args && args.path ? String(args.path) : ''
-        await scan(sid)
+        await ensureFresh(st, sid)
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         try {
           const rec = newUndoRec()
           await doReject(st, f, path, rec)
           commitUndo(st, rec)
-          saveState(st)
+          // v1.18: reject is destructive (disk rewritten + undo record) —
+          // persist immediately, never ride the debounced save.
+          scheduleSave(st, true)
           return { ok: true }
         } catch (e) {
           return { ok: false, error: e && e.message ? String(e.message) : String(e) }
@@ -1721,7 +2092,7 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        await scan(sid)
+        await ensureFresh(st, sid)
         const list = modifiedFiles(st)
         let applied = 0
         for (const item of list) {
@@ -1730,7 +2101,10 @@ export default {
           await doAccept(st, f, item.path)
           applied++
         }
-        saveState(st)
+        // v1.18: one debounced save covers the whole batch (and any accepts
+        // that follow within 250ms); the response goes out before the
+        // (potentially huge) state serialization runs in the background.
+        scheduleSave(st)
         return { ok: true, applied: applied, files: modifiedFiles(st) }
       },
 
@@ -1738,7 +2112,7 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        await scan(sid)
+        await ensureFresh(st, sid)
         const list = modifiedFiles(st)
         const failed = []
         const rec = newUndoRec()
@@ -1754,7 +2128,7 @@ export default {
           }
         }
         commitUndo(st, rec)
-        saveState(st)
+        scheduleSave(st, true)
         return { ok: true, applied: applied, failed: failed, files: modifiedFiles(st) }
       },
 
@@ -1804,7 +2178,11 @@ export default {
             // v1.13: like reject, undoing a reject rewrites disk content —
             // tell the client to reset this file's user edit history.
             f.justRejected = true
+            // v1.18: disk changed under the state → the next resolution must
+            // run the full walk (the restore's footprint is unknown), not a
+            // stale per-file refresh.
             st.dirty = true
+            st.pendingTargets = null
           } catch (e) {
             skipped.push({ path: item.path, reason: e && e.message ? String(e.message) : String(e) })
           }
@@ -1818,7 +2196,8 @@ export default {
         }
         try { rmSync(join(undoRoot(st.sid), rec.opId), { recursive: true, force: true }) } catch (e) {}
         st.lastReject = null
-        saveState(st)
+        // v1.18: undo clears a persisted record (lastReject) → force-save.
+        scheduleSave(st, true)
         return { ok: true, restored: restored, skipped: skipped }
       },
     }
@@ -1881,6 +2260,10 @@ export default {
       sseClients.clear()
       for (const [, h] of notifyTimers) clearTimeout(h)
       notifyTimers.clear()
+      // v1.18: flush any debounced state saves so a stop/update cannot drop
+      // the last accept/reject/scan changes.
+      for (const [, rec] of saveTimers) { clearTimeout(rec.t); saveState(rec.st) }
+      saveTimers.clear()
     }, 'dsh-file-edit: wait cleanup')
 
     // ---------- change triggers ----------
@@ -1911,35 +2294,75 @@ export default {
       if (!mutating) return
       const st = stateFor(sid)
       if (!st.baseReady) return
-      st.dirty = true
-      st.mutationStamp = (st.mutationStamp || 0) + 1
       // v1.15.1: any agent mutation can change the VCS letters — drop the
       // cached git snapshot for this workspace so the next tree load re-asks
       // git (the 2s cache would otherwise serve a pre-mutation snapshot).
-      // Mutating GIT commands get more: commit/checkout/reset/... change
-      // mostly .git or content the scanner already attributes, and the scan
-      // may legitimately detect nothing to bump — so bump the tree stamp
-      // directly (the client reloads the tree, which re-runs git status).
       invalidateGitCacheFor(st.root)
+      // v1.18: git index-only commands (add/commit/init) change no worktree
+      // byte — no dirty, no scan of any kind. The tree stamp + cache
+      // invalidation refresh the VCS badges; getModified consumes treeDirty
+      // without walking.
+      if (MUTATING_GIT_RE.test(cmd) && GIT_INDEX_ONLY_RE.test(cmd)) {
+        st.treeDirty = true
+        bumpTree(st)
+        scheduleNotify(sid, 300)
+        return
+      }
+      st.dirty = true
+      st.mutationStamp = (st.mutationStamp || 0) + 1
+      // Worktree-mutating git commands bump the tree stamp directly (they can
+      // change mostly .git or content the scanner may not attribute).
       if (MUTATING_GIT_RE.test(cmd)) bumpTree(st)
       // v1.8 change attribution (direction B): only changes that flowed
-      // through the agent's tool channel enter the review. write/edit carry
-      // an explicit file_path — attribute exactly that file. Mutating shell/
-      // pwsh commands are opaque text, so they fall back to a session-wide
-      // window the next scan consumes (conservative: everything non-pending
-      // found by that scan is attributed). An unparseable write/edit path
-      // also falls back to the window so agent work is never silently folded.
+      // through the agent's tool channel enter the review.
+      // v1.18: whenever the tool call NAMES its file targets, attribute and
+      // refresh exactly those files (targeted refresh — no full walk).
+      // write/edit carry an explicit file_path; mutating shell/pwsh/git
+      // commands have their target paths extracted from the command text.
+      // Anything unparseable falls back to the session-wide window (the full
+      // scan) so agent work is never silently folded.
       let attributed = false
       if (name === 'write' || name === 'edit') {
         const raw = args && typeof args.file_path === 'string' ? args.file_path : ''
         const rel = normalizeRelPath(st.root, raw)
-        if (rel) { st.touched.add(rel); attributed = true }
+        if (rel) { st.touched.add(rel); addTarget(st, rel); attributed = true }
+        else fallbackWindow(st)
+      } else {
+        // shell / pwsh / git: extract precise targets from the command text.
+        // Both extractors run (a command can mix `git ... ; Set-Content ...`):
+        // their targets UNION into the precise set. If EITHER extractor
+        // cannot locate its targets (git reset --hard, wildcards, variables),
+        // the whole command falls back to the session-wide window — a git
+        // reset followed by a Set-Content still rewrote unknown files.
+        const isGit = MUTATING_GIT_RE.test(cmd)
+        const isShell = MUTATING_SHELL_RE.test(cmd)
+        let rels = null
+        let needFallback = false
+        if (isGit) {
+          const gr = extractGitPaths(cmd, st.root)
+          if (gr) rels = gr
+          else needFallback = true
+        }
+        if (isShell && !needFallback) {
+          const sr = extractCommandPaths(cmd, st.root)
+          if (sr) rels = rels ? new Set([...rels, ...sr]) : sr
+          else needFallback = true
+        }
+        if (needFallback || !rels || rels.size === 0) {
+          fallbackWindow(st)
+        } else {
+          for (const rel of rels) {
+            const r = normalizeRelPath(st.root, rel)
+            if (r) { st.touched.add(r); addTarget(st, r); attributed = true }
+            else { attributed = false; break }
+          }
+          if (!attributed) fallbackWindow(st)
+        }
       }
-      if (!attributed) st.shellWindow = true
       // Wake any long-polling client right away (bursts of tool results in
       // one agent turn coalesce into a single wake-up). The woken client
-      // pulls getModified once, whose dirty branch runs the lazy scan —
-      // exactly one walk per mutation burst, zero periodic polling.
+      // pulls getModified once: precise targets refresh only those files,
+      // fallbacks run exactly one full walk per mutation burst.
       scheduleNotify(sid, 300)
     })
   },

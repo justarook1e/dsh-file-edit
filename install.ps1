@@ -77,4 +77,4 @@ if ($LASTEXITCODE -ne 0) { throw "dsh plugin add failed with exit code $LASTEXIT
 "  1. restart DSH (loads the new bundle layer)"
 "  2. hard-refresh the web page (Ctrl+F5) so the browser picks up the client bundle"
 "  3. verify: sidebar workspace tree + the Files tab + modified-file bar appear,"
-"     and the console shows '[dsh-file-edit] guard v1.17.0'"
+"     and the console shows '[dsh-file-edit] guard v1.18.0'"
