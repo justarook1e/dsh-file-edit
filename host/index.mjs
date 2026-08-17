@@ -52,7 +52,11 @@ export default {
     // "any shell call dirties the session" only commands that can actually
     // change the workspace get through: read-only traffic (Get-ChildItem,
     // node --version, git status, ...) now costs nothing.
-    const MUTATING_SHELL_RE = /Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|Rename-Item|del\s|rm\s|rmdir/i
+    // v1.18: extended with the remaining file-mutating PowerShell cmdlets and
+    // the direct .NET static file APIs (which the extractor cannot locate
+    // precisely, so they intentionally fall back to the full walk). False
+    // positives here only cost one walk — never a missed change.
+    const MUTATING_SHELL_RE = /Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|Rename-Item|Clear-Content|Tee-Object|Export-Csv|Export-Clixml|Set-Item|WriteAllText|AppendAllText|WriteAllLines|WriteAllBytes|File\.Copy|File\.Move|File\.Delete|del\s|rm\s|rmdir|mkdir\s|\bmd\s|\brd\s/i
     // v1.15.1: git commands that change the worktree↔HEAD relationship (the
     // thing the VCS badges answer). commit/checkout/reset/... never touch a
     // worktree byte the scanner could see, so they need their own trigger
@@ -67,7 +71,12 @@ export default {
     // workspaces. Worktree-mutating git (checkout/reset/clean/restore/rm/mv/
     // merge/rebase/pull/cherry-pick/apply/am/switch/stash) keeps the dirty
     // path, resolved precisely when the command names its files.
-    const GIT_INDEX_ONLY_RE = /\bgit\s+(?:add|commit|init)\b/i
+    // v1.18: git subcommands that DO rewrite worktree bytes (everything in the
+    // mutating list except the index-only add/commit/init). Used to decide
+    // whether a command may take the index-only shortcut: a command mixing
+    // `git add` with `git checkout -- x`/`git reset --hard` must NOT be treated
+    // as index-only, otherwise the worktree change is silently dropped.
+    const GIT_WORKTREE_RE = /\bgit\s+(?:checkout|co|reset|clean|restore|stash|rm|mv|merge|rebase|pull|cherry-pick|apply|am|switch)\b/i
     const knownSessions = new Set()
     // Undo safety: reject overwrites disk with baseline content, so every
     // reject snapshots the pre-reject bytes first (one undo level per
@@ -133,7 +142,11 @@ export default {
     // null and the caller fall back to the full scan — false fallbacks are
     // safe (one walk), false precision would silently miss agent changes.
     const PS_PARAM_RE = /-(?:Path|LiteralPath|FilePath|Destination|NewName)\s+((?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')|[^\s;|&]+)/gi
-    const PS_CMDLET_RE = /\b(?:Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|Rename-Item|rm|rmdir|del)\b([^;|&]*)/gi
+    const PS_CMDLET_RE = /\b(?:Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|Rename-Item|Clear-Content|Tee-Object|Export-Csv|Export-Clixml|Set-Item|rm|rmdir|del)\b([^;|&]*)/gi
+    // Direct .NET static file APIs (called without a PowerShell cmdlet). Their
+    // path is the first positional argument; only the common single-target
+    // forms are extracted, everything else falls back to the full walk.
+    const DOTNET_FILE_RE = /(?:\[(?:System\.)?IO\.File\]::)?(WriteAllText|AppendAllText|WriteAllLines|WriteAllBytes|Delete)\s*\(\s*((?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')|[^\s,)]+)/gi
     // PowerShell value-taking parameters on the cmdlets above (a following
     // token is that flag's value, not a positional path); switches do not
     // consume a value. A flag outside both lists conservatively consumes its
@@ -146,7 +159,13 @@ export default {
     function unquoteCmd(raw) {
       const s = String(raw || '').replace(/,$/, '')
       if (s.length >= 2 && s[0] === "'" && s[s.length - 1] === "'") return s.slice(1, -1).replace(/''/g, "'")
-      if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') return s.slice(1, -1).replace(/\\(.)/g, '$1')
+      // v1.18: double-quoted strings are NOT backslash-escaped in PowerShell
+      // (and in bash only quote/backslash/dollar/backtick are escaped). A
+      // Windows path like "C:\Users\HW\...\x.py" must keep its backslashes —
+      // the old `replace(/\\(.)/g, '$1')` corrupted it into "C:UsersHW...x.py"
+      // so Set-Content/Add-Content with a quoted absolute path was never found.
+      // Only unescape a literal escaped quote `\"`.
+      if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') return s.slice(1, -1).replace(/\\"/g, '"')
       return s
     }
     function splitCommas(raw) {
@@ -215,6 +234,24 @@ export default {
           }
           i++
         }
+      }
+      return out.size > 0 ? out : null
+    }
+    // .NET static file APIs (no PowerShell cmdlet): the FIRST positional
+    // argument is the target path for the single-target write/delete forms.
+    // Copy/Move take source+destination and are left to the full-walk fallback
+    // (extracting both and guessing which side changed would be false precision).
+    function extractDotNetPaths(cmd, root) {
+      if (typeof cmd !== 'string' || cmd === '') return null
+      const out = new Set()
+      let m
+      DOTNET_FILE_RE.lastIndex = 0
+      while ((m = DOTNET_FILE_RE.exec(cmd))) {
+        const s = unquoteCmd(m[2])
+        if (s === '' || s === ',') continue
+        const rel = cmdPathToRel(root, s)
+        if (!rel) return null
+        out.add(rel)
       }
       return out.size > 0 ? out : null
     }
@@ -712,6 +749,13 @@ export default {
           st.policy = res.policy
           try {
           const stamp = st.mutationStamp || 0
+          // v1.18: snapshot the touched set at walk start. The loop below
+          // consumes attribution for the paths it actually sees; a path the
+          // agent touched MID-walk (after we already processed it) must keep
+          // its touched entry so the follow-up targetedRefresh still attributes
+          // it — otherwise the edit gets silently folded (the "edited file's
+          // DIFF never shows" race).
+          const touchedAtStart = new Set(st.touched)
           const rootTarget = await fs.resolve(res.root)
           // v1.17: the gitignore-excluded set exempts ignored entries from
           // the walk budget (see walkFiles); one git call per scan burst
@@ -787,9 +831,11 @@ export default {
             // pendingTargets = null → the next resolution walks again.
             st.pendingTargets = new Set()
           }
-          // Consume only the touched paths this scan actually saw; a path
-          // added mid-scan (or skipped by walk caps) survives to the next.
-          for (const rel of seen) st.touched.delete(rel)
+          // Consume only the touched paths this scan actually saw AND that
+          // were already touched when the walk started; a path added mid-scan
+          // (or skipped by walk caps) survives so the next targetedRefresh
+          // still attributes it instead of folding it into the baseline.
+          for (const rel of seen) { if (touchedAtStart.has(rel)) st.touched.delete(rel) }
           st.scannedAt = Date.now()
           st.error = null
           if (treeChanged || contentChanged) {
@@ -797,6 +843,11 @@ export default {
             // v1.18: only persist when something actually changed — a
             // no-change failsafe walk must not re-serialize a huge state blob.
             scheduleSave(st)
+            // A BACKGROUND failsafe walk that found changes must wake the
+            // client so it re-fetches immediately instead of waiting for the
+            // next 20s poll. Harmless no-op for blocking (first/fallback)
+            // scans whose caller is already awaiting the response.
+            if (!firstScan) scheduleNotify(sid, 0)
           }
           } catch (e) {
             st.error = e && e.message ? String(e.message) : String(e)
@@ -943,9 +994,23 @@ export default {
     //  * treeDirty (git add/commit) → consume the flag, no scan at all;
     //  * last full scan older than FULL_SCAN_TTL → one full walk (the 20s
     //    failsafe the client's poll rides on).
-    async function ensureFresh(st, sid) {
+    //
+    // `failsafe` distinguishes the two RPC families:
+    //  * READ RPCs (getModified/getDiff/listTree) run the 20s failsafe walk in
+    //    the BACKGROUND so a large-workspace walk (seconds) never blocks the
+    //    response; the walk wakes the client when it actually changed files.
+    //  * MUTATION RPCs (accept/reject/hunk/edit/save) pass `failsafe:false` —
+    //    folding the in-memory baseline needs no external-change absorption and
+    //    must never pay a full walk just because the state is >20s old (the
+    //    "accept is laggy on many files" complaint).
+    async function ensureFresh(st, sid, opts) {
+      const failsafe = !opts || opts.failsafe !== false
       if (!st.baseReady) { await scan(sid); return }
       if (st.dirty) {
+        // A background failsafe walk may be mid-flight (started by an earlier
+        // read RPC). Wait for it before resolving precise targets so the two
+        // never interleave mutations of the same review map.
+        if (st.scanning) await st.scanning
         if (st.pendingTargets instanceof Set && st.pendingTargets.size > 0) {
           const r = await targetedRefresh(sid)
           if (r && r.fallback) await scan(sid)
@@ -955,7 +1020,10 @@ export default {
         return
       }
       if (st.treeDirty) st.treeDirty = false
-      if (st.scannedAt === 0 || Date.now() - st.scannedAt >= FULL_SCAN_TTL) await scan(sid)
+      if (failsafe && (st.scannedAt === 0 || Date.now() - st.scannedAt >= FULL_SCAN_TTL)) {
+        // Background: do not await — the response must go out before the walk.
+        void scan(sid)
+      }
     }
 
     async function walkFiles(dirTarget, rel, out, depth, count, ignored) {
@@ -1668,19 +1736,8 @@ export default {
         const sid = String(args.sessionId)
         const path = args && args.path ? String(args.path) : ''
         // v1.18: resolve pending mutations precisely (targeted refresh) or by
-        // the full-walk fallback, then the 20s failsafe cadence.
-        if (!st.baseReady) {
-          await scan(sid)
-        } else if (st.dirty) {
-          if (st.pendingTargets instanceof Set && st.pendingTargets.size > 0) {
-            const r = await targetedRefresh(sid)
-            if (r && r.fallback) await scan(sid)
-          } else {
-            await scan(sid)
-          }
-        } else if (st.scannedAt === 0 || Date.now() - st.scannedAt >= FULL_SCAN_TTL) {
-          await scan(sid)
-        }
+        // the full-walk fallback; the 20s failsafe walk runs in the background.
+        await ensureFresh(st, sid)
         // Single-file freshness check for the OPEN file: one cheap stat that
         // keeps the viewer current even when the mutation targeted another
         // file or came from outside the agent channel (v1.8 fold semantics).
@@ -1782,7 +1839,7 @@ export default {
         const path = args && args.path ? String(args.path) : ''
         const hunkId = args && args.hunkId ? String(args.hunkId) : ''
         const action = args && args.action === 'reject' ? 'reject' : 'accept'
-        await ensureFresh(st, sid)
+        await ensureFresh(st, sid, { failsafe: false })
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         if (f.rev !== Number(args.rev)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
@@ -1843,7 +1900,7 @@ export default {
         const idx = Number(args.idx)
         const text = args && typeof args.text === 'string' ? args.text.replace(/\r/g, '') : ''
         if (!Number.isInteger(idx) || idx < 0) return { ok: false, code: 'stale', message: '编辑位置无效' }
-        await ensureFresh(st, sid)
+        await ensureFresh(st, sid, { failsafe: false })
         const f = st.files.get(path)
         if (!f || !f.cur || !f.cur.present) return { ok: false, code: 'not-found', message: '文件不存在' }
         if (f.rev !== Number(args.rev)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
@@ -1924,7 +1981,7 @@ export default {
         const rawLines = Array.isArray(args.lines) ? args.lines : null
         if (!rawLines) return { ok: false, code: 'bad', message: '无效的保存内容' }
         const lines = rawLines.map((s) => String(s).replace(/\r/g, ''))
-        await ensureFresh(st, sid)
+        await ensureFresh(st, sid, { failsafe: false })
         if (st.baseReady) {
           // On-disk freshness check (mirrors getDiff's single-file refresh):
           // the editor may have been open across an agent edit the scan has
@@ -2058,8 +2115,8 @@ export default {
         const sid = String(args.sessionId)
         const path = args && args.path ? String(args.path) : ''
         // v1.18: no unconditional walk — accept only needs the review state
-        // fresh (first scan / dirty / 20s failsafe), not a disk re-sync.
-        await ensureFresh(st, sid)
+        // fresh (first scan / dirty), not a disk re-sync or the 20s failsafe.
+        await ensureFresh(st, sid, { failsafe: false })
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         await doAccept(st, f, path)
@@ -2072,7 +2129,7 @@ export default {
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
         const path = args && args.path ? String(args.path) : ''
-        await ensureFresh(st, sid)
+        await ensureFresh(st, sid, { failsafe: false })
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         try {
@@ -2092,7 +2149,7 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        await ensureFresh(st, sid)
+        await ensureFresh(st, sid, { failsafe: false })
         const list = modifiedFiles(st)
         let applied = 0
         for (const item of list) {
@@ -2112,7 +2169,7 @@ export default {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
-        await ensureFresh(st, sid)
+        await ensureFresh(st, sid, { failsafe: false })
         const list = modifiedFiles(st)
         const failed = []
         const rec = newUndoRec()
@@ -2301,8 +2358,10 @@ export default {
       // v1.18: git index-only commands (add/commit/init) change no worktree
       // byte — no dirty, no scan of any kind. The tree stamp + cache
       // invalidation refresh the VCS badges; getModified consumes treeDirty
-      // without walking.
-      if (MUTATING_GIT_RE.test(cmd) && GIT_INDEX_ONLY_RE.test(cmd)) {
+      // without walking. Only commands with NO worktree-mutating git subcommand
+      // qualify: `git add; git checkout -- x`/`git reset --hard` fall through
+      // to the dirty path so their worktree change is never dropped.
+      if (MUTATING_GIT_RE.test(cmd) && !GIT_WORKTREE_RE.test(cmd)) {
         st.treeDirty = true
         bumpTree(st)
         scheduleNotify(sid, 300)
@@ -2344,9 +2403,21 @@ export default {
           else needFallback = true
         }
         if (isShell && !needFallback) {
-          const sr = extractCommandPaths(cmd, st.root)
-          if (sr) rels = rels ? new Set([...rels, ...sr]) : sr
-          else needFallback = true
+          // A PowerShell cmdlet present → use the cmdlet extractor (it returns
+          // null for unparseable targets like wildcards and must then fall
+          // back). No cmdlet → try the direct .NET static file APIs; Copy/Move
+          // are deliberately left to the fallback (source + destination).
+          PS_CMDLET_RE.lastIndex = 0
+          const hasCmdlet = PS_CMDLET_RE.test(cmd)
+          if (hasCmdlet) {
+            const sr = extractCommandPaths(cmd, st.root)
+            if (sr) rels = rels ? new Set([...rels, ...sr]) : sr
+            else needFallback = true
+          } else {
+            const dr = extractDotNetPaths(cmd, st.root)
+            if (dr) rels = rels ? new Set([...rels, ...dr]) : dr
+            else needFallback = true
+          }
         }
         if (needFallback || !rels || rels.size === 0) {
           fallbackWindow(st)
