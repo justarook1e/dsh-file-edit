@@ -509,7 +509,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.18.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.19.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -862,6 +862,19 @@ window.__ModuleLoader__.load({
           '.dsh-fe-mdswitch input:not(:checked) + .dsh-fe-mdswitch-track .dsh-fe-mdswitch-read { color:var(--dsw-alias-label-primary); font-weight:600; }',
           '.dsh-fe-mdswitch input:focus-visible + .dsh-fe-mdswitch-track { outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
           '@media (prefers-reduced-motion: reduce) { .dsh-fe-mdswitch-pill,.dsh-fe-mdswitch-seg { transition:none; } }',
+          // ---- v1.19: session history 5-row cap + expand/collapse ----
+          // Mirrors the shell's WorkspaceBrowser overflow control
+          // (COLLAPSED_SESSION_LIMIT = 5 + .sessionOverflowButton): a
+          // workspace's history section renders at most five rows; with
+          // more, a full-width quiet button below them shows
+          // "展开其余 N 个会话" (Show N more sessions) and toggles to
+          // "收起" (Show less) — same height, transparent background,
+          // left-aligned 12px text and tertiary → secondary hover as the
+          // native button. Text indent = the session-title start point:
+          // .dsh-fe-sess padding-left (40px) + .dsh-fe-dot width (7px) +
+          // row gap (6px), so the label lines up with the history titles.
+          '.dsh-fe-sess-more { width:100%; height:28px; border:none; border-radius:8px; padding:0 12px 0 calc(40px + 7px + 6px); background:transparent; cursor:pointer; text-align:left; font-size:12px; color:var(--dsw-alias-label-tertiary); }',
+          '.dsh-fe-sess-more:hover { color:var(--dsw-alias-label-secondary); }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -1012,6 +1025,10 @@ window.__ModuleLoader__.load({
           return Math.floor(diff / (365 * DAY)) + ' yr'
         }
 
+        // v1.19: session-history overflow cap, mirroring the shell's own
+        // WorkspaceBrowser overflow control (COLLAPSED_SESSION_LIMIT = 5).
+        const SESSION_HISTORY_LIMIT = 5
+
         // ---------- sidebar workspace tree ----------
         function WorkspaceNode(props) {
           const ws = props.ws
@@ -1027,6 +1044,10 @@ window.__ModuleLoader__.load({
           const [treeError, setTreeError] = React.useState(null)
           const [treeLoading, setTreeLoading] = React.useState(false)
           const [query, setQuery] = React.useState('')
+          // v1.19: whether the session-history overflow control has been
+          // expanded (transient per-mount state, same as the shell's
+          // expandedSessionGroups — no persistence by design).
+          const [histExpanded, setHistExpanded] = React.useState(false)
           // v1.15.1: `silent` reloads skip the '…' busy indicator — the 20s
           // background re-check below must not flash the refresh button.
           const loadFiles = async (force, silent) => {
@@ -1046,6 +1067,15 @@ window.__ModuleLoader__.load({
             .filter(s => s !== undefined)
             .filter(s => !query || (s.displayTitle || '').toLowerCase().indexOf(query.toLowerCase()) >= 0 || s.id.toLowerCase().indexOf(query.toLowerCase()) >= 0)
             .sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0)))
+          // v1.19: at most SESSION_HISTORY_LIMIT history rows render at once;
+          // the overflow control below expands the rest (mirrors the shell's
+          // COLLAPSED_SESSION_LIMIT + sessionOverflowButton). An active
+          // search lifts the cap — matching results are the way to reach
+          // older sessions, exactly like the shell's search surface.
+          const searching = query !== ''
+          const shownSessions = histExpanded || searching
+            ? sessions
+            : sessions.slice(0, SESSION_HISTORY_LIMIT)
           const toggleFiles = () => {
             const next = !secFiles
             setSecFiles(next)
@@ -1121,7 +1151,7 @@ window.__ModuleLoader__.load({
                   value: query,
                   onChange: (ev) => setQuery(ev.target.value),
                 }),
-                sessions.map(s => React.createElement('div', {
+                shownSessions.map(s => React.createElement('div', {
                   key: s.id,
                   className: 'dsh-fe-sess' + (s.id === currentId ? ' dsh-fe-sess-cur' : ''),
                   onClick: () => ctx.sessions.open(s.id),
@@ -1133,6 +1163,21 @@ window.__ModuleLoader__.load({
                   React.createElement('span', { className: 'dsh-fe-sess-name' }, s.displayTitle),
                   React.createElement('span', { className: 'dsh-fe-sess-time' }, timeAgo(s.updatedAt, Date.now())),
                 )),
+                // v1.19: overflow control — same semantics, texts and
+                // visual language as the shell's sessionOverflowButton
+                // (locales: sessions.expand = "展开其余 {n} 个会话" /
+                // sessions.collapse = "收起"). Hidden while searching.
+                !searching && sessions.length > SESSION_HISTORY_LIMIT
+                  ? React.createElement('button', {
+                      className: 'dsh-fe-sess-more',
+                      'aria-expanded': histExpanded ? 'true' : 'false',
+                      onClick: () => setHistExpanded(!histExpanded),
+                    },
+                    histExpanded
+                      ? '收起'
+                      : '展开其余 ' + (sessions.length - SESSION_HISTORY_LIMIT) + ' 个会话',
+                  )
+                  : null,
                 React.createElement('button', { className: 'dsh-fe-newbtn', 'data-dsh-fe-guarded': '1', onClick: () => guardedStartSession(ws.workspaceId) }, IconPlus(), '新建会话'),
               ) : null,
               React.createElement('div', {
