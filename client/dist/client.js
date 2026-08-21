@@ -543,7 +543,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.20.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.20.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -949,8 +949,11 @@ window.__ModuleLoader__.load({
           '.dsh-fe-mgbtn-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); color:var(--dsw-alias-state-error-primary); }',
           // v1.20.2: rest state is a plain text button「管理」(no icon) that
           // fades in on header hover; the manage state keeps the trash +
-          // cancel icon pair.
-          '.dsh-fe-mgbtn-txt { border:none; background:transparent; padding:1px 8px; border-radius:6px; font-size:12px; color:var(--dsw-alias-label-secondary); white-space:nowrap; cursor:pointer; }',
+          // cancel icon pair. v1.20.3: both states are pinned to the same
+          // 18px control height so entering manage mode does NOT grow the
+          // section header row.
+          '.dsh-fe-iconbtn.dsh-fe-mgbtn { width:18px; height:18px; }',
+          '.dsh-fe-mgbtn-txt { display:inline-flex; align-items:center; height:18px; border:none; background:transparent; padding:0 8px; border-radius:6px; font-size:12px; color:var(--dsw-alias-label-secondary); white-space:nowrap; cursor:pointer; }',
           '.dsh-fe-mgbtn-txt:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); color:var(--dsw-alias-label-primary); }',
           '.dsh-fe-mgbtn-txt:focus-visible { outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
           // Checkbox column in manage mode: a small rounded square (v1.20.1
@@ -1046,10 +1049,11 @@ window.__ModuleLoader__.load({
         // geometry, drawn small and bold for a 13px box).
         // v1.20.1: dots at 20px field. v1.20.2: back down to a compact 16px
         // field (smaller dots, narrower button) per user feedback.
-        const IconDots = () => React.createElement('svg', { ...svgBase, width: 16, height: 14, viewBox: '0 0 16 14' }, [
+        // v1.20.3: a touch more air between the dots (6px pitch, 18px field).
+        const IconDots = () => React.createElement('svg', { ...svgBase, width: 18, height: 14, viewBox: '0 0 18 14' }, [
           React.createElement('circle', { cx: 3, cy: 7, r: 1.4, fill: 'currentColor', stroke: 'none' }),
-          React.createElement('circle', { cx: 8, cy: 7, r: 1.4, fill: 'currentColor', stroke: 'none' }),
-          React.createElement('circle', { cx: 13, cy: 7, r: 1.4, fill: 'currentColor', stroke: 'none' }),
+          React.createElement('circle', { cx: 9, cy: 7, r: 1.4, fill: 'currentColor', stroke: 'none' }),
+          React.createElement('circle', { cx: 15, cy: 7, r: 1.4, fill: 'currentColor', stroke: 'none' }),
         ])
         // v1.20.2: redrawn pin — a ball-head pin seen from the front: ring
         // head with a solid center dot and a clean needle. Reads brighter and
