@@ -543,7 +543,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.20.3: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.20.4: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -576,7 +576,9 @@ window.__ModuleLoader__.load({
           // themes too). The old DIFF-pending yellow dot is removed entirely.
           '.dsh-fe-tab-dirty { display:inline-block; width:7px; height:7px; border-radius:50%; margin-left:2px; background:var(--dsw-alias-label-primary); opacity:.9; vertical-align:middle; }',
           // v1.13: save-confirmation dialog (fixed overlay inside FileView).
-          '.dsh-fe-ask-mask { position:fixed; inset:0; z-index:60; background:color-mix(in srgb, var(--dsw-alias-label-primary) 24%, transparent); display:flex; align-items:flex-start; justify-content:center; padding-top:18vh; }',
+          // v1.20.4: the scrim DIMS the page (dark mix — no more whitening)
+          // and BLURS what is behind the dialog via backdrop-filter.
+          '.dsh-fe-ask-mask { position:fixed; inset:0; z-index:60; background:color-mix(in srgb, var(--dsw-alias-bg-base) 38%, #000); backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); display:flex; align-items:flex-start; justify-content:center; padding-top:18vh; }',
           '.dsh-fe-ask-card { background:var(--dsw-alias-bg-layer-2); border:1px solid var(--dsw-alias-border-l1); border-radius:12px; box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); padding:14px 16px; min-width:min(420px, calc(100vw - 48px)); max-width:calc(100vw - 48px); color:var(--dsw-alias-label-primary); }',
           '.dsh-fe-ask-title { font-size:14px; font-weight:650; margin-bottom:8px; }',
           '.dsh-fe-ask-body { font-size:12.5px; color:var(--dsw-alias-label-secondary); line-height:1.55; }',
@@ -1247,9 +1249,24 @@ window.__ModuleLoader__.load({
                 const live = failed.some((x) => x.error === 'session-live')
                 const gone = failed.some((x) => x.error === 'not-found')
                 const names = failed.map((x) => (byId[x.sessionId] && byId[x.sessionId].displayTitle) || x.sessionId).join('、')
-                setDelErr('无法删除：' + names + (live ? '（会话正在使用中）' : gone ? '（会话记录不存在）' : ''))
+                // v1.20.4: explain the live case — a session stays attached to
+                // the DSH host for the whole process run once opened/resumed;
+                // running=False only means no turn is active right now.
+                let why = ''
+                if (live) {
+                  const running = failed.some((x) => byId[x.sessionId] && byId[x.sessionId].running)
+                  why = running
+                    ? '（该会话的 agent 正在运行，暂不能删除）'
+                    : '（该会话仍被 DSH 保持打开——可能仍在浏览器标签页中；重启 DSH 后即可删除）'
+                } else if (gone) {
+                  why = '（会话记录不存在）'
+                }
+                setDelErr('无法删除：' + names + why)
               }
-              pinStore.clear(ids)
+              // v1.20.4: clear pins ONLY for the sessions actually deleted —
+              // a failed delete must not silently drop the pin.
+              const okIds = (r.results || []).filter((x) => x.ok).map((x) => x.sessionId)
+              pinStore.clear(okIds)
               setSel(null)
               await refreshSessions()
             } finally {

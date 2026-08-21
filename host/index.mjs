@@ -89,7 +89,30 @@ export default {
     const MAX_DIFF_LINES = 8000
     const MAX_ENTRIES = 8000
     const MAX_DEPTH = 16
-    const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', '.next', '.dsh', '.idea', '.vscode', '.cache', '.turbo', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.eslintcache', '.DS_Store'])
+    // v1.20.4: expanded hard-skip list. These are dependency/runtime/cache/
+    // generated-output directories — never authored source — so agent changes
+    // inside them are NOT reviewed (and they do not consume the walk budget).
+    // Name-based match at any depth, applied identically to the review scan
+    // (walkFiles) and the file tree (treeNode).
+    const SKIP_DIRS = new Set([
+      // version control / editor / tooling metadata
+      '.git', '.dsh', '.idea', '.vscode', '.DS_Store',
+      // node / js toolchains, package managers, bundler caches
+      'node_modules', 'bower_components', 'jspm_packages', '.yarn', '.pnpm-store',
+      // js framework build outputs + their caches
+      '.next', '.nuxt', '.svelte-kit', '.astro', '.output', '_next', '.angular', '.vite', '.parcel-cache', '.turbo', '.cache', '.swc',
+      'build',
+      // python runtimes, environments, caches
+      'python', '.venv', 'venv', 'env', 'site-packages', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox',
+      // rust / java / .gradle / xcode / dart / flutter
+      'target', '.gradle', 'DerivedData', 'Pods', 'Carthage', '.swiftpm', '.dart_tool',
+      // ruby / php / go / elixir / erlang dependencies
+      'vendor', 'deps', '_build', '.stack-work', '.bundle',
+      // playwright & test artifacts
+      'playwright_browsers', 'playwright-report', 'test-results', 'coverage', '.nyc_output',
+      // misc infra
+      '.terraform', '.eslintcache', '.stylelintcache',
+    ])
     // v1.13.3: change triggers are event-driven and NARROW — the client no
     // longer fast-polls (its fixed 20s arm is only a failsafe), so a trigger
     // here must be both precise and cheap. write/edit always mutate and carry
