@@ -24,6 +24,51 @@ const STATE_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'dsh-fil
 }
 mkdirSync(STATE_DIR, { recursive: true })
 
+// v1.20: session deletion (permanent). DSH exposes no session-delete API, so
+// the plugin removes the session's own artifacts from the JSONL store. The
+// layout mirrors session-persistence-jsonl exactly
+// (packages/session/session-persistence-jsonl/src/format.ts):
+//   <root>/<projectKey(cwd)>/<encodeSegment(sessionId)>/session.jsonl.zstd
+// with root = dshHomePath('sessions') (bundle/base/cordis.patch.yml). The two
+// encoders below are faithful mirrors (injective, separator-safe); the delete
+// handler validates the target again before rmSync.
+const SESSIONS_ROOT = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'sessions')
+// Session ids are session-<uuid>; allow only encodeSegment-safe code units so
+// no traversal/absolute path can ever reach the filesystem.
+const SESSION_ID_RE = /^session-[A-Za-z0-9._~-]{8,160}$/
+function encodeSegmentOf(raw) {
+  if (raw.length === 0) throw new Error('cannot encode an empty path segment')
+  if (raw === '.') return '~002E'
+  if (raw === '..') return '~002E~002E'
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) out += ch
+    else out += '~' + raw.charCodeAt(i).toString(16).toUpperCase().padStart(4, '0')
+  }
+  return out
+}
+function projectKeyOf(cwd) {
+  if (cwd.length === 0) throw new Error('cannot encode an empty project path')
+  let readable = ''
+  let separatorRun = false
+  for (let i = 0; i < cwd.length; i++) {
+    const ch = cwd[i]
+    if (ch === '/' || ch === '\\' || ch === ':') {
+      if (!separatorRun) readable += '-'
+      separatorRun = true
+    } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += '~' + cwd.charCodeAt(i).toString(16).toUpperCase().padStart(4, '0')
+      separatorRun = false
+    }
+  }
+  const slug = readable.replace(/^-+/, '') || 'root'
+  return '--' + slug.slice(0, 251) + '--'
+}
+
 export default {
   // Hard dependencies: the loader waits for these host services to become
   // ACTIVE before apply runs (ctx.get is strict about fiber state and can
@@ -1728,6 +1773,72 @@ export default {
           set.add(finish)
           h = setTimeout(() => finish({ ok: true, changed: false }), WAIT_MS)
         })
+      },
+
+      // v1.20: permanently delete one or more sessions (UI: per-row dot menu
+      // 删除 + manage-mode batch delete). The client sends {sessionId, cwd?}
+      // pairs. Refuses live (attached/running) sessions — their persistence
+      // would be recreated by the still-owning fiber; the client disables the
+      // current session's delete affordances, and the host guard is the back
+      // stop. Removes the session dir, the plugin's own review state and the
+      // DSH projection caches get reconciled by the client's list refresh.
+      async deleteSessions(args) {
+        const raw = args && Array.isArray(args.sessions) ? args.sessions : []
+        if (raw.length === 0) return { ok: false, error: 'empty-sessions' }
+        const results = []
+        for (const item of raw) {
+          const sid = item && item.sessionId ? String(item.sessionId) : ''
+          if (!SESSION_ID_RE.test(sid)) {
+            results.push({ sessionId: sid || null, ok: false, error: 'bad-session-id' })
+            continue
+          }
+          if (sessions.get(sid)) {
+            results.push({ sessionId: sid, ok: false, error: 'session-live' })
+            continue
+          }
+          const enc = encodeSegmentOf(sid)
+          const candidates = []
+          const cwd = item && typeof item.cwd === 'string' ? item.cwd : ''
+          if (cwd) {
+            try { candidates.push(join(SESSIONS_ROOT, projectKeyOf(cwd), enc)) } catch (e) {}
+          }
+          // Fallback: scan every bucket for the encoded session dir (covers
+          // cwd mismatches and sessions whose header cwd differs from the
+          // workspace path the browser reports).
+          try {
+            for (const entry of readdirSync(SESSIONS_ROOT, { withFileTypes: true })) {
+              if (!entry.isDirectory()) continue
+              const cand = join(SESSIONS_ROOT, entry.name, enc)
+              if (existsSync(cand) && candidates.indexOf(cand) < 0) candidates.push(cand)
+            }
+          } catch (e) {}
+          let deleted = 0
+          let lastError = null
+          for (const dir of candidates) {
+            // Safety net: the removal target must sit EXACTLY one level under
+            // the sessions root and its basename must be the encoded id.
+            const rel = relative(SESSIONS_ROOT, dir)
+            const parts = rel.split(/[\\/]/)
+            if (parts.length !== 2 || parts[1] !== enc || parts[0] === '' || parts[0] === '.' || parts[0] === '..') continue
+            if (!existsSync(dir)) continue
+            try {
+              rmSync(dir, { recursive: true, force: true })
+              deleted++
+            } catch (e) {
+              lastError = e && e.message ? String(e.message) : String(e)
+              break
+            }
+          }
+          // Drop the plugin's own review state for the removed session.
+          try { const sf = stateFile(sid); if (existsSync(sf)) rmSync(sf, { force: true }) } catch (e) {}
+          try { const sd = join(STATE_DIR, sidSafe(sid)); if (existsSync(sd)) rmSync(sd, { recursive: true, force: true }) } catch (e) {}
+          if (deleted === 0) {
+            results.push({ sessionId: sid, ok: false, error: lastError || 'not-found' })
+          } else {
+            results.push({ sessionId: sid, ok: true, deleted: deleted })
+          }
+        }
+        return { ok: true, results: results }
       },
 
       async getDiff(args) {

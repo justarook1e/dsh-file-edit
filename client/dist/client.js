@@ -130,6 +130,40 @@ window.__ModuleLoader__.load({
           emit() { this.rev++; const subs = Array.from(this.subs); for (const f of subs) { try { f() } catch (e) {} } },
           subscribe(f) { this.subs.add(f); return () => { this.subs.delete(f) } },
         }
+        // v1.20: pinned sessions (置顶) — a module-level set persisted to
+        // localStorage so pins survive page reloads and are shared by every
+        // workspace node. Sorting happens in WorkspaceNode: pinned sessions
+        // float to the top, each group ordered by last activity (updatedAt).
+        const pinStore = {
+          KEY: 'dsh-file-edit.pins.v1',
+          pins: new Set(),
+          subs: new Set(),
+          load() {
+            try {
+              const raw = localStorage.getItem(this.KEY)
+              if (!raw) return
+              const arr = JSON.parse(raw)
+              if (Array.isArray(arr)) for (const id of arr) if (typeof id === 'string') this.pins.add(id)
+            } catch (e) {}
+          },
+          save() {
+            try { localStorage.setItem(this.KEY, JSON.stringify(Array.from(this.pins))) } catch (e) {}
+          },
+          has(id) { return this.pins.has(id) },
+          toggle(id) {
+            if (this.pins.has(id)) this.pins.delete(id); else this.pins.add(id)
+            this.save()
+            this.emit()
+          },
+          clear(ids) {
+            let changed = false
+            for (const id of ids || []) if (this.pins.delete(id)) changed = true
+            if (changed) { this.save(); this.emit() }
+          },
+          subscribe(f) { this.subs.add(f); return () => { this.subs.delete(f) } },
+          emit() { for (const f of Array.from(this.subs)) { try { f() } catch (e) {} } },
+        }
+        pinStore.load()
         const range = (a, b) => { const r = []; for (let i = a; i < b; i++) r.push(i); return r }
         const useStore = () => {
           const [, force] = React.useState(0)
@@ -509,7 +543,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.19.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.20.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -875,6 +909,47 @@ window.__ModuleLoader__.load({
           // row gap (6px), so the label lines up with the history titles.
           '.dsh-fe-sess-more { width:100%; height:28px; border:none; border-radius:8px; padding:0 12px 0 calc(40px + 7px + 6px); background:transparent; cursor:pointer; text-align:left; font-size:12px; color:var(--dsw-alias-label-tertiary); }',
           '.dsh-fe-sess-more:hover { color:var(--dsw-alias-label-secondary); }',
+          // ---- v1.20: session row dot menu + pin + manage mode ----
+          // Hovering a history row crossfades the relative-time label into a
+          // three-dot control pinned to the row's right edge (the dots have
+          // their own soft hover chip). Clicking opens a small in-flow action
+          // card below the row: 删除 / 置顶 (or 取消置顶 when pinned).
+          '.dsh-fe-sess { position:relative; }',
+          '.dsh-fe-sess-time { transition:opacity .12s ease; }',
+          '.dsh-fe-sess:hover .dsh-fe-sess-time { opacity:0; }',
+          '.dsh-fe-sess-dots { position:absolute; right:6px; top:50%; transform:translateY(-50%); width:22px; height:20px; display:inline-flex; align-items:center; justify-content:center; border:none; background:transparent; border-radius:5px; color:var(--dsw-alias-label-secondary); opacity:0; cursor:pointer; transition:opacity .12s ease, background .12s ease, color .12s ease; }',
+          '.dsh-fe-sess:hover .dsh-fe-sess-dots { opacity:1; }',
+          '.dsh-fe-sess-dots:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 16%, transparent); color:var(--dsw-alias-label-primary); }',
+          '.dsh-fe-sess-dots:focus-visible { opacity:1; outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
+          '.dsh-fe-sess-pin { flex:none; display:inline-flex; color:var(--dsw-alias-state-warn-primary); }',
+          '.dsh-fe-menu-veil { position:fixed; inset:0; z-index:29; }',
+          '.dsh-fe-sess-menu { position:relative; z-index:30; display:flex; gap:3px; margin:1px 8px 4px 40px; padding:3px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv1, 0 2px 4px 0 rgba(0,0,0,.05)); }',
+          '.dsh-fe-sess-menu-item { flex:1; display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:5px 8px; border:none; background:transparent; border-radius:6px; color:var(--dsw-alias-label-secondary); font-size:12px; cursor:pointer; transition:background .12s ease, color .12s ease; }',
+          '.dsh-fe-sess-menu-item:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); color:var(--dsw-alias-label-primary); }',
+          '.dsh-fe-sess-menu-item-no { color:var(--dsw-alias-state-error-primary); }',
+          '.dsh-fe-sess-menu-item-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); color:var(--dsw-alias-state-error-primary); }',
+          '.dsh-fe-sess-menu-item:disabled { opacity:.45; cursor:not-allowed; }',
+          // Manage mode: the history header reveals a manage button on hover
+          // (always visible while managing), where it is replaced by the
+          // trash + cancel icon pair.
+          '.dsh-fe-mgbtn { opacity:0; transition:opacity .12s ease, background .12s ease, color .12s ease; }',
+          '.dsh-fe-sec:hover .dsh-fe-mgbtn, .dsh-fe-mgbtn-on { opacity:1; }',
+          '.dsh-fe-mgbtn:focus-visible { opacity:1; outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
+          '.dsh-fe-mgbtn-no { color:var(--dsw-alias-state-error-primary); }',
+          '.dsh-fe-mgbtn-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); color:var(--dsw-alias-state-error-primary); }',
+          // Checkbox column in manage mode: a small rounded square; checked =
+          // business-blue fill with a light check mark. The warning flash
+          // (delete pressed with nothing selected) paints every visible
+          // checkbox orange-yellow, shakes it twice and fades back — a single
+          // keyframe replayed by remounting the boxes on each warn tick.
+          '.dsh-fe-chk { width:15px; height:15px; flex:none; display:inline-flex; align-items:center; justify-content:center; border:1.5px solid color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); border-radius:4px; background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); color:transparent; cursor:pointer; transition:background .18s ease, border-color .18s ease, color .18s ease; }',
+          '.dsh-fe-chk:hover { border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 72%, transparent); }',
+          '.dsh-fe-chk-on { background:var(--dsw-alias-state-business-primary, var(--dsw-alias-label-primary)); border-color:transparent; color:var(--dsw-alias-bg-base); }',
+          '.dsh-fe-chk-dis { opacity:.35; cursor:default; }',
+          '.dsh-fe-sess-sel { background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 12%, transparent); }',
+          '@keyframes dsh-fe-chk-warn { 0% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } 10% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 20% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 35% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 50% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 65% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 78% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 100% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } }',
+          '.dsh-fe-chk-warn { animation:dsh-fe-chk-warn 1.05s ease-in-out; }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-sess-time, .dsh-fe-sess-dots, .dsh-fe-sess-menu-item, .dsh-fe-mgbtn, .dsh-fe-chk { transition:none; } .dsh-fe-chk-warn { animation:none; background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -947,6 +1022,34 @@ window.__ModuleLoader__.load({
         const IconPencil = () => I(14, '0 0 14 14', [P('M12 3.6 L10.4 2 a1.1 1.1 0 0 0 -1.6 0 L3.4 7.4 V10.6 H6.6 L12 5.2 a1.1 1.1 0 0 0 0 -1.6 Z'), P('M8.6 2.8 L11.2 5.4')])
         const IconPlus = () => I(12, '0 0 14 14', [P('M7 2.5 V11.5'), P('M2.5 7 H11.5')])
         const IconClose = () => I(11, '0 0 14 14', [P('M4 4 L10 10'), P('M10 4 L4 10')])
+        // v1.20: session-history controls. Dots = steady 1.5px r circles on
+        // the row baseline; pin = pushpin (head + needle); trash = bin with
+        // lid and handle; manage = three slider lines with knobs (batch
+        // selection); check = the checkbox mark (reuses the decision-glyph
+        // geometry, drawn small and bold for a 15px box).
+        const IconDots = () => React.createElement('svg', { ...svgBase, width: 14, height: 14, viewBox: '0 0 14 14' }, [
+          React.createElement('circle', { cx: 3, cy: 7, r: 1.5, fill: 'currentColor', stroke: 'none' }),
+          React.createElement('circle', { cx: 7, cy: 7, r: 1.5, fill: 'currentColor', stroke: 'none' }),
+          React.createElement('circle', { cx: 11, cy: 7, r: 1.5, fill: 'currentColor', stroke: 'none' }),
+        ])
+        const IconPin = () => I(14, '0 0 14 14', [
+          P('M7 1.6 L9.1 3.7 V5.9 L10.8 8.2 H3.2 L4.9 5.9 V3.7 Z'),
+          P('M7 8.2 V12.6'),
+        ])
+        const IconTrash = () => I(14, '0 0 14 14', [
+          P('M2.8 3.8 H11.2'),
+          P('M5.3 3.8 V2.6 a.9 .9 0 0 1 .9 -.9 h1.6 a.9 .9 0 0 1 .9 .9 V3.8'),
+          P('M4.1 3.8 L4.6 10.9 a1 1 0 0 0 1 .9 h2.8 a1 1 0 0 0 1 -.9 L9.9 3.8'),
+        ])
+        const IconManage = () => React.createElement('svg', { ...svgBase, width: 14, height: 14, viewBox: '0 0 14 14' }, [
+          P('M2.5 4 H11.5'),
+          React.createElement('circle', { cx: 8.8, cy: 4, r: 1.7 }),
+          P('M2.5 7 H11.5'),
+          React.createElement('circle', { cx: 5.2, cy: 7, r: 1.7 }),
+          P('M2.5 10 H11.5'),
+          React.createElement('circle', { cx: 7, cy: 10, r: 1.7 }),
+        ])
+        const IconChk = () => I(12, '0 0 14 14', [P('M3.4 7.2 L6 9.6 L10.8 4.4')], { strokeWidth: 2.2 })
         const IconBtn = (props) => React.createElement('button', {
           type: 'button',
           title: props.title,
@@ -1048,6 +1151,69 @@ window.__ModuleLoader__.load({
           // expanded (transient per-mount state, same as the shell's
           // expandedSessionGroups — no persistence by design).
           const [histExpanded, setHistExpanded] = React.useState(false)
+          // v1.20: session-row dot menu (which session's action card is open),
+          // manage mode (batch select/delete), selected ids, warning flash
+          // state, confirm dialog and the in-flight delete flag.
+          const [menuFor, setMenuFor] = React.useState(null)
+          const [managing, setManaging] = React.useState(false)
+          const [sel, setSel] = React.useState(null)
+          const [warnOn, setWarnOn] = React.useState(false)
+          const [warnTick, setWarnTick] = React.useState(0)
+          const warnRef = React.useState({ c: null })[0]
+          const [confirmDel, setConfirmDel] = React.useState(null)
+          const [delErr, setDelErr] = React.useState(null)
+          const [deleting, setDeleting] = React.useState(false)
+          const [pinTick, setPinTick] = React.useState(0)
+          React.useEffect(() => pinStore.subscribe(() => setPinTick((n) => n + 1)), [])
+          React.useEffect(() => () => { if (warnRef.c) { try { warnRef.c() } catch (e) {} } }, [])
+          // Delete pressed with nothing selected: repaint every visible
+          // checkbox orange-yellow, shake twice, fade back. The tick remounts
+          // the boxes so the CSS keyframe replays on each press; the timeout
+          // drops the class so expanding the section later does NOT replay.
+          const flashWarn = () => {
+            setWarnTick((n) => n + 1)
+            setWarnOn(true)
+            if (warnRef.c) { try { warnRef.c() } catch (e) {} }
+            warnRef.c = ctx.timeout(() => { setWarnOn(false); warnRef.c = null }, 1150)
+          }
+          const toggleSel = (id) => {
+            setSel((prev) => {
+              const next = new Set(prev || [])
+              if (next.has(id)) next.delete(id); else next.add(id)
+              return next
+            })
+          }
+          const refreshSessions = async () => {
+            // Re-pull both baselines so the deleted ids vanish from the sidebar
+            // groups immediately (Host workspace.list + session.list reconcile
+            // against the JSONL store on request).
+            try { if (ctx.workspaces && ctx.workspaces.refresh) await ctx.workspaces.refresh() } catch (e) {}
+            try { if (ctx.sessions && ctx.sessions.refresh) await ctx.sessions.refresh() } catch (e) {}
+          }
+          const doDelete = async (ids) => {
+            if (!ids || ids.length === 0) return
+            setDeleting(true)
+            setDelErr(null)
+            const payload = ids.map((id) => ({ sessionId: id, cwd: (byId[id] && byId[id].cwd) || ws.path }))
+            try {
+              const r = await call('deleteSessions', { sessions: payload })
+              if (!r.ok) { setDelErr(r.error || '删除失败'); return }
+              const failed = (r.results || []).filter((x) => !x.ok)
+              if (failed.length > 0) {
+                const live = failed.some((x) => x.error === 'session-live')
+                const gone = failed.some((x) => x.error === 'not-found')
+                const names = failed.map((x) => (byId[x.sessionId] && byId[x.sessionId].displayTitle) || x.sessionId).join('、')
+                setDelErr('无法删除：' + names + (live ? '（会话正在使用中）' : gone ? '（会话记录不存在）' : ''))
+              }
+              pinStore.clear(ids)
+              setSel(null)
+              await refreshSessions()
+            } finally {
+              setDeleting(false)
+            }
+          }
+          const confirmAndDel = (ids) => setConfirmDel({ ids: ids.slice() })
+          const selectedCount = sel ? sel.size : 0
           // v1.15.1: `silent` reloads skip the '…' busy indicator — the 20s
           // background re-check below must not flash the refresh button.
           const loadFiles = async (force, silent) => {
@@ -1062,11 +1228,19 @@ window.__ModuleLoader__.load({
           // v1.11: history ordered by recency — newest session on top (the
           // host's sessionIds order reflects creation/attachment, not
           // activity). Equal timestamps keep the host order (stable sort).
+          // v1.20: pinned sessions float above everything, and each group
+          // (pinned / rest) sorts by last activity — "多个被置顶的会话按
+          // 最后时间排序".
           const sessions = (ws.sessionIds || [])
             .map(id => byId[id])
             .filter(s => s !== undefined)
             .filter(s => !query || (s.displayTitle || '').toLowerCase().indexOf(query.toLowerCase()) >= 0 || s.id.toLowerCase().indexOf(query.toLowerCase()) >= 0)
-            .sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0)))
+            .sort((a, b) => {
+              const pa = pinStore.has(a.id) ? 1 : 0
+              const pb = pinStore.has(b.id) ? 1 : 0
+              if (pa !== pb) return pb - pa
+              return ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0))
+            })
           // v1.19: at most SESSION_HISTORY_LIMIT history rows render at once;
           // the overflow control below expands the rest (mirrors the shell's
           // COLLAPSED_SESSION_LIMIT + sessionOverflowButton). An active
@@ -1143,6 +1317,27 @@ window.__ModuleLoader__.load({
                 React.createElement('span', { className: 'dsh-fe-ic' }, IconClock()),
                 React.createElement('span', null, '会话历史'),
                 React.createElement('span', { className: 'dsh-fe-stats' }, '(' + sessions.length + ')'),
+                React.createElement('span', { className: 'dsh-fe-spacer' }, null),
+                // v1.20: hover-revealed manage button; while managing the
+                // header swaps it for the trash (batch delete) + cancel pair.
+                managing
+                  ? React.createElement('button', {
+                      className: 'dsh-fe-iconbtn dsh-fe-mgbtn dsh-fe-mgbtn-on dsh-fe-mgbtn-no',
+                      title: deleting ? '正在删除…' : '删除选中的会话' + (selectedCount > 0 ? '（' + selectedCount + ' 个）' : ''),
+                      onClick: (ev) => { ev.stopPropagation(); if (deleting) return; if (selectedCount > 0) confirmAndDel(Array.from(sel)); else flashWarn() },
+                    }, IconTrash())
+                  : null,
+                managing
+                  ? React.createElement('button', {
+                      className: 'dsh-fe-iconbtn dsh-fe-mgbtn dsh-fe-mgbtn-on',
+                      title: '取消管理',
+                      onClick: (ev) => { ev.stopPropagation(); setManaging(false); setSel(null); setMenuFor(null); setDelErr(null) },
+                    }, IconClose())
+                  : React.createElement('button', {
+                      className: 'dsh-fe-iconbtn dsh-fe-mgbtn',
+                      title: '管理会话（勾选后批量删除）',
+                      onClick: (ev) => { ev.stopPropagation(); setManaging(true); setSel(null); setMenuFor(null); setDelErr(null) },
+                    }, IconManage()),
               ),
               secHistory ? React.createElement('div', null,
                 React.createElement('input', {
@@ -1151,18 +1346,61 @@ window.__ModuleLoader__.load({
                   value: query,
                   onChange: (ev) => setQuery(ev.target.value),
                 }),
-                shownSessions.map(s => React.createElement('div', {
-                  key: s.id,
-                  className: 'dsh-fe-sess' + (s.id === currentId ? ' dsh-fe-sess-cur' : ''),
-                  onClick: () => ctx.sessions.open(s.id),
-                  title: s.id + (s.updatedAt ? '\n' + new Date(s.updatedAt).toLocaleString() : ''),
-                },
-                  s.running
-                    ? IconRunning()
-                    : React.createElement('span', { className: 'dsh-fe-dot' + (s.completed ? ' dsh-fe-dot-done' : '') }),
-                  React.createElement('span', { className: 'dsh-fe-sess-name' }, s.displayTitle),
-                  React.createElement('span', { className: 'dsh-fe-sess-time' }, timeAgo(s.updatedAt, Date.now())),
-                )),
+                delErr ? React.createElement('div', { className: 'dsh-fe-err' }, String(delErr)) : null,
+                shownSessions.map(s => {
+                  const pinned = pinStore.has(s.id)
+                  const isCur = s.id === currentId
+                  const chkOn = managing && sel !== null && sel.has(s.id)
+                  const chkDis = managing && isCur
+                  const row = React.createElement('div', {
+                    key: s.id,
+                    className: 'dsh-fe-sess' + (isCur ? ' dsh-fe-sess-cur' : '') + (chkOn ? ' dsh-fe-sess-sel' : ''),
+                    onClick: () => ctx.sessions.open(s.id),
+                    title: s.id + (s.updatedAt ? '\n' + new Date(s.updatedAt).toLocaleString() : ''),
+                  },
+                    // v1.20: manage mode swaps the status glyph slot for the
+                    // selection checkbox (current session's box is disabled —
+                    // a live session cannot be deleted).
+                    managing
+                      ? React.createElement('span', {
+                          key: s.id + ':' + warnTick,
+                          className: 'dsh-fe-chk' + (chkOn ? ' dsh-fe-chk-on' : '') + (chkDis ? ' dsh-fe-chk-dis' : '') + (warnOn ? ' dsh-fe-chk-warn' : ''),
+                          title: chkDis ? '当前会话，不能删除' : (chkOn ? '取消选择' : '选择此会话'),
+                          onClick: (ev) => { ev.stopPropagation(); if (!chkDis) toggleSel(s.id) },
+                        }, IconChk())
+                      : (s.running
+                          ? IconRunning()
+                          : React.createElement('span', { className: 'dsh-fe-dot' + (s.completed ? ' dsh-fe-dot-done' : '') })),
+                    React.createElement('span', { className: 'dsh-fe-sess-name' }, s.displayTitle),
+                    pinned ? React.createElement('span', { className: 'dsh-fe-sess-pin', title: '已置顶' }, IconPin()) : null,
+                    React.createElement('span', { className: 'dsh-fe-sess-time' }, timeAgo(s.updatedAt, Date.now())),
+                    React.createElement('button', {
+                      className: 'dsh-fe-sess-dots',
+                      title: '更多操作',
+                      onClick: (ev) => { ev.stopPropagation(); setMenuFor(menuFor === s.id ? null : s.id) },
+                    }, IconDots()),
+                  )
+                  const menu = menuFor === s.id
+                    ? React.createElement('div', { className: 'dsh-fe-sess-menu' },
+                        React.createElement('button', {
+                          className: 'dsh-fe-sess-menu-item dsh-fe-sess-menu-item-no',
+                          disabled: isCur,
+                          title: isCur ? '当前会话，不能删除' : '删除此会话（不可恢复）',
+                          onClick: () => { if (isCur) return; setMenuFor(null); confirmAndDel([s.id]) },
+                        }, IconTrash(), '删除'),
+                        React.createElement('button', {
+                          className: 'dsh-fe-sess-menu-item',
+                          title: pinned ? '取消置顶' : '置顶到最上方',
+                          onClick: () => { pinStore.toggle(s.id); setMenuFor(null) },
+                        }, IconPin(), pinned ? '取消置顶' : '置顶'),
+                      )
+                    : null
+                  return React.createElement(React.Fragment, { key: s.id }, row, menu)
+                }),
+                // v1.20: click-away veil for the open dot menu (a plain React
+                // overlay — no global listeners, which are unreliable in this
+                // shell; the menu card itself sits a level above it).
+                menuFor ? React.createElement('div', { className: 'dsh-fe-menu-veil', onClick: () => setMenuFor(null) }) : null,
                 // v1.19: overflow control — same semantics, texts and
                 // visual language as the shell's sessionOverflowButton
                 // (locales: sessions.expand = "展开其余 {n} 个会话" /
@@ -1199,6 +1437,29 @@ window.__ModuleLoader__.load({
                 tree ? React.createElement('div', { className: 'dsh-fe-children' },
                   React.createElement(TreeNode, { node: tree, depth: 0, onOpen: (p) => store.openFile(p) })) : null,
               ) : null,
+            ) : null,
+            // v1.20: destructive-action confirm (single delete from the dot
+            // menu or a manage-mode batch delete). Same overlay/card visual
+            // language as the file-view save prompt (dsh-fe-ask-*).
+            confirmDel ? React.createElement('div', {
+              className: 'dsh-fe-ask-mask',
+              onClick: () => setConfirmDel(null),
+            },
+              React.createElement('div', { className: 'dsh-fe-ask-card', onClick: (ev) => ev.stopPropagation() },
+                React.createElement('div', { className: 'dsh-fe-ask-title' }, '确认删除会话'),
+                React.createElement('div', { className: 'dsh-fe-ask-body' },
+                  '会话删除后不可恢复，请确认。',
+                  confirmDel.ids.length > 1 ? '（共 ' + confirmDel.ids.length + ' 个会话）' : null,
+                ),
+                React.createElement('div', { className: 'dsh-fe-ask-actions' },
+                  React.createElement('button', { className: 'dsh-fe-btn', onClick: () => setConfirmDel(null) }, '取消'),
+                  React.createElement('button', {
+                    className: 'dsh-fe-btn dsh-fe-btn-no',
+                    disabled: deleting,
+                    onClick: () => { const ids = confirmDel.ids.slice(); setConfirmDel(null); void doDelete(ids) },
+                  }, deleting ? '删除中…' : '确认删除'),
+                ),
+              ),
             ) : null,
           )
         }
