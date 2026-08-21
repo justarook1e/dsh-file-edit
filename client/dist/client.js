@@ -543,7 +543,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.20.4: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.21.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -578,7 +578,16 @@ window.__ModuleLoader__.load({
           // v1.13: save-confirmation dialog (fixed overlay inside FileView).
           // v1.20.4: the scrim DIMS the page (dark mix — no more whitening)
           // and BLURS what is behind the dialog via backdrop-filter.
-          '.dsh-fe-ask-mask { position:fixed; inset:0; z-index:60; background:color-mix(in srgb, var(--dsw-alias-bg-base) 38%, #000); backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); display:flex; align-items:flex-start; justify-content:center; padding-top:18vh; }',
+          // v1.21.0: the v1.20.4 mix (bg-base 38% + #000 62%) was a near-
+          // opaque flat wash on the dark theme — the page behind the dialog
+          // vanished and the whole background read as ONE solid color.
+          // Replaced with the shell's own mask recipe, the exact one the
+          // Modal / settings / image-lightbox dialogs use:
+          //   --dsw-alias-bg-mask-1 = rgba(0,0,0,.24) (light) / .50 (dark)
+          //   --dsw-mask-blur      = blur(2px)
+          // So the page is only slightly dimmed and stays recognizable
+          // through the gaussian blur — acrylic veil, not a color wash.
+          '.dsh-fe-ask-mask { position:fixed; inset:0; z-index:60; background:var(--dsw-alias-bg-mask-1, rgba(0,0,0,.32)); backdrop-filter:var(--dsw-mask-blur, blur(2px)); -webkit-backdrop-filter:var(--dsw-mask-blur, blur(2px)); display:flex; align-items:flex-start; justify-content:center; padding-top:18vh; }',
           '.dsh-fe-ask-card { background:var(--dsw-alias-bg-layer-2); border:1px solid var(--dsw-alias-border-l1); border-radius:12px; box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); padding:14px 16px; min-width:min(420px, calc(100vw - 48px)); max-width:calc(100vw - 48px); color:var(--dsw-alias-label-primary); }',
           '.dsh-fe-ask-title { font-size:14px; font-weight:650; margin-bottom:8px; }',
           '.dsh-fe-ask-body { font-size:12.5px; color:var(--dsw-alias-label-secondary); line-height:1.55; }',
@@ -941,6 +950,15 @@ window.__ModuleLoader__.load({
           '.dsh-fe-sess-menu-item-no { color:var(--dsw-alias-state-error-primary); }',
           '.dsh-fe-sess-menu-item-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); color:var(--dsw-alias-state-error-primary); }',
           '.dsh-fe-sess-menu-item:disabled { opacity:.45; cursor:not-allowed; }',
+          // v1.21.0: session history rows animate. Enter: quick fade + rise.
+          // Leave: fade + slight slide out while the row's own height
+          // collapses (max-height/padding/margin interpolated in the
+          // keyframes — the row keeps its place until the mirror drops it,
+          // so the list below closes in smoothly instead of jumping).
+          '.dsh-fe-sess-in { animation:dsh-fe-sess-in .18s ease-out; }',
+          '.dsh-fe-sess-out { overflow:hidden; animation:dsh-fe-sess-out .3s ease-in forwards; }',
+          '@keyframes dsh-fe-sess-in { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }',
+          '@keyframes dsh-fe-sess-out { from { opacity:1; transform:none; max-height:44px; margin-top:1px; margin-bottom:1px; padding-top:5px; padding-bottom:5px; } to { opacity:0; transform:translateX(-10px); max-height:0; margin-top:0; margin-bottom:0; padding-top:0; padding-bottom:0; } }',
           // Manage mode: the history header reveals a manage button on hover
           // (always visible while managing), where it is replaced by the
           // trash + cancel icon pair.
@@ -971,7 +989,7 @@ window.__ModuleLoader__.load({
           '.dsh-fe-sess-sel { background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 12%, transparent); }',
           '@keyframes dsh-fe-chk-warn { 0% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } 10% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 20% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 35% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 50% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 65% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 78% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 100% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } }',
           '.dsh-fe-chk-warn { animation:dsh-fe-chk-warn 1.05s ease-in-out; }',
-          '@media (prefers-reduced-motion: reduce) { .dsh-fe-sess-time, .dsh-fe-sess-dots, .dsh-fe-sess-pin, .dsh-fe-sess-menu-item, .dsh-fe-mgbtn, .dsh-fe-mgbtn-txt, .dsh-fe-chk { transition:none; } .dsh-fe-sess-menu { animation:none; } .dsh-fe-sess-menu-close { animation:none; } .dsh-fe-chk-warn { animation:none; background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); } }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-sess-time, .dsh-fe-sess-dots, .dsh-fe-sess-pin, .dsh-fe-sess-menu-item, .dsh-fe-mgbtn, .dsh-fe-mgbtn-txt, .dsh-fe-chk { transition:none; } .dsh-fe-sess-menu { animation:none; } .dsh-fe-sess-menu-close { animation:none; } .dsh-fe-chk-warn { animation:none; background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); } .dsh-fe-sess-in { animation:none; } .dsh-fe-sess-out { animation:none; } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -1192,10 +1210,19 @@ window.__ModuleLoader__.load({
           const [delErr, setDelErr] = React.useState(null)
           const [deleting, setDeleting] = React.useState(false)
           const [pinTick, setPinTick] = React.useState(0)
+          // v1.21.0: enter/leave animation mirror for session history rows
+          // (same pattern as the modified-bar rows). `sessRows` is the
+          // RENDERED list; the derived `shownSessions` stays the logical one.
+          // Rows that vanish from the derived list (deletion, search
+          // filtering, overflow collapse) stay mounted with the -out class
+          // until the animation finishes; new rows enter with -in.
+          const [sessRows, setSessRows] = React.useState(null)
+          const sessAnimRef = React.useState({ t: null, sig: null })[0]
           React.useEffect(() => pinStore.subscribe(() => setPinTick((n) => n + 1)), [])
           React.useEffect(() => () => {
             if (warnRef.c) { try { warnRef.c() } catch (e) {} }
             if (menuTimer.h) { try { menuTimer.h() } catch (e) {} }
+            if (sessAnimRef.t) { try { sessAnimRef.t() } catch (e) {} }
           }, [])
           const openMenu = (id, rect) => {
             if (menuFor === id) { closeMenu(); return }
@@ -1311,6 +1338,33 @@ window.__ModuleLoader__.load({
           const shownSessions = histExpanded || searching
             ? sessions
             : sessions.slice(0, SESSION_HISTORY_LIMIT)
+          // v1.21.0: reconcile the rendered mirror with the derived list.
+          // Keyed on the id signature so search keystrokes / overflow
+          // collapse / post-delete refreshes all animate rows in and out
+          // instead of snapping. A row that left stays for the animation
+          // (320ms > the .3s leave animation), then the timer drops it.
+          const sessSig = shownSessions.map((s) => s.id).join('\u0001')
+          React.useEffect(() => {
+            if (sessAnimRef.sig === sessSig) return
+            sessAnimRef.sig = sessSig
+            setSessRows((prev) => {
+              const prevMap = new Map((prev || []).map((p) => [p.key, p]))
+              const nextSet = new Set(shownSessions.map((s) => s.id))
+              const merged = shownSessions.map((s) => {
+                const old = prevMap.get(s.id)
+                return { key: s.id, s: s, leaving: false, enter: !old }
+              })
+              const leaving = (prev || []).filter((p) => !nextSet.has(p.key)).map((p) => ({ key: p.key, s: p.s, leaving: true, enter: false }))
+              return merged.concat(leaving)
+            })
+            if (sessAnimRef.t) { try { sessAnimRef.t() } catch (e) {} }
+            sessAnimRef.t = null
+            const reduced = typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+            sessAnimRef.t = ctx.timeout(() => {
+              sessAnimRef.t = null
+              setSessRows((prev) => (prev || []).filter((p) => !p.leaving))
+            }, reduced ? 0 : 320)
+          }, [sessSig])
           const toggleFiles = () => {
             const next = !secFiles
             setSecFiles(next)
@@ -1408,14 +1462,18 @@ window.__ModuleLoader__.load({
                   onChange: (ev) => setQuery(ev.target.value),
                 }),
                 delErr ? React.createElement('div', { className: 'dsh-fe-err' }, String(delErr)) : null,
-                shownSessions.map(s => {
+                (sessRows || []).map(r => {
+                  // Live data for rows still present (fresh time/title
+                  // labels); the snapshot keeps a leaving row alive while
+                  // it animates out (byId no longer has it).
+                  const s = byId[r.key] || r.s
                   const pinned = pinStore.has(s.id)
                   const isCur = s.id === currentId
                   const chkOn = managing && sel !== null && sel.has(s.id)
                   const chkDis = managing && isCur
                   return React.createElement('div', {
-                    key: s.id,
-                    className: 'dsh-fe-sess' + (isCur ? ' dsh-fe-sess-cur' : '') + (chkOn ? ' dsh-fe-sess-sel' : ''),
+                    key: r.key,
+                    className: 'dsh-fe-sess' + (isCur ? ' dsh-fe-sess-cur' : '') + (chkOn ? ' dsh-fe-sess-sel' : '') + (r.leaving ? ' dsh-fe-sess-out' : (r.enter ? ' dsh-fe-sess-in' : '')),
                     onClick: () => ctx.sessions.open(s.id),
                     title: s.id + (s.updatedAt ? '\n' + new Date(s.updatedAt).toLocaleString() : ''),
                   },
