@@ -543,7 +543,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.20.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.20.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -912,19 +912,26 @@ window.__ModuleLoader__.load({
           // ---- v1.20: session row dot menu + pin + manage mode ----
           // Hovering a history row crossfades the relative-time label into a
           // three-dot control pinned to the row's right edge (the dots have
-          // their own soft hover chip). Clicking opens a small in-flow action
-          // card below the row: 删除 / 置顶 (or 取消置顶 when pinned).
+          // their own soft hover chip). Clicking opens a floating mini
+          // dropdown anchored under the dots (fixed-positioned, so the
+          // sidebar's scroll container never clips it): two stacked rows,
+          // each exactly two Chinese characters wide — 删除 / 置顶, or
+          // 删除 / 取消 once pinned. Expand and collapse are animated
+          // (scale + fade from the top-right corner).
           '.dsh-fe-sess { position:relative; }',
           '.dsh-fe-sess-time { transition:opacity .12s ease; }',
           '.dsh-fe-sess:hover .dsh-fe-sess-time { opacity:0; }',
-          '.dsh-fe-sess-dots { position:absolute; right:6px; top:50%; transform:translateY(-50%); width:22px; height:20px; display:inline-flex; align-items:center; justify-content:center; border:none; background:transparent; border-radius:5px; color:var(--dsw-alias-label-secondary); opacity:0; cursor:pointer; transition:opacity .12s ease, background .12s ease, color .12s ease; }',
+          '.dsh-fe-sess-dots { position:absolute; right:5px; top:50%; transform:translateY(-50%); width:30px; height:22px; display:inline-flex; align-items:center; justify-content:center; border:none; background:transparent; border-radius:6px; color:var(--dsw-alias-label-secondary); opacity:0; cursor:pointer; transition:opacity .12s ease, background .12s ease, color .12s ease; }',
           '.dsh-fe-sess:hover .dsh-fe-sess-dots { opacity:1; }',
           '.dsh-fe-sess-dots:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 16%, transparent); color:var(--dsw-alias-label-primary); }',
           '.dsh-fe-sess-dots:focus-visible { opacity:1; outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
           '.dsh-fe-sess-pin { flex:none; display:inline-flex; color:var(--dsw-alias-state-warn-primary); }',
           '.dsh-fe-menu-veil { position:fixed; inset:0; z-index:29; }',
-          '.dsh-fe-sess-menu { position:relative; z-index:30; display:flex; gap:3px; margin:1px 8px 4px 40px; padding:3px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv1, 0 2px 4px 0 rgba(0,0,0,.05)); }',
-          '.dsh-fe-sess-menu-item { flex:1; display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:5px 8px; border:none; background:transparent; border-radius:6px; color:var(--dsw-alias-label-secondary); font-size:12px; cursor:pointer; transition:background .12s ease, color .12s ease; }',
+          '.dsh-fe-sess-menu { position:fixed; z-index:31; display:flex; flex-direction:column; gap:1px; padding:3px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); transform-origin:top right; animation:dsh-fe-menu-in .14s ease-out; }',
+          '.dsh-fe-sess-menu-close { animation:dsh-fe-menu-out .12s ease-in forwards; }',
+          '@keyframes dsh-fe-menu-in { from { opacity:0; transform:translateY(-5px) scale(.94); } to { opacity:1; transform:none; } }',
+          '@keyframes dsh-fe-menu-out { from { opacity:1; transform:none; } to { opacity:0; transform:translateY(-5px) scale(.94); } }',
+          '.dsh-fe-sess-menu-item { min-width:calc(2 * 1em + 10px); height:24px; display:flex; align-items:center; justify-content:center; padding:0 5px; border:none; background:transparent; border-radius:6px; color:var(--dsw-alias-label-secondary); font-size:12px; white-space:nowrap; cursor:pointer; transition:background .12s ease, color .12s ease; }',
           '.dsh-fe-sess-menu-item:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); color:var(--dsw-alias-label-primary); }',
           '.dsh-fe-sess-menu-item-no { color:var(--dsw-alias-state-error-primary); }',
           '.dsh-fe-sess-menu-item-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); color:var(--dsw-alias-state-error-primary); }',
@@ -937,19 +944,20 @@ window.__ModuleLoader__.load({
           '.dsh-fe-mgbtn:focus-visible { opacity:1; outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
           '.dsh-fe-mgbtn-no { color:var(--dsw-alias-state-error-primary); }',
           '.dsh-fe-mgbtn-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); color:var(--dsw-alias-state-error-primary); }',
-          // Checkbox column in manage mode: a small rounded square; checked =
-          // business-blue fill with a light check mark. The warning flash
-          // (delete pressed with nothing selected) paints every visible
-          // checkbox orange-yellow, shakes it twice and fades back — a single
-          // keyframe replayed by remounting the boxes on each warn tick.
-          '.dsh-fe-chk { width:15px; height:15px; flex:none; display:inline-flex; align-items:center; justify-content:center; border:1.5px solid color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); border-radius:4px; background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); color:transparent; cursor:pointer; transition:background .18s ease, border-color .18s ease, color .18s ease; }',
+          // Checkbox column in manage mode: a small rounded square (v1.20.1
+          // shrunk one step: 15 → 13px, mark 12 → 10px); checked = business-
+          // blue fill with a light check mark. The warning flash (delete
+          // pressed with nothing selected) paints every visible checkbox
+          // orange-yellow, shakes it twice and fades back — a single keyframe
+          // replayed by remounting the boxes on each warn tick.
+          '.dsh-fe-chk { width:13px; height:13px; flex:none; display:inline-flex; align-items:center; justify-content:center; border:1.5px solid color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); border-radius:3.5px; background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); color:transparent; cursor:pointer; transition:background .18s ease, border-color .18s ease, color .18s ease; }',
           '.dsh-fe-chk:hover { border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 72%, transparent); }',
           '.dsh-fe-chk-on { background:var(--dsw-alias-state-business-primary, var(--dsw-alias-label-primary)); border-color:transparent; color:var(--dsw-alias-bg-base); }',
           '.dsh-fe-chk-dis { opacity:.35; cursor:default; }',
           '.dsh-fe-sess-sel { background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 12%, transparent); }',
           '@keyframes dsh-fe-chk-warn { 0% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } 10% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 20% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 35% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 50% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 65% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 78% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 100% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } }',
           '.dsh-fe-chk-warn { animation:dsh-fe-chk-warn 1.05s ease-in-out; }',
-          '@media (prefers-reduced-motion: reduce) { .dsh-fe-sess-time, .dsh-fe-sess-dots, .dsh-fe-sess-menu-item, .dsh-fe-mgbtn, .dsh-fe-chk { transition:none; } .dsh-fe-chk-warn { animation:none; background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); } }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-sess-time, .dsh-fe-sess-dots, .dsh-fe-sess-menu-item, .dsh-fe-mgbtn, .dsh-fe-chk { transition:none; } .dsh-fe-sess-menu { animation:none; } .dsh-fe-sess-menu-close { animation:none; } .dsh-fe-chk-warn { animation:none; background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -1026,11 +1034,13 @@ window.__ModuleLoader__.load({
         // the row baseline; pin = pushpin (head + needle); trash = bin with
         // lid and handle; manage = three slider lines with knobs (batch
         // selection); check = the checkbox mark (reuses the decision-glyph
-        // geometry, drawn small and bold for a 15px box).
-        const IconDots = () => React.createElement('svg', { ...svgBase, width: 14, height: 14, viewBox: '0 0 14 14' }, [
-          React.createElement('circle', { cx: 3, cy: 7, r: 1.5, fill: 'currentColor', stroke: 'none' }),
-          React.createElement('circle', { cx: 7, cy: 7, r: 1.5, fill: 'currentColor', stroke: 'none' }),
-          React.createElement('circle', { cx: 11, cy: 7, r: 1.5, fill: 'currentColor', stroke: 'none' }),
+        // geometry, drawn small and bold for a 13px box).
+        // v1.20.1: the three dots spread wider (20px glyph field instead of
+        // 14) so the control reads clearly next to the time label.
+        const IconDots = () => React.createElement('svg', { ...svgBase, width: 20, height: 14, viewBox: '0 0 20 14' }, [
+          React.createElement('circle', { cx: 3, cy: 7, r: 1.6, fill: 'currentColor', stroke: 'none' }),
+          React.createElement('circle', { cx: 10, cy: 7, r: 1.6, fill: 'currentColor', stroke: 'none' }),
+          React.createElement('circle', { cx: 17, cy: 7, r: 1.6, fill: 'currentColor', stroke: 'none' }),
         ])
         const IconPin = () => I(14, '0 0 14 14', [
           P('M7 1.6 L9.1 3.7 V5.9 L10.8 8.2 H3.2 L4.9 5.9 V3.7 Z'),
@@ -1041,15 +1051,18 @@ window.__ModuleLoader__.load({
           P('M5.3 3.8 V2.6 a.9 .9 0 0 1 .9 -.9 h1.6 a.9 .9 0 0 1 .9 .9 V3.8'),
           P('M4.1 3.8 L4.6 10.9 a1 1 0 0 0 1 .9 h2.8 a1 1 0 0 0 1 -.9 L9.9 3.8'),
         ])
+        // v1.20.1: manage glyph — two-row checklist (first row checked) reads
+        // as "select/批量管理" — the old three-slider icon was too busy at
+        // 14px. Boxes are 4.4px rounded squares, the check sits cleanly
+        // inside the first one.
         const IconManage = () => React.createElement('svg', { ...svgBase, width: 14, height: 14, viewBox: '0 0 14 14' }, [
-          P('M2.5 4 H11.5'),
-          React.createElement('circle', { cx: 8.8, cy: 4, r: 1.7 }),
-          P('M2.5 7 H11.5'),
-          React.createElement('circle', { cx: 5.2, cy: 7, r: 1.7 }),
-          P('M2.5 10 H11.5'),
-          React.createElement('circle', { cx: 7, cy: 10, r: 1.7 }),
+          React.createElement('rect', { x: 2.3, y: 2.0, width: 4.4, height: 4.4, rx: 1 }),
+          P('M3.6 4.35 L4.35 5.15 L5.5 3.8'),
+          P('M8.2 4.2 H11.7'),
+          React.createElement('rect', { x: 2.3, y: 7.6, width: 4.4, height: 4.4, rx: 1 }),
+          P('M8.2 9.8 H11.7'),
         ])
-        const IconChk = () => I(12, '0 0 14 14', [P('M3.4 7.2 L6 9.6 L10.8 4.4')], { strokeWidth: 2.2 })
+        const IconChk = () => I(10, '0 0 14 14', [P('M3.4 7.2 L6 9.6 L10.8 4.4')], { strokeWidth: 2.4 })
         const IconBtn = (props) => React.createElement('button', {
           type: 'button',
           title: props.title,
@@ -1154,7 +1167,14 @@ window.__ModuleLoader__.load({
           // v1.20: session-row dot menu (which session's action card is open),
           // manage mode (batch select/delete), selected ids, warning flash
           // state, confirm dialog and the in-flight delete flag.
+          // v1.20.1: the menu is a fixed-position floating mini dropdown
+          // anchored under the dots — menuPos holds the viewport anchor from
+          // the dots' bounding rect, menuClosing runs the collapse animation
+          // before unmount.
           const [menuFor, setMenuFor] = React.useState(null)
+          const [menuPos, setMenuPos] = React.useState(null)
+          const [menuClosing, setMenuClosing] = React.useState(false)
+          const menuTimer = React.useState({ h: null })[0]
           const [managing, setManaging] = React.useState(false)
           const [sel, setSel] = React.useState(null)
           const [warnOn, setWarnOn] = React.useState(false)
@@ -1165,7 +1185,25 @@ window.__ModuleLoader__.load({
           const [deleting, setDeleting] = React.useState(false)
           const [pinTick, setPinTick] = React.useState(0)
           React.useEffect(() => pinStore.subscribe(() => setPinTick((n) => n + 1)), [])
-          React.useEffect(() => () => { if (warnRef.c) { try { warnRef.c() } catch (e) {} } }, [])
+          React.useEffect(() => () => {
+            if (warnRef.c) { try { warnRef.c() } catch (e) {} }
+            if (menuTimer.h) { try { menuTimer.h() } catch (e) {} }
+          }, [])
+          const openMenu = (id, rect) => {
+            if (menuFor === id) { closeMenu(); return }
+            if (menuTimer.h) { try { menuTimer.h() } catch (e) {} }
+            setMenuClosing(false)
+            setMenuFor(id)
+            if (rect) {
+              setMenuPos({ top: rect.bottom + 4, right: (window.innerWidth || 0) - rect.right })
+            }
+          }
+          const closeMenu = () => {
+            if (menuFor === null) return
+            setMenuClosing(true)
+            if (menuTimer.h) { try { menuTimer.h() } catch (e) {} }
+            menuTimer.h = ctx.timeout(() => { setMenuFor(null); setMenuClosing(false); menuTimer.h = null }, 130)
+          }
           // Delete pressed with nothing selected: repaint every visible
           // checkbox orange-yellow, shake twice, fade back. The tick remounts
           // the boxes so the CSS keyframe replays on each press; the timeout
@@ -1331,12 +1369,12 @@ window.__ModuleLoader__.load({
                   ? React.createElement('button', {
                       className: 'dsh-fe-iconbtn dsh-fe-mgbtn dsh-fe-mgbtn-on',
                       title: '取消管理',
-                      onClick: (ev) => { ev.stopPropagation(); setManaging(false); setSel(null); setMenuFor(null); setDelErr(null) },
+                      onClick: (ev) => { ev.stopPropagation(); closeMenu(); setManaging(false); setSel(null); setDelErr(null) },
                     }, IconClose())
                   : React.createElement('button', {
                       className: 'dsh-fe-iconbtn dsh-fe-mgbtn',
                       title: '管理会话（勾选后批量删除）',
-                      onClick: (ev) => { ev.stopPropagation(); setManaging(true); setSel(null); setMenuFor(null); setDelErr(null) },
+                      onClick: (ev) => { ev.stopPropagation(); closeMenu(); setManaging(true); setSel(null); setDelErr(null) },
                     }, IconManage()),
               ),
               secHistory ? React.createElement('div', null,
@@ -1352,7 +1390,7 @@ window.__ModuleLoader__.load({
                   const isCur = s.id === currentId
                   const chkOn = managing && sel !== null && sel.has(s.id)
                   const chkDis = managing && isCur
-                  const row = React.createElement('div', {
+                  return React.createElement('div', {
                     key: s.id,
                     className: 'dsh-fe-sess' + (isCur ? ' dsh-fe-sess-cur' : '') + (chkOn ? ' dsh-fe-sess-sel' : ''),
                     onClick: () => ctx.sessions.open(s.id),
@@ -1377,30 +1415,44 @@ window.__ModuleLoader__.load({
                     React.createElement('button', {
                       className: 'dsh-fe-sess-dots',
                       title: '更多操作',
-                      onClick: (ev) => { ev.stopPropagation(); setMenuFor(menuFor === s.id ? null : s.id) },
+                      onClick: (ev) => {
+                        ev.stopPropagation()
+                        let rect = null
+                        try { rect = ev.currentTarget.getBoundingClientRect() } catch (e) {}
+                        openMenu(s.id, rect)
+                      },
                     }, IconDots()),
+                    // v1.20.1: floating mini dropdown (fixed-positioned so the
+                    // sidebar's scroll container never clips it), anchored
+                    // under the dots and right-aligned to them. Text-only
+                    // items, each two Chinese characters wide (删除 / 置顶,
+                    // or 删除 / 取消 once pinned); expand + collapse animate.
+                    menuFor === s.id
+                      ? React.createElement('div', {
+                          className: 'dsh-fe-sess-menu' + (menuClosing ? ' dsh-fe-sess-menu-close' : ''),
+                          style: menuPos ? { top: menuPos.top, right: menuPos.right } : null,
+                          onClick: (ev) => ev.stopPropagation(),
+                        },
+                          React.createElement('button', {
+                            className: 'dsh-fe-sess-menu-item dsh-fe-sess-menu-item-no',
+                            disabled: isCur,
+                            title: isCur ? '当前会话，不能删除' : '删除此会话（不可恢复）',
+                            onClick: (ev) => { ev.stopPropagation(); if (isCur) return; closeMenu(); confirmAndDel([s.id]) },
+                          }, '删除'),
+                          React.createElement('button', {
+                            className: 'dsh-fe-sess-menu-item',
+                            title: pinned ? '取消置顶' : '置顶到最上方',
+                            onClick: (ev) => { ev.stopPropagation(); pinStore.toggle(s.id); closeMenu() },
+                          }, pinned ? '取消' : '置顶'),
+                        )
+                      : null,
                   )
-                  const menu = menuFor === s.id
-                    ? React.createElement('div', { className: 'dsh-fe-sess-menu' },
-                        React.createElement('button', {
-                          className: 'dsh-fe-sess-menu-item dsh-fe-sess-menu-item-no',
-                          disabled: isCur,
-                          title: isCur ? '当前会话，不能删除' : '删除此会话（不可恢复）',
-                          onClick: () => { if (isCur) return; setMenuFor(null); confirmAndDel([s.id]) },
-                        }, IconTrash(), '删除'),
-                        React.createElement('button', {
-                          className: 'dsh-fe-sess-menu-item',
-                          title: pinned ? '取消置顶' : '置顶到最上方',
-                          onClick: () => { pinStore.toggle(s.id); setMenuFor(null) },
-                        }, IconPin(), pinned ? '取消置顶' : '置顶'),
-                      )
-                    : null
-                  return React.createElement(React.Fragment, { key: s.id }, row, menu)
                 }),
                 // v1.20: click-away veil for the open dot menu (a plain React
                 // overlay — no global listeners, which are unreliable in this
-                // shell; the menu card itself sits a level above it).
-                menuFor ? React.createElement('div', { className: 'dsh-fe-menu-veil', onClick: () => setMenuFor(null) }) : null,
+                // shell; the menu card itself sits a level above it). Both
+                // directions animate through closeMenu().
+                menuFor ? React.createElement('div', { className: 'dsh-fe-menu-veil', onClick: () => closeMenu() }) : null,
                 // v1.19: overflow control — same semantics, texts and
                 // visual language as the shell's sessionOverflowButton
                 // (locales: sessions.expand = "展开其余 {n} 个会话" /
