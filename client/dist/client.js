@@ -543,7 +543,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.20.1: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.20.2: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -921,11 +921,14 @@ window.__ModuleLoader__.load({
           '.dsh-fe-sess { position:relative; }',
           '.dsh-fe-sess-time { transition:opacity .12s ease; }',
           '.dsh-fe-sess:hover .dsh-fe-sess-time { opacity:0; }',
-          '.dsh-fe-sess-dots { position:absolute; right:5px; top:50%; transform:translateY(-50%); width:30px; height:22px; display:inline-flex; align-items:center; justify-content:center; border:none; background:transparent; border-radius:6px; color:var(--dsw-alias-label-secondary); opacity:0; cursor:pointer; transition:opacity .12s ease, background .12s ease, color .12s ease; }',
+          '.dsh-fe-sess-dots { position:absolute; right:6px; top:50%; transform:translateY(-50%); width:24px; height:20px; display:inline-flex; align-items:center; justify-content:center; border:none; background:transparent; border-radius:5px; color:var(--dsw-alias-label-secondary); opacity:0; cursor:pointer; transition:opacity .12s ease, background .12s ease, color .12s ease; }',
           '.dsh-fe-sess:hover .dsh-fe-sess-dots { opacity:1; }',
           '.dsh-fe-sess-dots:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 16%, transparent); color:var(--dsw-alias-label-primary); }',
           '.dsh-fe-sess-dots:focus-visible { opacity:1; outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
-          '.dsh-fe-sess-pin { flex:none; display:inline-flex; color:var(--dsw-alias-state-warn-primary); }',
+          // v1.20.2: the pin badge is clickable — clicking it unpins directly.
+          '.dsh-fe-sess-pin { flex:none; display:inline-flex; margin-left:-1px; padding:2px; border-radius:5px; color:var(--dsw-alias-state-warn-primary); cursor:pointer; transition:background .12s ease, color .12s ease; }',
+          '.dsh-fe-sess-pin:hover { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 16%, transparent); color:var(--dsw-alias-state-warn-primary); }',
+          '.dsh-fe-sess-pin:focus-visible { outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
           '.dsh-fe-menu-veil { position:fixed; inset:0; z-index:29; }',
           '.dsh-fe-sess-menu { position:fixed; z-index:31; display:flex; flex-direction:column; gap:1px; padding:3px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); transform-origin:top right; animation:dsh-fe-menu-in .14s ease-out; }',
           '.dsh-fe-sess-menu-close { animation:dsh-fe-menu-out .12s ease-in forwards; }',
@@ -944,6 +947,12 @@ window.__ModuleLoader__.load({
           '.dsh-fe-mgbtn:focus-visible { opacity:1; outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
           '.dsh-fe-mgbtn-no { color:var(--dsw-alias-state-error-primary); }',
           '.dsh-fe-mgbtn-no:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); color:var(--dsw-alias-state-error-primary); }',
+          // v1.20.2: rest state is a plain text button「管理」(no icon) that
+          // fades in on header hover; the manage state keeps the trash +
+          // cancel icon pair.
+          '.dsh-fe-mgbtn-txt { border:none; background:transparent; padding:1px 8px; border-radius:6px; font-size:12px; color:var(--dsw-alias-label-secondary); white-space:nowrap; cursor:pointer; }',
+          '.dsh-fe-mgbtn-txt:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); color:var(--dsw-alias-label-primary); }',
+          '.dsh-fe-mgbtn-txt:focus-visible { outline:2px solid color-mix(in srgb, var(--dsw-alias-label-primary) 45%, transparent); outline-offset:1px; }',
           // Checkbox column in manage mode: a small rounded square (v1.20.1
           // shrunk one step: 15 → 13px, mark 12 → 10px); checked = business-
           // blue fill with a light check mark. The warning flash (delete
@@ -957,7 +966,7 @@ window.__ModuleLoader__.load({
           '.dsh-fe-sess-sel { background:color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)) 12%, transparent); }',
           '@keyframes dsh-fe-chk-warn { 0% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } 10% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 20% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 35% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 50% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 65% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 78% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 100% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } }',
           '.dsh-fe-chk-warn { animation:dsh-fe-chk-warn 1.05s ease-in-out; }',
-          '@media (prefers-reduced-motion: reduce) { .dsh-fe-sess-time, .dsh-fe-sess-dots, .dsh-fe-sess-menu-item, .dsh-fe-mgbtn, .dsh-fe-chk { transition:none; } .dsh-fe-sess-menu { animation:none; } .dsh-fe-sess-menu-close { animation:none; } .dsh-fe-chk-warn { animation:none; background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); } }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-sess-time, .dsh-fe-sess-dots, .dsh-fe-sess-pin, .dsh-fe-sess-menu-item, .dsh-fe-mgbtn, .dsh-fe-mgbtn-txt, .dsh-fe-chk { transition:none; } .dsh-fe-sess-menu { animation:none; } .dsh-fe-sess-menu-close { animation:none; } .dsh-fe-chk-warn { animation:none; background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -1030,37 +1039,30 @@ window.__ModuleLoader__.load({
         const IconPencil = () => I(14, '0 0 14 14', [P('M12 3.6 L10.4 2 a1.1 1.1 0 0 0 -1.6 0 L3.4 7.4 V10.6 H6.6 L12 5.2 a1.1 1.1 0 0 0 0 -1.6 Z'), P('M8.6 2.8 L11.2 5.4')])
         const IconPlus = () => I(12, '0 0 14 14', [P('M7 2.5 V11.5'), P('M2.5 7 H11.5')])
         const IconClose = () => I(11, '0 0 14 14', [P('M4 4 L10 10'), P('M10 4 L4 10')])
-        // v1.20: session-history controls. Dots = steady 1.5px r circles on
-        // the row baseline; pin = pushpin (head + needle); trash = bin with
-        // lid and handle; manage = three slider lines with knobs (batch
-        // selection); check = the checkbox mark (reuses the decision-glyph
+        // v1.20: session-history controls. Dots = three steady dots on the
+        // row baseline; pin = ball-head pin (ringed head + center dot +
+        // needle — clickable to unpin, v1.20.2); trash = bin with lid and
+        // handle; check = the checkbox mark (reuses the decision-glyph
         // geometry, drawn small and bold for a 13px box).
-        // v1.20.1: the three dots spread wider (20px glyph field instead of
-        // 14) so the control reads clearly next to the time label.
-        const IconDots = () => React.createElement('svg', { ...svgBase, width: 20, height: 14, viewBox: '0 0 20 14' }, [
-          React.createElement('circle', { cx: 3, cy: 7, r: 1.6, fill: 'currentColor', stroke: 'none' }),
-          React.createElement('circle', { cx: 10, cy: 7, r: 1.6, fill: 'currentColor', stroke: 'none' }),
-          React.createElement('circle', { cx: 17, cy: 7, r: 1.6, fill: 'currentColor', stroke: 'none' }),
+        // v1.20.1: dots at 20px field. v1.20.2: back down to a compact 16px
+        // field (smaller dots, narrower button) per user feedback.
+        const IconDots = () => React.createElement('svg', { ...svgBase, width: 16, height: 14, viewBox: '0 0 16 14' }, [
+          React.createElement('circle', { cx: 3, cy: 7, r: 1.4, fill: 'currentColor', stroke: 'none' }),
+          React.createElement('circle', { cx: 8, cy: 7, r: 1.4, fill: 'currentColor', stroke: 'none' }),
+          React.createElement('circle', { cx: 13, cy: 7, r: 1.4, fill: 'currentColor', stroke: 'none' }),
         ])
-        const IconPin = () => I(14, '0 0 14 14', [
-          P('M7 1.6 L9.1 3.7 V5.9 L10.8 8.2 H3.2 L4.9 5.9 V3.7 Z'),
-          P('M7 8.2 V12.6'),
+        // v1.20.2: redrawn pin — a ball-head pin seen from the front: ring
+        // head with a solid center dot and a clean needle. Reads brighter and
+        // friendlier than the old pentagon pushpin at 14px.
+        const IconPin = () => React.createElement('svg', { ...svgBase, width: 14, height: 14, viewBox: '0 0 14 14' }, [
+          React.createElement('circle', { cx: 7, cy: 4.2, r: 2.35 }),
+          React.createElement('circle', { cx: 7, cy: 4.2, r: 0.8, fill: 'currentColor', stroke: 'none' }),
+          P('M7 6.55 V12'),
         ])
         const IconTrash = () => I(14, '0 0 14 14', [
           P('M2.8 3.8 H11.2'),
           P('M5.3 3.8 V2.6 a.9 .9 0 0 1 .9 -.9 h1.6 a.9 .9 0 0 1 .9 .9 V3.8'),
           P('M4.1 3.8 L4.6 10.9 a1 1 0 0 0 1 .9 h2.8 a1 1 0 0 0 1 -.9 L9.9 3.8'),
-        ])
-        // v1.20.1: manage glyph — two-row checklist (first row checked) reads
-        // as "select/批量管理" — the old three-slider icon was too busy at
-        // 14px. Boxes are 4.4px rounded squares, the check sits cleanly
-        // inside the first one.
-        const IconManage = () => React.createElement('svg', { ...svgBase, width: 14, height: 14, viewBox: '0 0 14 14' }, [
-          React.createElement('rect', { x: 2.3, y: 2.0, width: 4.4, height: 4.4, rx: 1 }),
-          P('M3.6 4.35 L4.35 5.15 L5.5 3.8'),
-          P('M8.2 4.2 H11.7'),
-          React.createElement('rect', { x: 2.3, y: 7.6, width: 4.4, height: 4.4, rx: 1 }),
-          P('M8.2 9.8 H11.7'),
         ])
         const IconChk = () => I(10, '0 0 14 14', [P('M3.4 7.2 L6 9.6 L10.8 4.4')], { strokeWidth: 2.4 })
         const IconBtn = (props) => React.createElement('button', {
@@ -1372,10 +1374,10 @@ window.__ModuleLoader__.load({
                       onClick: (ev) => { ev.stopPropagation(); closeMenu(); setManaging(false); setSel(null); setDelErr(null) },
                     }, IconClose())
                   : React.createElement('button', {
-                      className: 'dsh-fe-iconbtn dsh-fe-mgbtn',
+                      className: 'dsh-fe-mgbtn dsh-fe-mgbtn-txt',
                       title: '管理会话（勾选后批量删除）',
                       onClick: (ev) => { ev.stopPropagation(); closeMenu(); setManaging(true); setSel(null); setDelErr(null) },
-                    }, IconManage()),
+                    }, '管理'),
               ),
               secHistory ? React.createElement('div', null,
                 React.createElement('input', {
@@ -1410,7 +1412,16 @@ window.__ModuleLoader__.load({
                           ? IconRunning()
                           : React.createElement('span', { className: 'dsh-fe-dot' + (s.completed ? ' dsh-fe-dot-done' : '') })),
                     React.createElement('span', { className: 'dsh-fe-sess-name' }, s.displayTitle),
-                    pinned ? React.createElement('span', { className: 'dsh-fe-sess-pin', title: '已置顶' }, IconPin()) : null,
+                    // v1.20.2: the pin badge is itself the unpin control —
+                    // clicking it unpins right away (the dot menu no longer
+                    // carries a 取消 row once pinned).
+                    pinned ? React.createElement('span', {
+                      className: 'dsh-fe-sess-pin',
+                      role: 'button',
+                      tabIndex: 0,
+                      title: '点击取消置顶',
+                      onClick: (ev) => { ev.stopPropagation(); pinStore.toggle(s.id); closeMenu() },
+                    }, IconPin()) : null,
                     React.createElement('span', { className: 'dsh-fe-sess-time' }, timeAgo(s.updatedAt, Date.now())),
                     React.createElement('button', {
                       className: 'dsh-fe-sess-dots',
@@ -1425,8 +1436,9 @@ window.__ModuleLoader__.load({
                     // v1.20.1: floating mini dropdown (fixed-positioned so the
                     // sidebar's scroll container never clips it), anchored
                     // under the dots and right-aligned to them. Text-only
-                    // items, each two Chinese characters wide (删除 / 置顶,
-                    // or 删除 / 取消 once pinned); expand + collapse animate.
+                    // items, each two Chinese characters wide. v1.20.2: once
+                    // pinned the menu shows ONLY 删除 — unpinning happens by
+                    // clicking the pin badge itself; expand/collapse animate.
                     menuFor === s.id
                       ? React.createElement('div', {
                           className: 'dsh-fe-sess-menu' + (menuClosing ? ' dsh-fe-sess-menu-close' : ''),
@@ -1439,11 +1451,11 @@ window.__ModuleLoader__.load({
                             title: isCur ? '当前会话，不能删除' : '删除此会话（不可恢复）',
                             onClick: (ev) => { ev.stopPropagation(); if (isCur) return; closeMenu(); confirmAndDel([s.id]) },
                           }, '删除'),
-                          React.createElement('button', {
+                          pinned ? null : React.createElement('button', {
                             className: 'dsh-fe-sess-menu-item',
-                            title: pinned ? '取消置顶' : '置顶到最上方',
+                            title: '置顶到最上方',
                             onClick: (ev) => { ev.stopPropagation(); pinStore.toggle(s.id); closeMenu() },
-                          }, pinned ? '取消' : '置顶'),
+                          }, '置顶'),
                         )
                       : null,
                   )
