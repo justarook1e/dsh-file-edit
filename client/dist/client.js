@@ -543,7 +543,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.21.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.22.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -990,6 +990,28 @@ window.__ModuleLoader__.load({
           '@keyframes dsh-fe-chk-warn { 0% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } 10% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 20% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 35% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 50% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(-4px); } 65% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(4px); } 78% { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); transform:translateX(0); } 100% { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 8%, transparent); border-color:color-mix(in srgb, var(--dsw-alias-label-secondary) 45%, transparent); transform:translateX(0); } }',
           '.dsh-fe-chk-warn { animation:dsh-fe-chk-warn 1.05s ease-in-out; }',
           '@media (prefers-reduced-motion: reduce) { .dsh-fe-sess-time, .dsh-fe-sess-dots, .dsh-fe-sess-pin, .dsh-fe-sess-menu-item, .dsh-fe-mgbtn, .dsh-fe-mgbtn-txt, .dsh-fe-chk { transition:none; } .dsh-fe-sess-menu { animation:none; } .dsh-fe-sess-menu-close { animation:none; } .dsh-fe-chk-warn { animation:none; background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-color:var(--dsw-alias-state-warn-primary); } .dsh-fe-sess-in { animation:none; } .dsh-fe-sess-out { animation:none; } }',
+          // ---- v1.22: explicit selection + in-view search ----
+          // Text selection is allowed on every code row (the shell's default
+          // styles may restrict it; the contentEditable spans stay selectable
+          // regardless, and the explicit rule keeps read-only rows too).
+          '.dsh-fe-diff, .dsh-fe-code, .dsh-fe-line, .dsh-fe-txwrap, .dsh-fe-txwrap .dsh-fe-tx { user-select:text; -webkit-user-select:text; }',
+          // Search pill: input + match counter + up/down arrows share ONE
+          // background (the pill) so the controls read as an integrated
+          // search box; it pins to the left of the diff jump pill in the
+          // same zero-height sticky strip.
+          '.dsh-fe-searchbar { display:flex; flex:none; align-items:center; gap:2px; margin:8px 6px 0 12px; padding:2px 3px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv1, 0 2px 4px 0 rgba(0,0,0,.05)); font-family:ui-monospace,Consolas,monospace; font-size:11.5px; color:var(--dsw-alias-label-primary); }',
+          '.dsh-fe-searchbox { border:none; outline:none; background:transparent; color:var(--dsw-alias-label-primary); font:inherit; padding:3px 2px; min-width:80px; max-width:240px; }',
+          '.dsh-fe-searchbox::placeholder { color:var(--dsw-alias-label-secondary); opacity:.8; }',
+          '.dsh-fe-searchcount { flex:none; padding:0 3px; color:var(--dsw-alias-label-secondary); font-size:10.5px; white-space:nowrap; line-height:1; }',
+          '.dsh-fe-searchbtn { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; flex:none; border:none; background:transparent; border-radius:6px; color:var(--dsw-alias-label-secondary); cursor:pointer; padding:0; }',
+          '.dsh-fe-searchbtn:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 14%, transparent); color:var(--dsw-alias-label-primary); }',
+          '.dsh-fe-searchbtn:focus-visible { outline:1px solid var(--dsw-alias-state-business-primary, var(--dsw-alias-label-secondary)); outline-offset:-1px; }',
+          // Search hit marks (wrapped into the pointer-events:none overlay
+          // layer): amber like most editors; the current hit gets the
+          // stronger fill + outline.
+          '.dsh-fe-hit { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-radius:2px; }',
+          '.dsh-fe-hit-cur { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 65%, transparent); outline:1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary) 90%, transparent); border-radius:2px; }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-searchbar { transition:none; } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -2781,6 +2803,9 @@ window.__ModuleLoader__.load({
             } else {
               hl.textContent = text
             }
+            // v1.22: search marks ride the overlay (module state, row = the
+            // editable's model index).
+            applySearchMarks(hl, 'm' + (el.getAttribute('data-m') || ''))
           } catch (e) {}
         }
         const syncHl = (el) => {
@@ -2792,6 +2817,85 @@ window.__ModuleLoader__.load({
             const els = Array.from(hlPending)
             for (const e of els) paintHlNow(e)
           })
+        }
+
+        // ---------- v1.22: in-view search (Ctrl+F) ----------
+        // Shared search state between DiffPane (bar + navigation) and the two
+        // highlight painters. Marks are wrapped into the pointer-events:none
+        // overlay layer (`.dsh-fe-hl`) only — React never owns those nodes
+        // after the shell fills them, so imperative wrapping is safe (same
+        // rule as v1.13.2). Corpus = the edit model's rows in display order
+        // (current content incl. hunk-new rows; deleted rows are not
+        // searched). matches: flat list in display order, one entry per
+        // (hit × row-segment); byRow maps row key -> that row's entries.
+        const searchState = { on: false, query: '', matches: [], byRow: new Map(), cur: -1, dirty: false, lastModel: null, lastVersion: -1 }
+        // Wrap every occurrence of the current query inside a freshly painted
+        // highlight overlay. Occurrence ranges are row-local; the walk uses a
+        // cumulative offset over the overlay's text nodes (tokens) and splits
+        // any node overlapping a range into pre/hit/post pieces.
+        function applySearchMarks(hl, rowKey) {
+          if (!searchState.on || !searchState.query) return
+          const occ = searchState.byRow.get(rowKey)
+          if (!occ || occ.length === 0) return
+          const cursor = { at: 0 }
+          const walk = (parent) => {
+            let child = parent.firstChild
+            while (child) {
+              const nxt = child.nextSibling
+              if (child.nodeType === 3) {
+                const start = cursor.at
+                const end = start + child.textContent.length
+                cursor.at = end
+                for (const o of occ) {
+                  const os = Math.max(o.pos, start)
+                  const oe = Math.min(o.pos + o.len, end)
+                  if (os >= oe) continue
+                  const isCur = searchState.matches[searchState.cur] === o
+                  const parent = child.parentNode
+                  if (!parent) break
+                  const pre = document.createTextNode(child.textContent.slice(0, os - start))
+                  const hit = document.createElement('span')
+                  hit.className = 'dsh-fe-hit' + (isCur ? ' dsh-fe-hit-cur' : '')
+                  hit.textContent = child.textContent.slice(os - start, oe - start)
+                  const post = document.createTextNode(child.textContent.slice(oe - start))
+                  parent.replaceChild(pre, child)
+                  parent.insertBefore(hit, pre.nextSibling)
+                  parent.insertBefore(post, hit.nextSibling)
+                  break
+                }
+              } else if (child.nodeType === 1 && child.firstChild) {
+                walk(child)
+              }
+              child = nxt
+            }
+          }
+          walk(hl)
+        }
+        // Model-based text of the current selection (row texts joined with
+        // \n) — the browser's own toString() concatenates the per-line spans
+        // without newlines. Returns null when the selection is not on the
+        // model (single-row model selections ARE included) so callers can
+        // fall back to the browser default (old read-only rows etc.).
+        function selectedModelText(mm) {
+          try {
+            const sel = window.getSelection && window.getSelection()
+            if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null
+            const a = rowOfNodeEl(sel.anchorNode)
+            const f = rowOfNodeEl(sel.focusNode)
+            if (!a || !f) return null
+            const anchor = { row: a.row, pos: offsetInEl(a.el, sel.anchorNode, sel.anchorOffset) }
+            const focus = { row: f.row, pos: offsetInEl(f.el, sel.focusNode, sel.focusOffset) }
+            const p1 = (anchor.row < focus.row || (anchor.row === focus.row && anchor.pos <= focus.pos)) ? anchor : focus
+            const p2 = p1 === anchor ? focus : anchor
+            let text = ''
+            for (let r = p1.row; r <= p2.row && r < mm.lines.length; r++) {
+              if (r > p1.row) text += '\n'
+              const from = r === p1.row ? p1.pos : 0
+              const to = r === p2.row ? p2.pos : mm.lines[r].length
+              text += mm.lines[r].slice(from, to)
+            }
+            return text
+          } catch (e) { return null }
         }
 
         const LANG_BY_EXT = {
@@ -3678,7 +3782,39 @@ window.__ModuleLoader__.load({
           // into the next file's model creation.
           const [mdEdit, setMdEdit] = React.useState(null)
           const mdEditRef = React.useState({ v: null })[0]
-          React.useEffect(() => { setMdEdit(null); mdEditRef.v = null }, [path, sid])
+          // v1.22: in-view search. searchTick re-renders the pane (the ref
+          // painters re-run and re-wrap overlay marks) whenever the module-
+          // level searchState changes.
+          const [searchTick, setSearchTick] = React.useState(0)
+          const inpRef = React.useState({ el: null })[0]
+          const focusSearchRef = React.useState({ n: 0 })[0]
+          // v1.22 multi-line drag selection: anchor/caret records (see the
+          // handlers near onCodeKeyDown). Kept with the other hooks — this
+          // pane has early returns, and hooks must stay unconditional.
+          const dragSel = React.useState({ active: false, sx: 0, sy: 0, node: null, off: 0, row: -1, moved: false })[0]
+          const bumpSearch = () => setSearchTick((n) => n + 1)
+          const resetSearch = () => {
+            searchState.on = false
+            searchState.query = ''
+            searchState.matches = []
+            searchState.byRow = new Map()
+            searchState.cur = -1
+            searchState.dirty = true
+          }
+          React.useEffect(() => {
+            setMdEdit(null)
+            mdEditRef.v = null
+            // v1.22: search state is module-level — reset on file/session switch.
+            resetSearch()
+            setSearchTick((n) => n + 1)
+          }, [path, sid])
+          // v1.22: focus the search box after Ctrl+F opens it.
+          React.useEffect(() => {
+            if (focusSearchRef.n > 0 && inpRef.el) {
+              focusSearchRef.n = 0
+              try { inpRef.el.focus(); inpRef.el.select() } catch (e) {}
+            }
+          }, [searchTick])
           // v1.13: the per-file edit model drives the code area. modelKey
           // identifies the model in the module-level registry; modelVersion
           // re-renders after every structural model change (undo/redo/Enter/
@@ -4363,60 +4499,121 @@ window.__ModuleLoader__.load({
               }
             }
             if (mod && key === 'c') {
-              // Multi-row copy: the browser concatenates inline spans without
+              // Copy: the browser concatenates the per-line spans without
               // newlines — build the exact selected text from the model.
-              try {
-                const sel = window.getSelection && window.getSelection()
-                if (!sel || !sel.rangeCount || sel.isCollapsed) return
-                const a = rowOfNodeEl(sel.anchorNode)
-                const f = rowOfNodeEl(sel.focusNode)
-                if (!a || !f || a.row === f.row) return
-                stop()
-                const anchor = { row: a.row, pos: offsetInEl(a.el, sel.anchorNode, sel.anchorOffset) }
-                const focus = { row: f.row, pos: offsetInEl(f.el, sel.focusNode, sel.focusOffset) }
-                const p1 = (anchor.row < focus.row || (anchor.row === focus.row && anchor.pos <= focus.pos)) ? anchor : focus
-                const p2 = p1 === anchor ? focus : anchor
-                let text = ''
-                for (let r = p1.row; r <= p2.row && r < mm.lines.length; r++) {
-                  if (r > p1.row) text += '\n'
-                  const from = r === p1.row ? p1.pos : 0
-                  const to = r === p2.row ? p2.pos : mm.lines[r].length
-                  text += mm.lines[r].slice(from, to)
-                }
-                try {
-                  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(() => {})
-                } catch (e2) {}
-              } catch (e2) {}
-              return
-            }
-            if (mod && key === 'v') {
-              // Manual paste: the browser's default would splice block
-              // elements into the single-line spans. Read the clipboard and
-              // insert through the model (multi-line text splits rows).
+              // Single-line model selections are handled here too (the text
+              // is identical); non-model selections (old rows) fall through
+              // to the browser default.
+              const txt = selectedModelText(mm)
+              if (txt === null) return
               stop()
-              const info = caretModelPos(mm)
-              if (!info) return
-              let text = ''
               try {
-                const cd = ev.clipboardData || (window.clipboardData || null)
-                if (cd) text = cd.getData('text/plain') || ''
+                if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).catch(() => {})
               } catch (e2) {}
-              if (text === '') return
-              text = text.replace(/\r\n/g, '\n').replace(/\r/g, '')
-              const flush = flushLine(mm, info.row)
-              const patches = []
-              if (flush) patches.push(flush)
-              patches.push({ line: info.row, start: info.pos, removed: '', inserted: text })
-              if (patches.length) {
-                const nl = text.lastIndexOf('\n')
-                const lastRow = nl < 0 ? info.row : info.row + text.split('\n').length - 1
-                const lastPos = nl < 0 ? info.pos + text.length : text.length - nl - 1
-                mm.activeIdx = null
-                pushEntry(mm, patches, lastRow, lastPos)
-                mm.pendingCaret = { line: lastRow, pos: lastPos }
-              }
               return
             }
+            if (mod && key === 'f') {
+              // v1.22: open the in-view search bar (pre-filled with the
+              // current selection, if it lies on the model).
+              stop()
+              openSearch()
+              return
+            }
+          }
+          // v1.22 paste: the keydown event has NO clipboardData (that is a
+          // paste-event field), which is why the old Ctrl+V branch always saw
+          // an empty clipboard. Handle the real `paste` event instead — it
+          // fires for Ctrl+V and context-menu paste alike; preventDefault
+          // there cancels the native insertion into the contentEditable span
+          // while this handler inserts through the model instead.
+          const onCodePaste = (ev) => {
+            const t = ev.target
+            if (!t || !t.closest || !t.closest('.dsh-fe-line')) return
+            const mm = modelRef.m
+            if (!mm) return
+            const ed = t.closest('.dsh-fe-tx-edit')
+            if (!ed) return
+            ev.preventDefault()
+            ev.stopPropagation()
+            const info = caretModelPos(mm)
+            if (!info) return
+            let text = ''
+            try {
+              const cd = ev.clipboardData
+              if (cd) text = cd.getData('text/plain') || ''
+            } catch (e2) {}
+            if (text === '') return
+            text = text.replace(/\r\n/g, '\n').replace(/\r/g, '')
+            const flush = flushLine(mm, info.row)
+            const patches = []
+            if (flush) patches.push(flush)
+            patches.push({ line: info.row, start: info.pos, removed: '', inserted: text })
+            if (patches.length) {
+              const nl = text.lastIndexOf('\n')
+              const lastRow = nl < 0 ? info.row : info.row + text.split('\n').length - 1
+              const lastPos = nl < 0 ? info.pos + text.length : text.length - nl - 1
+              mm.activeIdx = null
+              pushEntry(mm, patches, lastRow, lastPos)
+              mm.pendingCaret = { line: lastRow, pos: lastPos }
+            }
+          }
+          // v1.22 multi-line mouse selection: Chromium clamps a drag to the
+          // editing host a drag starts in, so dragging from one per-line
+          // contentEditable to another never extended the selection. As soon
+          // as the drag leaves the anchor row, take over with a real DOM
+          // range built from caretRangeFromPoint endpoints (works across the
+          // transparent per-line spans; the row text and highlights stay
+          // intact). In-row drags keep the native gesture untouched.
+          const caretAtPoint = (x, y) => {
+            try {
+              if (typeof document.caretRangeFromPoint !== 'function') return null
+              const r = document.caretRangeFromPoint(x, y)
+              if (!r) return null
+              return { node: r.startContainer, off: r.startOffset }
+            } catch (e) { return null }
+          }
+          const rowKeyOfNode = (node) => {
+            let el = node
+            if (el && el.nodeType !== 1) el = el.parentElement
+            if (!el || !el.getAttribute || el.getAttribute('data-m') === null) return null
+            const v = Number(el.getAttribute('data-m'))
+            return Number.isInteger(v) ? v : null
+          }
+          const extendDragSelection = (ev) => {
+            if (!dragSel.active || !dragSel.moved) return
+            // Only engage when the anchor sits on a code row (not buttons,
+            // the line-number gutter or the hunk head).
+            if (dragSel.row === null || dragSel.row < 0) return
+            const cur = caretAtPoint(ev.clientX, ev.clientY)
+            if (!cur) return
+            const curRow = rowKeyOfNode(cur.node)
+            if (curRow === null || curRow === dragSel.row) return
+            // The drag crossed into another row — build the full range.
+            let start = dragSel.node && dragSel.off !== undefined ? { node: dragSel.node, off: dragSel.off } : null
+            if (!start) { const s0 = caretAtPoint(dragSel.sx, dragSel.sy); if (s0) start = s0 }
+            if (!start) return
+            let sel = null
+            try { sel = window.getSelection && window.getSelection() } catch (e) { return }
+            if (!sel) return
+            let aNode = start.node, aOff = start.off
+            let bNode = cur.node, bOff = cur.off
+            // swap so start <= end in document order
+            let swap = false
+            try {
+              const cmp = aNode.compareDocumentPosition(bNode)
+              if (cmp === 0) { if (aOff > bOff) swap = true }
+              else if (cmp & Node.DOCUMENT_POSITION_FOLLOWING) swap = true
+            } catch (e) {
+              if (curRow < dragSel.row) swap = true
+            }
+            if (swap) { const tn = aNode, to = aOff; aNode = bNode; aOff = bOff; bNode = tn; bOff = to }
+            try {
+              const range = document.createRange()
+              range.setStart(aNode, aOff)
+              range.setEnd(bNode, bOff)
+              sel.removeAllRanges()
+              sel.addRange(range)
+            } catch (e) {}
           }
           const saveCurrent = async () => {
             const mm = modelRef.m
@@ -4462,7 +4659,7 @@ window.__ModuleLoader__.load({
           // a child of this node" during commits, which unmounted the whole
           // root (the file view "disappearing" on Ctrl+S) and silently
           // updated detached text nodes (Ctrl+Z looking like a no-op).
-          const paintHl = (node, text, hlState) => {
+          const paintHl = (node, text, hlState, rowKey) => {
             const langId = node.getAttribute('data-lang') || ''
             const toks = langId ? lineTokensCached(text, langId, hlState) : null
             node.textContent = ''
@@ -4476,6 +4673,8 @@ window.__ModuleLoader__.load({
             } else {
               node.textContent = text
             }
+            // v1.22: search marks ride the overlay layer (display-only).
+            applySearchMarks(node, rowKey)
           }
           const renderModelRow = (r, cls, hlState) => {
             const text = r.text
@@ -4497,7 +4696,7 @@ window.__ModuleLoader__.load({
               },
                 React.createElement('span', {
                   className: 'dsh-fe-hl', 'data-hl': '1', 'data-lang': lang || '', 'aria-hidden': 'true',
-                  ref: (node) => { if (node && m.activeIdx !== r.model) paintHl(node, text, hlState) },
+                  ref: (node) => { if (node && m.activeIdx !== r.model) paintHl(node, text, hlState, 'm' + r.model) },
                 }),
                 React.createElement('span', {
                   className: 'dsh-fe-tx dsh-fe-tx-edit',
@@ -4759,6 +4958,165 @@ window.__ModuleLoader__.load({
             }, 30)
           }
           const curFocus = hunks.length > 0 ? Math.min(focusIdx === null ? 0 : focusIdx, hunks.length - 1) : 0
+          // ---------- v1.22: in-view search ----------
+          // Corpus = the edit model's rows in display order (context + hunk-
+          // new rows). Matches re-run only when the model/query changed; each
+          // render afterwards merely re-wraps overlay marks through the ref
+          // painters. Multi-line queries match the rows joined by '\n' and
+          // yield one segment entry per covered row.
+          const searchRows = searchState.on && m ? m.rows : []
+          if (searchState.on) {
+            if (searchState.lastModel !== m || searchState.lastVersion !== modelVersion) {
+              searchState.lastModel = m
+              searchState.lastVersion = modelVersion
+              searchState.dirty = true
+            }
+            if (searchState.dirty) {
+              searchState.dirty = false
+              const q = searchState.query
+              const flat = []
+              const byRow = new Map()
+              if (q) {
+                const starts = []
+                const joined = []
+                let acc = 0
+                for (const r of searchRows) { starts.push(acc); joined.push(r.text); acc += r.text.length + 1 }
+                const body = joined.join('\n')
+                const ql = q.toLowerCase()
+                const bl = body.toLowerCase()
+                let k = 0
+                for (;;) {
+                  const hit = bl.indexOf(ql, k)
+                  if (hit < 0) break
+                  k = hit + Math.max(1, ql.length)
+                  const end = hit + q.length
+                  for (let ri = 0; ri < searchRows.length; ri++) {
+                    const rs = starts[ri]
+                    const re = rs + searchRows[ri].text.length
+                    if (re <= hit) continue
+                    if (rs >= end) break
+                    const segStart = Math.max(hit, rs)
+                    const segEnd = Math.min(end, re)
+                    const mc = { key: 'm' + searchRows[ri].model, row: searchRows[ri].model, pos: segStart - rs, len: segEnd - segStart }
+                    flat.push(mc)
+                    let arr = byRow.get(mc.key)
+                    if (!arr) { arr = []; byRow.set(mc.key, arr) }
+                    arr.push(mc)
+                  }
+                }
+              }
+              searchState.matches = flat
+              searchState.byRow = byRow
+              if (searchState.cur >= flat.length) searchState.cur = flat.length > 0 ? 0 : -1
+            }
+          }
+          const jumpToMatch = (mc) => {
+            const code = diffRef.node
+            if (!code || !mc) return
+            let ed = null
+            if (mc.key.charAt(0) === 'm') {
+              ed = code.querySelector('.dsh-fe-tx-edit[data-m="' + mc.row + '"]')
+            } else {
+              const parts = mc.key.split(':')
+              const hnode = hunkRefs[Number(parts[0])]
+              ed = hnode ? hnode.querySelector('.dsh-fe-old[data-n="' + parts[1] + '"]') : null
+            }
+            if (!ed) return
+            const lineEl = ed.closest('.dsh-fe-line') || ed
+            let scroller = null
+            let p = lineEl
+            while (p && p !== document.body) {
+              const oy = getComputedStyle(p).overflowY
+              if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && p.scrollHeight > p.clientHeight + 1) { scroller = p; break }
+              p = p.parentElement
+            }
+            if (!scroller) scroller = document.scrollingElement || document.documentElement
+            const box = lineEl.getBoundingClientRect()
+            const sb = scroller.getBoundingClientRect()
+            const internal = scroller === code
+            const barH = (scopeRef.node && scopeRef.node.firstElementChild && scopeRef.node.firstElementChild.offsetHeight) || 0
+            let headerH = internal ? barH + 1 : ((store.tabH || 32) + (store.toolH || 35) + barH + 2)
+            if (!internal && toolbarRef.node) {
+              const r = toolbarRef.node.getBoundingClientRect()
+              if (r.bottom > 0 && r.bottom - sb.top > 0) headerH = Math.max(headerH, r.bottom - sb.top + barH + 2)
+            }
+            const target = scroller.scrollTop + (box.top - sb.top) - headerH
+            try { scroller.scrollTo({ top: Math.max(0, target), behavior: 'smooth' }) }
+            catch (e) { try { scroller.scrollTop = Math.max(0, target) } catch (e2) { try { lineEl.scrollIntoView() } catch (e3) {} } }
+            lineEl.classList.add('dsh-fe-scope-flash')
+            if (scopeState.flashTimer) clearTimeout(scopeState.flashTimer)
+            scopeState.flashTimer = setTimeout(() => { scopeState.flashTimer = null; lineEl.classList.remove('dsh-fe-scope-flash') }, 900)
+            // Land the caret on the match start when the row is editable.
+            const editable = ed.classList && ed.classList.contains('dsh-fe-tx-edit') ? ed : ed.querySelector('.dsh-fe-tx-edit')
+            if (editable) {
+              try {
+                editable.focus({ preventScroll: true })
+                setCaretEl(editable, mc.pos)
+              } catch (e) {}
+            }
+          }
+          const searchNav = (dir) => {
+            const ms = searchState.matches
+            if (!searchState.on || ms.length === 0) return
+            const prev = searchState.cur
+            let next
+            if (dir === 'next') next = prev < 0 ? 0 : (prev + 1) % ms.length
+            else next = prev < 0 ? ms.length - 1 : (prev - 1 + ms.length) % ms.length
+            searchState.cur = next
+            bumpSearch()
+            jumpToMatch(ms[next])
+          }
+          const clearSearchState = () => {
+            searchState.on = false
+            searchState.query = ''
+            searchState.matches = []
+            searchState.byRow = new Map()
+            searchState.cur = -1
+            searchState.dirty = true
+          }
+          const openSearch = () => {
+            const txt = selectedModelText(modelRef.m)
+            if (txt !== null && txt !== '') searchState.query = txt
+            searchState.on = true
+            searchState.dirty = true
+            if (searchState.cur >= searchState.matches.length) searchState.cur = -1
+            focusSearchRef.n = 1
+            bumpSearch()
+          }
+          const closeSearch = () => {
+            clearSearchState()
+            bumpSearch()
+          }
+          const searchBar = searchState.on ? React.createElement('div', { className: 'dsh-fe-searchbar' },
+            React.createElement('input', {
+              className: 'dsh-fe-searchbox',
+              ref: (node) => { inpRef.el = node },
+              placeholder: '在文件中搜索…',
+              spellCheck: false,
+              value: searchState.query,
+              onChange: (ev) => {
+                searchState.query = String(ev.target.value || '').replace(/\r/g, '')
+                searchState.dirty = true
+                if (searchState.cur >= searchState.matches.length) searchState.cur = -1
+                bumpSearch()
+              },
+              onKeyDown: (ev) => {
+                if ((ev.ctrlKey || ev.metaKey) && (ev.key || '').toLowerCase() === 'f') {
+                  // Stay inside the plugin's search box — never the browser's.
+                  ev.preventDefault(); ev.stopPropagation()
+                  try { inpRef.el && inpRef.el.select() } catch (e) {}
+                  return
+                }
+                if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); searchNav(ev.shiftKey ? 'prev' : 'next') }
+                else if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); closeSearch() }
+                else if (ev.key === 'ArrowUp') { ev.preventDefault(); searchNav('prev') }
+                else if (ev.key === 'ArrowDown') { ev.preventDefault(); searchNav('next') }
+              },
+            }),
+            searchState.matches.length > 0 ? React.createElement('span', { className: 'dsh-fe-searchcount' }, (searchState.cur < 0 ? 1 : searchState.cur + 1) + '/' + searchState.matches.length) : null,
+            React.createElement('button', { type: 'button', className: 'dsh-fe-searchbtn', title: '上一处匹配（Shift+Enter）', onClick: () => searchNav('prev') }, IconChevUp()),
+            React.createElement('button', { type: 'button', className: 'dsh-fe-searchbtn', title: '下一处匹配（Enter / ↓）', onClick: () => searchNav('next') }, IconChevDown()),
+          ) : null
           // Only exists while the file has diff changes; disappears with them.
           const jump = hunks.length > 0 ? React.createElement('div', { className: 'dsh-fe-jump' },
             React.createElement('span', { className: 'dsh-fe-jump-count' }, (curFocus + 1) + ' / ' + hunks.length),
@@ -4771,14 +5129,38 @@ window.__ModuleLoader__.load({
             React.createElement('div', { className: 'dsh-fe-diffwrap' },
               // v1.8.1: zero-height sticky strip — the jump pill stays pinned
               // below the sticky header stack while the page scrolls, and is
-              // simply absent when the file has no hunks.
-              jump ? React.createElement('div', { className: 'dsh-fe-jumprow' }, jump) : null,
+              // simply absent when the file has no hunks. v1.22: the search
+              // bar rides the same strip, pinned LEFT of the jump pill.
+              (jump || searchState.on) ? React.createElement('div', { className: 'dsh-fe-jumprow' }, searchBar, jump) : null,
               scopeBar,
               React.createElement('div', {
                 className: 'dsh-fe-diff',
                 ref: (node) => { diffRef.node = node },
                 onScroll: onDiffScroll,
                 onKeyDown: onCodeKeyDown,
+                onPaste: onCodePaste,
+                onMouseDown: (ev) => {
+                  if (ev.button !== 0) { dragSel.active = false; return }
+                  dragSel.active = true
+                  dragSel.moved = false
+                  dragSel.sx = ev.clientX
+                  dragSel.sy = ev.clientY
+                  dragSel.row = (ev.target && ev.target.closest && ev.target.closest('.dsh-fe-line')) ? rowKeyOfNode(ev.target) : null
+                  dragSel.node = null
+                  dragSel.off = 0
+                },
+                onMouseMove: (ev) => {
+                  if (!dragSel.active) return
+                  if ((ev.buttons & 1) !== 1) { dragSel.active = false; return }
+                  if (!dragSel.moved) {
+                    if (Math.abs(ev.clientX - dragSel.sx) + Math.abs(ev.clientY - dragSel.sy) < 4) return
+                    dragSel.moved = true
+                    const s0 = caretAtPoint(dragSel.sx, dragSel.sy)
+                    if (s0) { dragSel.node = s0.node; dragSel.off = s0.off }
+                  }
+                  extendDragSelection(ev)
+                },
+                onMouseUp: () => { dragSel.active = false },
               },
                 plan.map((b, i) => {
                   if (b.kind === 'ctx') {

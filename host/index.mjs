@@ -2168,32 +2168,50 @@ export default {
         const canFold = !!(f.base && f.base.present && f.base.content !== null)
         let newBase = canFold ? baseLines.slice() : null
         if (newBase) {
-          // inHunkAt[i] = cur index i sits inside a pending hunk's new range;
-          // shiftAt[i] = Σ(newLen−oldLen) over hunks starting at or before i
-          // (maps a cur index onto the aligned baseline index).
-          const inHunkAt = new Array(curLines.length + 1).fill(false)
+          // v1.22: the user's own save never enters the review — ops fold into
+          // the baseline EVERYWHERE, including inside pending hunks. shiftAt
+          // maps an OUT-of-hunk cur index onto the aligned baseline index;
+          // in-hunk positions get a dedicated mapping (below) because shiftAt
+          // overcounts the containing hunk's own delta.
           const shiftAt = new Array(curLines.length + 1).fill(0)
-          for (const h of all) {
-            for (let k = h.newStart; k < h.newStart + h.newLen; k++) inHunkAt[k] = true
-            shiftAt[h.newStart] += h.newLen - h.oldLen
-          }
+          for (const h of all) shiftAt[h.newStart] += h.newLen - h.oldLen
           for (let i = 1; i < shiftAt.length; i++) shiftAt[i] += shiftAt[i - 1]
           const ops = myersOps(curLines, lines)
           const ctxDel = []
           const ctxIns = []
           let insBefore = 0
           if (ops) {
+            const hunkAt = (p) => {
+              for (const h of all) if (p >= h.newStart && p < h.newStart + h.newLen) return h
+              return null
+            }
             for (const op of ops) {
               if (op.t === 'e') continue
               if (op.t === 'd') {
                 const curPos = op.i
-                if (inHunkAt[curPos]) continue
-                ctxDel.push({ idx: curPos - (shiftAt[curPos] || 0) })
+                const h = hunkAt(curPos)
+                if (h) {
+                  // cur line p inside hunk h corresponds to base line
+                  // h.oldStart + (p − h.newStart) (the hunk's own old range);
+                  // insertion-only hunks have no counterpart → no base delete.
+                  const baseIdx = h.oldStart + (curPos - h.newStart)
+                  if (baseIdx < h.oldStart + h.oldLen) ctxDel.push({ idx: baseIdx })
+                } else {
+                  ctxDel.push({ idx: curPos - (shiftAt[curPos] || 0) })
+                }
               } else {
                 const curPos = op.j - insBefore
                 insBefore++
-                if (curPos >= 0 && curPos < inHunkAt.length && inHunkAt[curPos]) continue
-                ctxIns.push({ idx: curPos - (shiftAt[curPos] || 0), text: lines[op.j] })
+                const h = hunkAt(curPos)
+                if (h) {
+                  // The user's inserted text becomes part of the reference:
+                  // insert it into the baseline at the hunk's own old range,
+                  // clamped (append for inserts at the tail of a replace).
+                  const baseIdx = Math.max(h.oldStart, Math.min(h.oldStart + h.oldLen, h.oldStart + (curPos - h.newStart)))
+                  ctxIns.push({ idx: baseIdx, text: lines[op.j] })
+                } else {
+                  ctxIns.push({ idx: curPos - (shiftAt[curPos] || 0), text: lines[op.j] })
+                }
               }
             }
           } else if (all.length === 0) {
