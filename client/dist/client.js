@@ -52,6 +52,16 @@ window.__ModuleLoader__.load({
             }
           } catch (e) {}
         }
+        // v1.24: same sanctioned synthetic-click trick for the terminal tab.
+        const switchToTerminalView = () => {
+          try {
+            const tabs = document.querySelectorAll('div[role="tablist"] button[role="tab"]')
+            for (let i = 0; i < tabs.length; i++) {
+              const btn = tabs[i]
+              if ((btn.textContent || '').trim() === '终端') { btn.click(); return }
+            }
+          } catch (e) {}
+        }
         const store = {
           sessionId: null,
           tabs: [],
@@ -127,6 +137,12 @@ window.__ModuleLoader__.load({
           },
           onDockH(f) { this.dockSubs.add(f); return () => { this.dockSubs.delete(f) } },
           requestRefresh() { this.refreshTick++; this.emit() },
+          // v1.24: the project run-target picker. Rendered by FileView (NOT by
+          // the button) because the toolbar is a `position:sticky; z-index:5`
+          // stacking context — a fixed menu inside it would paint below the
+          // shell's resize handle (z-index 8). Same layer as the save dialog.
+          runMenu: null,
+          setRunMenu(v) { this.runMenu = v; this.emit() },
           emit() { this.rev++; const subs = Array.from(this.subs); for (const f of subs) { try { f() } catch (e) {} } },
           subscribe(f) { this.subs.add(f); return () => { this.subs.delete(f) } },
         }
@@ -164,6 +180,397 @@ window.__ModuleLoader__.load({
           emit() { for (const f of Array.from(this.subs)) { try { f() } catch (e) {} } },
         }
         pinStore.load()
+        // ---------- v1.24: integrated terminal (client model) ----------
+        // The host runs each command as its own process and streams raw output
+        // (SGR colors, \r progress rewrites, cursor moves, erase-to-EOL). This
+        // is a deliberately small terminal emulator: it folds that stream into
+        // line/run structures so the view re-renders incrementally instead of
+        // re-parsing the whole scrollback on every poll. The 16 ANSI colors are
+        // CSS variables so they follow the light/dark theme.
+        const TERM_T256 = (() => {
+          const a = []
+          for (let r = 0; r < 6; r++) for (let g = 0; g < 6; g++) for (let b = 0; b < 6; b++) {
+            a.push('rgb(' + (r ? 55 + r * 40 : 0) + ',' + (g ? 55 + g * 40 : 0) + ',' + (b ? 55 + b * 40 : 0) + ')')
+          }
+          return a
+        })()
+        const term256 = (n) => {
+          if (n < 16) return 'var(--dsh-fe-a' + n + ')'
+          if (n < 232) return TERM_T256[n - 16]
+          const v = 8 + (n - 232) * 10
+          return 'rgb(' + v + ',' + v + ',' + v + ')'
+        }
+        const TERM_STYLE_CACHE = new Map()
+        const termStyleObj = (s) => {
+          const key = (s.fg || '') + '|' + (s.bg || '') + '|' + (s.b ? 'b' : '') + (s.d ? 'd' : '') + (s.i ? 'i' : '') + (s.u ? 'u' : '') + (s.r ? 'r' : '')
+          let obj = TERM_STYLE_CACHE.get(key)
+          if (!obj) {
+            obj = {}
+            if (s.fg) obj.color = s.fg
+            if (s.bg) obj.backgroundColor = s.bg
+            if (s.b) obj.fontWeight = 600
+            if (s.d) obj.opacity = 0.62
+            if (s.i) obj.fontStyle = 'italic'
+            if (s.u) obj.textDecoration = 'underline'
+            if (s.r) {
+              const f = obj.color
+              obj.color = obj.backgroundColor || 'var(--dsw-alias-bg-layer-1)'
+              obj.backgroundColor = f || 'var(--dsw-alias-label-primary)'
+            }
+            TERM_STYLE_CACHE.set(key, obj)
+          }
+          return obj
+        }
+        const termNewStyle = () => ({ fg: null, bg: null, b: false, d: false, i: false, u: false, r: false })
+        const TERM_MAX_LINES = 3000
+        const termNewLine = () => ({ runs: [], rev: 0 })
+        const termNewParser = () => ({ lines: [termNewLine()], row: 0, col: 0, style: termNewStyle(), tail: '' })
+        const termLineLen = (line) => { let n = 0; for (const r of line.runs) n += r.t.length; return n }
+        // Replace/overwrite `text` at column `col` of one line, splitting runs
+        // as needed (the operation behind \r progress rewrites and \x1b[K).
+        function termPut(line, col, text, style) {
+          const len = text.length
+          const out = []
+          const push = (t, s) => {
+            if (!t) return
+            const last = out[out.length - 1]
+            if (last && last.s === s) last.t += t
+            else out.push({ t: t, s: s })
+          }
+          let pos = 0
+          let done = false
+          for (const r of line.runs) {
+            const start = pos
+            const end = pos + r.t.length
+            pos = end
+            if (end <= col) { push(r.t, r.s); continue }
+            if (start >= col + len) {
+              if (!done) { push(text, style); done = true }
+              push(r.t, r.s)
+              continue
+            }
+            if (start < col) push(r.t.slice(0, col - start), r.s)
+            if (!done) { push(text, style); done = true }
+            if (end > col + len) push(r.t.slice(col + len - start), r.s)
+          }
+          if (!done) {
+            if (pos < col) push(' '.repeat(col - pos), null)
+            push(text, style)
+          }
+          line.runs = out
+          line.rev = (line.rev || 0) + 1
+        }
+        function termEraseLine(p, mode) {
+          const line = p.lines[p.row]
+          line.rev = (line.rev || 0) + 1
+          if (mode === 2) { line.runs = []; return }
+          if (mode === 1) {
+            const out = []
+            let pos = 0
+            for (const r of line.runs) {
+              const end = pos + r.t.length
+              if (end <= p.col) out.push({ t: r.t, s: r.s })
+              else if (pos < p.col) out.push({ t: ' '.repeat(p.col - pos), s: null })
+              pos = end
+            }
+            line.runs = out
+            return
+          }
+          const out = []
+          let pos = 0
+          for (const r of line.runs) {
+            const end = pos + r.t.length
+            if (pos >= p.col) break
+            out.push({ t: end <= p.col ? r.t : r.t.slice(0, p.col - pos), s: r.s })
+            pos = end
+          }
+          line.runs = out
+        }
+        function termEnsureRow(p, row) {
+          while (p.lines.length <= row) p.lines.push(termNewLine())
+          if (p.lines.length > TERM_MAX_LINES) {
+            const cut = p.lines.length - TERM_MAX_LINES
+            p.lines.splice(0, cut)
+            p.row = Math.max(0, p.row - cut)
+          }
+        }
+        function termSgr(p, nums) {
+          const st = p.style
+          const next = { fg: st.fg, bg: st.bg, b: st.b, d: st.d, i: st.i, u: st.u, r: st.r }
+          for (let k = 0; k < nums.length; k++) {
+            const c = nums[k]
+            if (c === 0) Object.assign(next, termNewStyle())
+            else if (c === 1) next.b = true
+            else if (c === 2) next.d = true
+            else if (c === 3) next.i = true
+            else if (c === 4) next.u = true
+            else if (c === 7) next.r = true
+            else if (c === 22) { next.b = false; next.d = false }
+            else if (c === 23) next.i = false
+            else if (c === 24) next.u = false
+            else if (c === 27) next.r = false
+            else if (c >= 30 && c <= 37) next.fg = 'var(--dsh-fe-a' + (c - 30) + ')'
+            else if (c === 39) next.fg = null
+            else if (c >= 40 && c <= 47) next.bg = 'var(--dsh-fe-a' + (c - 40) + ')'
+            else if (c === 49) next.bg = null
+            else if (c >= 90 && c <= 97) next.fg = 'var(--dsh-fe-a' + (c - 90 + 8) + ')'
+            else if (c >= 100 && c <= 107) next.bg = 'var(--dsh-fe-a' + (c - 100 + 8) + ')'
+            else if (c === 38 || c === 48) {
+              const target = c === 38 ? 'fg' : 'bg'
+              const mode = nums[k + 1]
+              if (mode === 5) { next[target] = term256(nums[k + 2] || 0); k += 2 }
+              else if (mode === 2) {
+                next[target] = 'rgb(' + (nums[k + 2] || 0) + ',' + (nums[k + 3] || 0) + ',' + (nums[k + 4] || 0) + ')'
+                k += 4
+              }
+            }
+          }
+          p.style = next
+        }
+        function termCsi(p, params, final) {
+          const nums = params.replace(/^[?>!=]+/, '').split(';').map((x) => (x === '' ? 0 : parseInt(x, 10) || 0))
+          const a = nums[0] === undefined ? 0 : nums[0]
+          if (final === 'm') { termSgr(p, nums); return }
+          if (final === 'K') { termEraseLine(p, a); return }
+          if (final === 'J') {
+            if (a === 2) { p.lines = [{ runs: [] }]; p.row = 0; p.col = 0 }
+            else if (a === 0) { termEraseLine(p, 0); p.lines.length = Math.max(p.row + 1, 1) }
+            else termEraseLine(p, 1)
+            return
+          }
+          if (final === 'A') { p.row = Math.max(0, p.row - Math.max(1, a)); termEnsureRow(p, p.row); return }
+          if (final === 'B') { p.row += Math.max(1, a); termEnsureRow(p, p.row); return }
+          if (final === 'C') { p.col += Math.max(1, a); return }
+          if (final === 'D') { p.col = Math.max(0, p.col - Math.max(1, a)); return }
+          if (final === 'G') { p.col = Math.max(0, (a || 1) - 1); return }
+          if (final === 'H' || final === 'f') { p.row = Math.max(0, (nums[0] || 1) - 1); p.col = Math.max(0, (nums[1] || 1) - 1); termEnsureRow(p, p.row); return }
+          if (final === 'd') { p.row = Math.max(0, (a || 1) - 1); termEnsureRow(p, p.row); return }
+          // Cursor visibility, scroll regions, device queries: intentionally ignored.
+        }
+        // Returns the index just past the sequence, or -1 when the buffer ends
+        // mid-sequence (the remainder is kept in parser.tail for the next chunk).
+        function termEscape(p, s, i) {
+          const n = s.length
+          if (i + 1 >= n) return -1
+          const c = s[i + 1]
+          if (c === '[') {
+            let j = i + 2
+            while (j < n && !(s[j] >= '\u0040' && s[j] <= '\u007e')) j++
+            if (j >= n) return -1
+            termCsi(p, s.slice(i + 2, j), s[j])
+            return j + 1
+          }
+          if (c === ']') {
+            let j = i + 2
+            while (j < n) {
+              if (s[j] === '\u0007') return j + 1
+              if (s[j] === '\u001b' && s[j + 1] === '\\') return j + 2
+              j++
+            }
+            return -1
+          }
+          if (c === 'P' || c === '^' || c === '_') {
+            let j = i + 2
+            while (j < n && !(s[j] === '\u001b' && s[j + 1] === '\\')) j++
+            return j >= n ? -1 : j + 2
+          }
+          if ('()*+-./#%'.indexOf(c) >= 0) return i + 3 <= n ? i + 3 : -1
+          return i + 2
+        }
+        function termFeed(p, text) {
+          if (!text && !p.tail) return false
+          const s = p.tail + (text || '')
+          p.tail = ''
+          const n = s.length
+          let i = 0
+          while (i < n) {
+            const ch = s[i]
+            if (ch === '\u001b') {
+              const next = termEscape(p, s, i)
+              if (next === -1) { p.tail = s.slice(i); break }
+              i = next
+              continue
+            }
+            if (ch === '\n') { p.row++; p.col = 0; termEnsureRow(p, p.row); i++; continue }
+            if (ch === '\r') { p.col = 0; i++; continue }
+            if (ch === '\b') { if (p.col > 0) p.col--; i++; continue }
+            if (ch === '\t') {
+              const next = (Math.floor(p.col / 8) + 1) * 8
+              termPut(p.lines[p.row], p.col, ' '.repeat(next - p.col), null)
+              p.col = next
+              i++
+              continue
+            }
+            if (ch === '\u0007' || ch === '\u000e' || ch === '\u000f') { i++; continue }
+            if (ch < ' ') { i++; continue }
+            let j = i
+            while (j < n && s[j] >= ' ' && s[j] !== '\u001b' && s[j] !== '\u007f') j++
+            const line = p.lines[p.row]
+            const cur = termLineLen(line)
+            if (p.col > cur) termPut(line, cur, ' '.repeat(p.col - cur), null)
+            termPut(line, p.col, s.slice(i, j), termStyleObj(p.style))
+            p.col += j - i
+            i = j
+          }
+          return true
+        }
+        // Shared per-session terminal state. Kept module-level so the view, the
+        // run button and the polling loop survive view switches (the shell only
+        // mounts the ACTIVE conversation view).
+        const termStore = {
+          bySid: new Map(),
+          rec(sid) {
+            let t = this.bySid.get(sid)
+            if (!t) {
+              t = {
+                sid, parser: termNewParser(), version: 0,
+                cursor: 0, total: 0, started: false, busy: false, command: null,
+                exitCode: null, cwd: '', root: '', shell: '', motd: '', error: null,
+                history: [], histIdx: -1, subs: new Set(), timer: null, pulling: false,
+              }
+              this.bySid.set(sid, t)
+            }
+            return t
+          },
+          subscribe(sid, fn) {
+            const t = this.rec(sid)
+            t.subs.add(fn)
+            this.start(sid)
+            return () => {
+              t.subs.delete(fn)
+              if (t.subs.size === 0) this.stop(sid)
+            }
+          },
+          emit(sid) {
+            const t = this.rec(sid)
+            for (const f of Array.from(t.subs)) { try { f() } catch (e) {} }
+          },
+          start(sid) {
+            const t = this.rec(sid)
+            if (t.timer) return
+            const tick = () => {
+              t.timer = null
+              if (t.subs.size === 0) return
+              void this.pull(sid).then(() => {
+                if (t.subs.size === 0 || t.timer) return
+                // busy: fast follow; hard error: slow retry; idle: relaxed.
+                t.timer = ctx.timeout(tick, t.busy ? 200 : (t.error ? 3000 : 650))
+              })
+            }
+            tick()
+          },
+          stop(sid) {
+            const t = this.rec(sid)
+            if (t.timer) { try { t.timer() } catch (e) {} t.timer = null }
+          },
+          async pull(sid) {
+            const t = this.rec(sid)
+            if (t.pulling) return
+            t.pulling = true
+            try {
+              const r = t.started
+                ? await call('termRead', { sessionId: sid, after: t.cursor })
+                : await call('termStart', { sessionId: sid })
+              this.merge(sid, r)
+            } finally { t.pulling = false }
+          },
+          merge(sid, r) {
+            const t = this.rec(sid)
+            if (!r || r.ok === false) {
+              const raw = r && r.error ? String(r.error) : '终端不可用'
+              // The running host module is loaded at DSH start; a newer client
+              // bundle can therefore outrun it. Say so instead of leaking the
+              // raw RPC error.
+              t.error = /no such method|not found/i.test(raw)
+                ? '宿主插件仍是旧版本（终端 RPC 不存在）：请重启 DSH 后重试。'
+                : raw
+              this.emit(sid)
+              return
+            }
+            t.error = null
+            t.started = true
+            if (r.motd) t.motd = String(r.motd)
+            if (r.shell) t.shell = String(r.shell)
+            if (r.cwd) t.cwd = String(r.cwd)
+            if (r.root) t.root = String(r.root)
+            if (r.eol) t.eol = String(r.eol)
+            t.busy = !!r.busy
+            t.command = r.command ? String(r.command) : null
+            if (r.exitCode !== undefined) t.exitCode = r.exitCode
+            let changed = false
+            if (r.reset) {
+              t.parser = termNewParser()
+              t.cursor = 0
+              changed = true
+            }
+            if (r.text) { if (termFeed(t.parser, String(r.text))) changed = true }
+            if (typeof r.total === 'number' && r.total !== t.total) { t.total = r.total; changed = true }
+            t.cursor = typeof r.total === 'number' ? r.total : t.cursor
+            if (changed || r.reset) { t.version++; this.emit(sid) }
+          },
+          async run(sid, command, source) {
+            const t = this.rec(sid)
+            const r = await call('termRun', { sessionId: sid, command: command, source: source || 'user' })
+            if (r && r.ok === false) {
+              t.error = String(r.error || '无法执行')
+              this.emit(sid)
+              return false
+            }
+            this.merge(sid, r)
+            this.start(sid)
+            return true
+          },
+          async write(sid, text) {
+            const t = this.rec(sid)
+            const r = await call('termWrite', { sessionId: sid, text: text })
+            if (r && r.ok === false) { t.error = String(r.error || '写入失败'); this.emit(sid); return false }
+            return true
+          },
+          async signal(sid) {
+            const r = await call('termSignal', { sessionId: sid, signal: 'SIGINT' })
+            if (r && r.ok === false) { const t = this.rec(sid); t.error = String(r.error || '无法中断'); this.emit(sid) }
+            return r && r.ok === true
+          },
+          async clear(sid) {
+            const t = this.rec(sid)
+            await call('termClear', { sessionId: sid })
+            t.parser = termNewParser()
+            t.cursor = 0
+            t.version++
+            this.emit(sid)
+          },
+          async restart(sid) {
+            const t = this.rec(sid)
+            await call('termClose', { sessionId: sid })
+            t.parser = termNewParser()
+            t.cursor = 0
+            t.total = 0
+            t.started = false
+            t.busy = false
+            t.command = null
+            t.exitCode = null
+            t.error = null
+            t.version++
+            this.emit(sid)
+            await this.pull(sid)
+          },
+          async detect(sid, path) {
+            const r = await call('termDetect', { sessionId: sid, path: path || '' })
+            if (!r || r.ok === false) {
+              const raw = r && r.error ? String(r.error) : '检测失败'
+              return {
+                ok: false,
+                candidates: [],
+                error: /no such method|not found/i.test(raw) ? '宿主插件仍是旧版本：请重启 DSH 后重试（也可在终端中手动输入命令）。' : raw,
+              }
+            }
+            return { ok: true, candidates: Array.isArray(r.candidates) ? r.candidates : [] }
+          },
+        }
+        // v1.22 search box: ESC must close it from anywhere in the view, not
+        // only while the input itself has focus. DiffPanes register a closer
+        // here; the capture-phase listener below owns the key.
+        const searchClosers = new Set()
         const range = (a, b) => { const r = []; for (let i = a; i < b; i++) r.push(i); return r }
         const useStore = () => {
           const [, force] = React.useState(0)
@@ -597,7 +1004,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.23.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.24.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -1069,6 +1476,48 @@ window.__ModuleLoader__.load({
           '.dsh-fe-hit { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent); border-radius:2px; }',
           '.dsh-fe-hit-cur { background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 65%, transparent); outline:1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary) 90%, transparent); border-radius:2px; }',
           '@media (prefers-reduced-motion: reduce) { .dsh-fe-searchbar { transition:none; } }',
+          // ---- v1.24: integrated terminal + project run button ----
+          // ANSI palette (VS Code terminal colors) as theme-aware variables, so
+          // colored command output stays legible in both color schemes.
+          '.dsh-fe-term { --dsh-fe-a0:#3b3b3b; --dsh-fe-a1:#cd3131; --dsh-fe-a2:#107c10; --dsh-fe-a3:#7a6400; --dsh-fe-a4:#0451a5; --dsh-fe-a5:#bc05bc; --dsh-fe-a6:#0598bc; --dsh-fe-a7:#555555; --dsh-fe-a8:#666666; --dsh-fe-a9:#cd3131; --dsh-fe-a10:#107c10; --dsh-fe-a11:#7a6400; --dsh-fe-a12:#0451a5; --dsh-fe-a13:#bc05bc; --dsh-fe-a14:#0598bc; --dsh-fe-a15:#a5a5a5; display:flex; flex-direction:column; height:100%; min-height:0; }',
+          'body[data-ds-dark-theme] .dsh-fe-term { --dsh-fe-a0:#666666; --dsh-fe-a1:#cd3131; --dsh-fe-a2:#0dbc79; --dsh-fe-a3:#e5e510; --dsh-fe-a4:#2472c8; --dsh-fe-a5:#bc3fbc; --dsh-fe-a6:#11a8cd; --dsh-fe-a7:#e5e5e5; --dsh-fe-a8:#666666; --dsh-fe-a9:#f14c4c; --dsh-fe-a10:#23d18b; --dsh-fe-a11:#f5f543; --dsh-fe-a12:#3b8eea; --dsh-fe-a13:#d670d6; --dsh-fe-a14:#29b8db; --dsh-fe-a15:#e5e5e5; }',
+          '.dsh-fe-term-head { display:flex; align-items:center; gap:8px; padding:6px 10px 6px 12px; border-bottom:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-1); flex:none; font-size:12.5px; }',
+          '.dsh-fe-term-dot { width:7px; height:7px; border-radius:50%; flex:none; background:var(--dsw-alias-label-secondary); opacity:.55; }',
+          '.dsh-fe-term-dot-on { background:var(--dsw-alias-state-success-primary); opacity:1; animation:dsh-fe-term-pulse 1.4s ease-in-out infinite; }',
+          '@keyframes dsh-fe-term-pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }',
+          '.dsh-fe-term-title { font-weight:650; }',
+          '.dsh-fe-term-cwd { font-family:ui-monospace,Consolas,monospace; font-size:11.5px; color:var(--dsw-alias-label-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:46%; }',
+          '.dsh-fe-term-cmd { font-family:ui-monospace,Consolas,monospace; font-size:11.5px; color:var(--dsw-alias-state-success-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:30%; }',
+          '.dsh-fe-term-body { position:relative; flex:1; min-height:0; overflow:auto; padding:8px 12px 12px; background:var(--dsw-alias-bg-layer-2); font-family:ui-monospace,Consolas,"Cascadia Mono",monospace; font-size:12.5px; line-height:1.5; color:var(--dsw-alias-label-primary); white-space:pre; user-select:text; }',
+          '.dsh-fe-term-line { min-height:1.5em; }',
+          '.dsh-fe-term-motd { color:var(--dsw-alias-label-secondary); border-bottom:1px dashed var(--dsw-alias-border-l1); padding-bottom:6px; margin-bottom:6px; white-space:pre-wrap; }',
+          '.dsh-fe-term-jump { position:sticky; bottom:0; float:right; margin-top:6px; border:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); border-radius:12px; font-size:11px; padding:2px 10px; cursor:pointer; }',
+          '.dsh-fe-term-inputrow { display:flex; align-items:center; gap:6px; flex:none; padding:6px 10px; border-top:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-1); }',
+          '.dsh-fe-term-prompt { font-family:ui-monospace,Consolas,monospace; font-size:13px; color:var(--dsw-alias-label-secondary); flex:none; }',
+          '.dsh-fe-term-prompt-on { color:var(--dsw-alias-state-success-primary); }',
+          '.dsh-fe-term-input { flex:1; min-width:0; border:none; outline:none; background:transparent; color:var(--dsw-alias-label-primary); font-family:ui-monospace,Consolas,monospace; font-size:12.5px; padding:3px 0; }',
+          '.dsh-fe-term-input::placeholder { color:var(--dsw-alias-label-secondary); opacity:.7; }',
+          '.dsh-fe-runbtn { display:inline-flex; align-items:center; gap:4px; flex:none; margin-left:6px; padding:2px 9px; border:1px solid color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); background:transparent; color:var(--dsw-alias-state-success-primary); border-radius:6px; font-size:12px; cursor:pointer; }',
+          '.dsh-fe-runbtn:hover { background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent); }',
+          '.dsh-fe-runbtn-busy { border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent); color:var(--dsw-alias-state-error-primary); }',
+          '.dsh-fe-runbtn-busy:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }',
+          '.dsh-fe-runbtn-caret { display:inline-flex; align-items:center; justify-content:center; flex:none; width:18px; height:20px; padding:0; border:none; background:transparent; color:var(--dsw-alias-label-secondary); border-radius:5px; cursor:pointer; }',
+          '.dsh-fe-runbtn-caret:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 14%, transparent); color:var(--dsw-alias-label-primary); }',
+          '.dsh-fe-runmenu { position:fixed; z-index:31; min-width:280px; max-width:min(520px, calc(100vw - 32px)); display:flex; flex-direction:column; gap:1px; padding:4px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); transform-origin:top right; animation:dsh-fe-menu-in .14s ease-out; }',
+          // The picker layer is rendered by FileView (RunMenuLayer), NOT by the
+          // toolbar button: the toolbar is a sticky z-index:5 stacking context,
+          // so a fixed menu inside it would paint below the shell resize handle
+          // (z-index 8) and never receive the click.
+          '.dsh-fe-runmenu-head { font-size:11px; font-weight:650; color:var(--dsw-alias-label-secondary); padding:4px 8px 5px; }',
+          '.dsh-fe-runmenu-empty { font-size:12px; color:var(--dsw-alias-label-secondary); padding:6px 8px 8px; line-height:1.5; }',
+          '.dsh-fe-runmenu-item { display:flex; align-items:center; gap:8px; text-align:left; width:100%; border:none; background:transparent; color:inherit; border-radius:6px; padding:5px 8px; cursor:pointer; font-size:12.5px; }',
+          '.dsh-fe-runmenu-item:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); }',
+          '.dsh-fe-runmenu-label { font-family:ui-monospace,Consolas,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:none; max-width:60%; }',
+          '.dsh-fe-runmenu-src { font-size:10.5px; padding:0 6px; border-radius:8px; border:1px solid var(--dsw-alias-border-l1); color:var(--dsw-alias-label-secondary); flex:none; }',
+          '.dsh-fe-runmenu-src-local { color:var(--dsw-alias-state-success-primary); border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); }',
+          '.dsh-fe-runmenu-detail { font-size:11px; color:var(--dsw-alias-label-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }',
+          '.dsh-fe-runmenu-foot { font-size:10.5px; color:var(--dsw-alias-label-secondary); padding:5px 8px 3px; border-top:1px solid var(--dsw-alias-border-l1); margin-top:2px; }',
+          '@media (prefers-reduced-motion: reduce) { .dsh-fe-term-dot-on { animation:none; } }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -1139,6 +1588,9 @@ window.__ModuleLoader__.load({
             style: { animationDelay: ((index - 8) * 125) + 'ms' },
           })))
         const IconPencil = () => I(14, '0 0 14 14', [P('M12 3.6 L10.4 2 a1.1 1.1 0 0 0 -1.6 0 L3.4 7.4 V10.6 H6.6 L12 5.2 a1.1 1.1 0 0 0 0 -1.6 Z'), P('M8.6 2.8 L11.2 5.4')])
+        // v1.24: run/stop glyphs for the project run button.
+        const IconPlay = () => React.createElement('svg', { ...svgBase, width: 11, height: 11, viewBox: '0 0 12 12', fill: 'currentColor', stroke: 'none', 'aria-hidden': true }, React.createElement('path', { d: 'M3 1.8 L10 6 L3 10.2 Z' }))
+        const IconStop = () => React.createElement('svg', { ...svgBase, width: 11, height: 11, viewBox: '0 0 12 12', fill: 'currentColor', stroke: 'none', 'aria-hidden': true }, React.createElement('rect', { x: 2.6, y: 2.6, width: 6.8, height: 6.8, rx: 1.2 }))
         const IconPlus = () => I(12, '0 0 14 14', [P('M7 2.5 V11.5'), P('M2.5 7 H11.5')])
         const IconClose = () => I(11, '0 0 14 14', [P('M4 4 L10 10'), P('M10 4 L4 10')])
         // v1.20: session-history controls. Dots = three steady dots on the
@@ -3858,6 +4310,16 @@ window.__ModuleLoader__.load({
           // pane has early returns, and hooks must stay unconditional.
           const dragSel = React.useState({ active: false, sx: 0, sy: 0, node: null, off: 0, row: -1, moved: false })[0]
           const bumpSearch = () => setSearchTick((n) => n + 1)
+          // v1.24: register this pane's "close the search box" action so the
+          // document-level ESC handler can close it while focus is anywhere
+          // else (editor rows, toolbar, the diff scroller). The ref keeps the
+          // latest closure without re-subscribing on every render.
+          const closeSearchRef = React.useState({ fn: null })[0]
+          React.useEffect(() => {
+            const fn = () => { if (searchState.on && closeSearchRef.fn) closeSearchRef.fn() }
+            searchClosers.add(fn)
+            return () => { searchClosers.delete(fn) }
+          }, [])
           const resetSearch = () => {
             searchState.on = false
             searchState.query = ''
@@ -4474,6 +4936,9 @@ window.__ModuleLoader__.load({
                   : '无未决定修改')))),
             React.createElement('span', { className: 'dsh-fe-spacer' }, null),
             actionButtons,
+            // v1.24: project run button lives at the right end of the row under
+            // the file tab strip (this toolbar).
+            React.createElement(RunButton, { key: 'run', sid: sid, path: path }),
           )
           // Deleted files: banner instead of a misleading red-line diff. The
           // toolbar still offers accept (confirm deletion) / reject (restore).
@@ -5152,6 +5617,8 @@ window.__ModuleLoader__.load({
             clearSearchState()
             bumpSearch()
           }
+          // v1.24: hand the ESC handler the live closer for this render.
+          closeSearchRef.fn = closeSearch
           const searchBar = searchState.on ? React.createElement('div', { className: 'dsh-fe-searchbar' },
             React.createElement('input', {
               className: 'dsh-fe-searchbox',
@@ -5421,12 +5888,237 @@ window.__ModuleLoader__.load({
               React.createElement(DiffPane, { sid: sid, path: active }),
             ),
             askOverlay,
+            // v1.24: run-target picker (fixed layer outside the toolbar's
+            // sticky stacking context — see store.runMenu).
+            React.createElement(RunMenuLayer, null),
+          )
+        }
+
+        // ---------- v1.24: terminal view + run button ----------
+        // One memoized line per parser line: the parser mutates only the lines
+        // it touches, so unchanged lines keep their object identity and React
+        // skips them while a command streams output.
+        const TermLine = React.memo(function TermLine(props) {
+          const runs = props.line.runs
+          if (runs.length === 0) return React.createElement('div', { className: 'dsh-fe-term-line' }, '\u00a0')
+          return React.createElement('div', { className: 'dsh-fe-term-line' },
+            runs.map((r, i) => (r.s ? React.createElement('span', { key: i, style: r.s }, r.t) : r.t)))
+        })
+        function TerminalView(props) {
+          const sid = props && props.sessionId
+          const [, force] = React.useState(0)
+          React.useEffect(() => {
+            if (!sid) return undefined
+            return termStore.subscribe(sid, () => force((n) => n + 1))
+          }, [sid])
+          const t = sid ? termStore.rec(sid) : null
+          const bodyRef = React.useState({ el: null })[0]
+          const inpRef = React.useState({ el: null })[0]
+          const [draft, setDraft] = React.useState('')
+          const [stick, setStick] = React.useState(true)
+          const version = t ? t.version : 0
+          const busy = !!(t && t.busy)
+          // Follow the tail unless the user scrolled up to read history.
+          React.useEffect(() => {
+            const el = bodyRef.el
+            if (el && stick) el.scrollTop = el.scrollHeight
+          }, [version, stick])
+          if (!sid) return null
+          const histMove = (dir) => {
+            if (!t || t.history.length === 0) return
+            let idx = t.histIdx
+            if (dir < 0) idx = idx < 0 ? t.history.length - 1 : Math.max(0, idx - 1)
+            else idx = idx < 0 ? -1 : Math.min(t.history.length - 1, idx + 1)
+            t.histIdx = idx
+            setDraft(idx < 0 ? '' : t.history[idx])
+          }
+          const submit = () => {
+            if (!t) return
+            const text = draft
+            setDraft('')
+            if (t.busy) {
+              // A running command owns stdin: the line answers its prompt.
+              void termStore.write(sid, text + (t.eol || '\r\n'))
+              return
+            }
+            if (text.trim() === '') return
+            t.history = t.history.filter((x) => x !== text).concat([text]).slice(-100)
+            t.histIdx = -1
+            void termStore.run(sid, text)
+          }
+          const lines = t ? t.parser.lines : []
+          return React.createElement('div', { className: 'dsh-fe-term' },
+            React.createElement('div', { className: 'dsh-fe-term-head' },
+              React.createElement('span', { className: 'dsh-fe-term-dot' + (busy ? ' dsh-fe-term-dot-on' : '') }),
+              React.createElement('span', { className: 'dsh-fe-term-title' }, '终端'),
+              t && t.shell ? React.createElement('span', { className: 'dsh-fe-chip' }, t.shell) : null,
+              React.createElement('span', { className: 'dsh-fe-term-cwd', title: t ? t.cwd : '' }, t ? t.cwd : ''),
+              React.createElement('span', { className: 'dsh-fe-spacer' }, null),
+              busy && t && t.command ? React.createElement('span', { className: 'dsh-fe-term-cmd', title: t.command }, '▶ ' + t.command) : null,
+              busy ? React.createElement('button', { type: 'button', className: 'dsh-fe-btn dsh-fe-btn-no', title: '中断当前进程（Ctrl+C）', onClick: () => { void termStore.signal(sid) } }, '中断') : null,
+              React.createElement('button', { type: 'button', className: 'dsh-fe-btn', title: '清空输出（Ctrl+L）', onClick: () => { void termStore.clear(sid) } }, '清空'),
+              React.createElement('button', { type: 'button', className: 'dsh-fe-btn', title: '结束并重新建立终端会话', onClick: () => { void termStore.restart(sid) } }, '重启'),
+            ),
+            t && t.error ? React.createElement('div', { className: 'dsh-fe-err' }, t.error) : null,
+            React.createElement('div', {
+              className: 'dsh-fe-term-body',
+              ref: (node) => { bodyRef.el = node },
+              onClick: () => { if (inpRef.el) { try { inpRef.el.focus() } catch (e) {} } },
+              onScroll: (ev) => {
+                const el = ev.currentTarget
+                const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+                if (atBottom !== stick) setStick(atBottom)
+              },
+            },
+              t && t.motd ? React.createElement('div', { className: 'dsh-fe-term-motd' }, t.motd) : null,
+              lines.map((line, i) => React.createElement(TermLine, { key: i, line: line, rev: line.rev })),
+              !stick ? React.createElement('button', {
+                type: 'button',
+                className: 'dsh-fe-term-jump',
+                onClick: () => setStick(true),
+              }, '跳到最新') : null,
+            ),
+            React.createElement('div', { className: 'dsh-fe-term-inputrow' },
+              React.createElement('span', { className: 'dsh-fe-term-prompt' + (busy ? ' dsh-fe-term-prompt-on' : '') }, busy ? '›' : '$'),
+              React.createElement('input', {
+                className: 'dsh-fe-term-input',
+                ref: (node) => { inpRef.el = node },
+                value: draft,
+                spellCheck: false,
+                autoComplete: 'off',
+                placeholder: busy ? '输入内容并回车 → 发送给运行中的进程' : '输入命令，回车执行（↑↓ 历史 · Ctrl+L 清空）',
+                onChange: (ev) => setDraft(ev.target.value),
+                onKeyDown: (ev) => {
+                  const k = ev.key || ''
+                  if (k === 'Enter') { ev.preventDefault(); submit(); return }
+                  if ((ev.ctrlKey || ev.metaKey) && k.toLowerCase() === 'c') { ev.preventDefault(); if (busy) void termStore.signal(sid); return }
+                  if ((ev.ctrlKey || ev.metaKey) && k.toLowerCase() === 'l') { ev.preventDefault(); void termStore.clear(sid); return }
+                  if (k === 'ArrowUp') { ev.preventDefault(); histMove(-1); return }
+                  if (k === 'ArrowDown') { ev.preventDefault(); histMove(1) }
+                },
+              }),
+            ),
+          )
+        }
+        // Project run button (file-view toolbar, right end): detects the run
+        // target, prefers the project-local environment, and drives the
+        // terminal view. A single unambiguous target runs on the first click;
+        // several targets open a picker.
+        function RunButton(props) {
+          // DiffPane passes `sid`; accept `sessionId` too so the button keeps
+          // working if it is ever mounted from a session-scoped slot.
+          const sid = props && (props.sessionId || props.sid)
+          const [, force] = React.useState(0)
+          React.useEffect(() => {
+            if (!sid) return undefined
+            return termStore.subscribe(sid, () => force((n) => n + 1))
+          }, [sid])
+          const t = sid ? termStore.rec(sid) : null
+          const btnRef = React.useState({ el: null })[0]
+          const [detecting, setDetecting] = React.useState(false)
+          const busy = !!(t && t.busy)
+          const menu = store.runMenu
+          const place = () => {
+            const el = btnRef.el
+            const rect = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null
+            return {
+              top: (rect ? rect.bottom + 4 : 80) + 'px',
+              right: Math.max(8, rect ? (window.innerWidth || 0) - rect.right : 16) + 'px',
+            }
+          }
+          const detect = async () => {
+            if (!sid) return null
+            setDetecting(true)
+            const r = await termStore.detect(sid, props.path || '')
+            setDetecting(false)
+            return r
+          }
+          const onMain = async () => {
+            if (!sid) return
+            if (busy) { void termStore.signal(sid); return }
+            const r = await detect()
+            if (!r) return
+            if (r.candidates.length === 1) { await runProjectTarget(sid, r.candidates[0].command); return }
+            store.setRunMenu({ ...place(), sid: sid, items: r.candidates, error: r.ok ? null : r.error, loading: false })
+          }
+          const onCaret = async () => {
+            if (!sid) return
+            if (menu) { store.setRunMenu(null); return }
+            store.setRunMenu({ ...place(), sid: sid, items: [], error: null, loading: true })
+            const r = await detect()
+            const cur = store.runMenu
+            if (cur) store.setRunMenu({ ...cur, items: r.candidates, error: r.ok ? null : r.error, loading: false })
+          }
+          return React.createElement(React.Fragment, null,
+            React.createElement('button', {
+              type: 'button',
+              ref: (node) => { btnRef.el = node },
+              className: 'dsh-fe-runbtn' + (busy ? ' dsh-fe-runbtn-busy' : ''),
+              title: busy ? '中断当前运行的进程' : '运行项目（自动识别语言/框架，项目本地环境优先）',
+              onClick: () => { void onMain() },
+            },
+              busy ? IconStop() : IconPlay(),
+              React.createElement('span', null, busy ? '停止' : (detecting ? '识别中…' : '运行')),
+            ),
+            React.createElement('button', {
+              type: 'button',
+              className: 'dsh-fe-runbtn-caret',
+              title: '选择运行目标',
+              onClick: () => { void onCaret() },
+            }, IconChevDown()),
+          )
+        }
+        // The run-target picker itself, rendered by FileView at the dialog layer.
+        const closeRunMenu = () => { if (store.runMenu) store.setRunMenu(null) }
+        const runProjectTarget = async (sid, command) => {
+          closeRunMenu()
+          switchToTerminalView()
+          await termStore.run(sid, command, 'run')
+        }
+        function RunMenuLayer() {
+          const menu = store.runMenu
+          if (!menu) return null
+          return React.createElement('div', { className: 'dsh-fe-runmenu-layer' },
+            React.createElement('div', { className: 'dsh-fe-menu-veil', onClick: () => closeRunMenu() }),
+            React.createElement('div', { className: 'dsh-fe-runmenu', style: { top: menu.top, right: menu.right } },
+              React.createElement('div', { className: 'dsh-fe-runmenu-head' }, '运行项目'),
+              menu.loading ? React.createElement('div', { className: 'dsh-fe-runmenu-empty' }, '检测中…') : null,
+              !menu.loading && menu.items.length === 0
+                ? React.createElement('div', { className: 'dsh-fe-runmenu-empty' }, menu.error || '未识别到可运行入口，可在「终端」中直接输入命令。')
+                : null,
+              (menu.items || []).map((c) => React.createElement('button', {
+                key: c.id || c.command,
+                type: 'button',
+                className: 'dsh-fe-runmenu-item',
+                title: c.command + (c.detail ? '  ·  ' + c.detail : ''),
+                onClick: () => { void runProjectTarget(menu.sid, c.command) },
+              },
+                React.createElement('span', { className: 'dsh-fe-runmenu-label' }, c.label),
+                React.createElement('span', { className: 'dsh-fe-runmenu-src' + (c.source === 'local' ? ' dsh-fe-runmenu-src-local' : '') }, c.source === 'local' ? '本地' : '全局'),
+                c.detail ? React.createElement('span', { className: 'dsh-fe-runmenu-detail' }, c.detail) : null,
+              )),
+              React.createElement('div', { className: 'dsh-fe-runmenu-foot' }, '项目本地环境优先；在终端中可查看完整输出'),
+            ),
           )
         }
 
         // ---------- registrations ----------
         ensureStyle()
         ctx.effect(() => removeStyle, 'dsh-file-edit: stylesheet')
+        // v1.24: ESC closes the plugin's own in-view search box from anywhere
+        // (the box keeps focus-independent state, so the key must be observed
+        // document-wide). Capture phase + stopPropagation so an editor row's
+        // own ESC (revert this line) does not also fire on the same keypress.
+        ctx.effect(() => {
+          const onKeyDown = (ev) => {
+            if (ev.key !== 'Escape' || searchClosers.size === 0) return
+            if (!searchState.on) return
+            for (const fn of Array.from(searchClosers)) { try { fn() } catch (e) {} }
+            try { ev.preventDefault(); ev.stopPropagation() } catch (e) {}
+          }
+          window.addEventListener('keydown', onKeyDown, true)
+          return () => window.removeEventListener('keydown', onKeyDown, true)
+        }, 'dsh-file-edit: escape closes search')
         // v1.13: flush pending edit-history persists on teardown and on page
         // unload (best effort — the debounced persist already covers normal
         // flows; this closes the shutdown window).
@@ -5459,6 +6151,11 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('conversation.view', () => ctx.slots.register(
           { name: 'conversation.view', id: 'dsh-file-edit', order: 20, label: '文件' },
           FileView,
+        ))
+        // v1.24: terminal view tab — order 30 places it to the right of 文件.
+        ctx.slots.inject('conversation.view', () => ctx.slots.register(
+          { name: 'conversation.view', id: 'dsh-file-edit-term', order: 30, label: '终端' },
+          TerminalView,
         ))
       },
     }

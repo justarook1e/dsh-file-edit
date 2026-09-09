@@ -3,11 +3,11 @@
 // Browser RPC arrives at POST /dsh-file-edit/api (registered on ctx.webServer).
 // Per-session review state (baseline + pending decisions) is persisted under
 // ~/.dsh/dsh-file-edit-state/<sessionId>.json so accept/reject survives restarts.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, rmSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { join, relative, isAbsolute, resolve as resolvePath } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 
 const STATE_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'dsh-file-edit-state')
 // v1.10.0 rename migration: the plugin used to live under dsh-files with its
@@ -2409,6 +2409,557 @@ export default {
         scheduleSave(st, true)
         return { ok: true, restored: restored, skipped: skipped }
       },
+
+      // ---------- v1.24: integrated terminal ----------
+      // One terminal per session, rooted at the session workspace. Every
+      // submitted line runs as its OWN child process (`pwsh -Command <line>` /
+      // `bash -c <line>`) so the process tree can be killed precisely
+      // (Ctrl+C / 停止): a persistent `-Command -` shell cannot be interrupted
+      // without killing the shell itself, and a child that reads stdin would
+      // swallow the following command lines. `cd` is handled by the host (it
+      // moves the terminal's cwd), so the common navigation flow still reads
+      // like a shell; a running command keeps a writable stdin so interactive
+      // prompts can be answered from the terminal input line.
+      async termStart(args) {
+        const st = requireState(args)
+        if (!st) return { ok: false, error: 'no-session' }
+        const sid = String(args.sessionId)
+        const root = await ensureTermRoot(st, sid)
+        if (!root) return { ok: false, error: 'no-workspace' }
+        const t = termFor(sid, root)
+        if (!t.motd) {
+          t.motd = TERM_SHELL.name + ' · ' + t.cwd
+          if (TERM_SHELL.dialect === 'pwsh') {
+            t.motd += '\n每条命令在独立进程中运行；cd 在本终端内保持，Ctrl+C 结束当前进程。'
+          } else {
+            t.motd += '\nEach line runs in its own process; cd persists here, Ctrl+C ends the running one.'
+          }
+        }
+        return termReadOf(t, 0)
+      },
+      async termRead(args) {
+        const sid = args && args.sessionId ? String(args.sessionId) : ''
+        if (!sid) return { ok: false, error: 'no-session' }
+        knownSessions.add(sid)
+        const t = terms.get(sid)
+        if (!t) return { ok: true, started: false, reset: true, text: '', total: 0, busy: false }
+        return termReadOf(t, Number(args.after) || 0)
+      },
+      async termRun(args) {
+        const st = requireState(args)
+        if (!st) return { ok: false, error: 'no-session' }
+        const sid = String(args.sessionId)
+        const root = await ensureTermRoot(st, sid)
+        if (!root) return { ok: false, error: 'no-workspace' }
+        const t = termFor(sid, root)
+        return termExec(st, t, args && typeof args.command === 'string' ? args.command : '', args && args.source === 'run' ? 'run' : 'user')
+      },
+      async termWrite(args) {
+        const t = terms.get(args && args.sessionId ? String(args.sessionId) : '')
+        if (!t || !t.busy || !t.child || !t.child.stdin) return { ok: false, error: 'not-running' }
+        const text = args && typeof args.text === 'string' ? args.text : ''
+        try { t.child.stdin.write(text) } catch (e) { return { ok: false, error: e && e.message ? String(e.message) : String(e) } }
+        return { ok: true, ...termInfoOf(t) }
+      },
+      async termSignal(args) {
+        const t = terms.get(args && args.sessionId ? String(args.sessionId) : '')
+        if (!t || !t.busy || !t.pid) return { ok: false, error: 'not-running' }
+        t.lastKilled = true
+        termKillTree(t.pid, args && typeof args.signal === 'string' ? args.signal : 'SIGINT')
+        return { ok: true }
+      },
+      async termClear(args) {
+        const t = terms.get(args && args.sessionId ? String(args.sessionId) : '')
+        if (!t) return { ok: true }
+        t.buf = ''
+        t.dropped = t.total
+        t.forceReset = true
+        t.rev++
+        return { ok: true }
+      },
+      async termClose(args) {
+        const sid = args && args.sessionId ? String(args.sessionId) : ''
+        const t = terms.get(sid)
+        if (!t) return { ok: true }
+        terms.delete(sid)
+        if (t.pid) termKillTree(t.pid, 'SIGKILL')
+        return { ok: true }
+      },
+      async termDetect(args) {
+        const st = requireState(args)
+        if (!st) return { ok: false, error: 'no-session' }
+        const sid = String(args.sessionId)
+        const root = await ensureTermRoot(st, sid)
+        if (!root) return { ok: false, error: 'no-workspace' }
+        const candidates = await detectRunCandidates(st, args && typeof args.path === 'string' ? args.path : '')
+        return { ok: true, root: root, shell: TERM_SHELL.name, candidates: candidates }
+      },
+    }
+
+    // ---------- v1.24: terminal engine ----------
+    const TERM_MAX_CHARS = 400 * 1024
+    const TERM_COLOR_ENV = {
+      FORCE_COLOR: '1',
+      CLICOLOR_FORCE: '1',
+      COLORTERM: 'truecolor',
+      TERM: 'xterm-256color',
+      PY_COLORS: '1',
+      PYTHONIOENCODING: 'utf-8',
+      npm_config_color: 'always',
+    }
+    // PowerShell's default pipe encoding is the OEM code page; DSH's own
+    // pwsh-local prepends the same encoding preamble so non-ASCII output
+    // survives. `$ProgressPreference` silences the module-autoload progress
+    // record, which Windows PowerShell 5.1 otherwise serializes to stderr as
+    // CLIXML noise on every invocation.
+    const PS_SCRIPT_PRE = '$ProgressPreference = "SilentlyContinue"\n'
+      + '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n'
+      + '$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n'
+    // Exact exit code for the command above: `$?` is False after a native
+    // command that returned non-zero (a cmdlet error also makes it False), and
+    // `$LASTEXITCODE` then carries the native code. The capture lives on its
+    // OWN lines so a trailing `# comment` cannot swallow it.
+    const PS_SCRIPT_TAIL = '\n$__dshfe_ok = $?\n'
+      + '$__dshfe_code = 0\n'
+      + 'if (-not $__dshfe_ok) { if ($LASTEXITCODE -is [int]) { $__dshfe_code = $LASTEXITCODE } else { $__dshfe_code = 1 } }\n'
+      + 'exit $__dshfe_code\n'
+    // Each command runs from a generated script file instead of a `-Command`
+    // string: PowerShell 5.1's own command-line parser mangles a quoted
+    // `-Command` argument (Node escapes inner `"` as `\"`, which PS re-parses),
+    // and `-EncodedCommand` routes the error stream through CLIXML. A UTF-8
+    // BOM script is the only transport that survives arbitrary user text —
+    // quotes, parentheses, Chinese, multi-line blocks — with clean stderr and
+    // a faithful exit code.
+    const TERM_TMP_DIR = join(tmpdir(), 'dsh-file-edit-term-' + process.pid)
+    const terms = new Map()
+
+    function termFileExists(p) {
+      try { return existsSync(p) } catch (e) { return false }
+    }
+    // Mirror of dsh-pwsh-local resolve.ts: PowerShell 7 install → PATH pwsh.exe
+    // → Windows PowerShell 5.1. No shell service dependency: a user-facing
+    // terminal must not be confined by the agent's sandbox policy.
+    function resolveTermShell() {
+      if (process.platform === 'win32') {
+        const programFiles = process.env.ProgramFiles ?? 'C:\\Program Files'
+        const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+        const candidates = [join(programFiles, 'PowerShell', '7', 'pwsh.exe')]
+        for (const entry of (process.env.PATH ?? '').split(';')) {
+          const trimmed = entry.trim().replace(/^"|"$/g, '')
+          if (trimmed.length > 0) candidates.push(join(trimmed, 'pwsh.exe'))
+        }
+        candidates.push(join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+        for (const candidate of candidates) {
+          if (termFileExists(candidate)) {
+            const legacy = /powershell\.exe$/i.test(candidate)
+            return { exe: candidate, name: legacy ? 'Windows PowerShell 5.1' : 'PowerShell 7', dialect: 'pwsh' }
+          }
+        }
+        return { exe: 'pwsh', name: 'pwsh', dialect: 'pwsh' }
+      }
+      const sh = process.env.SHELL && process.env.SHELL.length > 0 ? process.env.SHELL : 'bash'
+      return { exe: sh, name: sh.split('/').pop() || sh, dialect: 'bash' }
+    }
+    const TERM_SHELL = resolveTermShell()
+    // Build the exact invocation for one command. `args` NEVER repeats the
+    // executable (Node's spawn takes the executable separately); passing it
+    // again made PowerShell re-launch itself as a child process, which then
+    // reported only its own 0/1 instead of the command's exit code.
+    // pwsh gets a generated script file (path returned so the caller can clean
+    // it up and scrub it from output); bash takes the command text directly,
+    // which has no re-quoting hazard.
+    function termSpec(t, command) {
+      if (TERM_SHELL.dialect !== 'pwsh') return { exe: TERM_SHELL.exe, args: ['-c', command], script: null }
+      mkdirSync(TERM_TMP_DIR, { recursive: true })
+      t.scriptSeq = (t.scriptSeq || 0) + 1
+      const file = join(TERM_TMP_DIR, 'cmd-' + t.scriptSeq + '.ps1')
+      // UTF-8 BOM: without it Windows PowerShell 5.1 reads the file as ANSI and
+      // garbles non-ASCII command text.
+      writeFileSync(file, '\uFEFF' + PS_SCRIPT_PRE + command + PS_SCRIPT_TAIL, 'utf8')
+      return {
+        exe: TERM_SHELL.exe,
+        args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file],
+        script: file,
+      }
+    }
+    function termEnv() {
+      const env = Object.assign({}, process.env, TERM_COLOR_ENV)
+      if (env.NO_COLOR !== undefined) delete env.NO_COLOR
+      return env
+    }
+    async function ensureTermRoot(st, sid) {
+      if (st.root) return st.root
+      const r = resolveSession(sid)
+      if (r && !r.error && r.root) st.root = r.root
+      return st.root
+    }
+    function termFor(sid, root) {
+      let t = terms.get(sid)
+      if (!t) {
+        t = {
+          sid, root: root || null, cwd: root || null,
+          child: null, pid: 0, busy: false, command: null, exitCode: null,
+          startedAt: 0, endedAt: 0, lastKilled: false,
+          buf: '', dropped: 0, total: 0, rev: 0, forceReset: false, motd: '',
+          scriptSeq: 0, scrubFrom: null, scrubTo: '',
+        }
+        terms.set(sid, t)
+      }
+      if (root && t.root !== root) {
+        t.root = root
+        if (!t.busy) t.cwd = root
+      }
+      return t
+    }
+    function termAppend(t, text) {
+      if (!text) return
+      // The generated script path shows up in PowerShell error records
+      // ("At C:\...\cmd-3.ps1:4 char:1"); present it as the user's command.
+      if (t.scrubFrom && text.indexOf(t.scrubFrom) >= 0) text = text.split(t.scrubFrom).join(t.scrubTo)
+      t.buf += text
+      t.total += text.length
+      if (t.buf.length > TERM_MAX_CHARS) {
+        const cut = t.buf.length - TERM_MAX_CHARS
+        t.buf = t.buf.slice(cut)
+        t.dropped += cut
+      }
+      t.rev++
+    }
+    function termInfoOf(t) {
+      return {
+        ok: true,
+        sessionId: t.sid,
+        root: t.root,
+        cwd: t.cwd,
+        shell: TERM_SHELL.name,
+        shellPath: TERM_SHELL.exe,
+        busy: t.busy,
+        command: t.command,
+        exitCode: t.exitCode,
+        total: t.total,
+        pid: t.pid,
+        rev: t.rev,
+        eol: process.platform === 'win32' ? '\r\n' : '\n',
+      }
+    }
+    function termReadOf(t, after) {
+      let reset = false
+      let text = ''
+      if (t.forceReset || after < t.dropped || after > t.total) {
+        reset = true
+        text = t.buf
+        t.forceReset = false
+      } else {
+        text = t.buf.slice(after - t.dropped)
+      }
+      return { ...termInfoOf(t), started: true, reset, text, dropped: t.dropped, motd: t.motd }
+    }
+    // `cd` is the one piece of shell state worth keeping across the per-command
+    // processes: the host resolves it, validates the target and moves the
+    // terminal's cwd. Compound lines (`cd a && b`) are left to the shell so a
+    // real command is never mistaken for navigation.
+    function termCdTarget(t, line) {
+      const m = /^\s*(?:cd|chdir|set-location|sl|pushd)\b\s*(.*)$/i.exec(line)
+      if (!m) return null
+      let raw = (m[1] || '').trim()
+      if (/[;&|]/.test(raw)) return null
+      const base = t.cwd || t.root || process.cwd()
+      if (raw === '' || raw === '~') raw = t.root || base
+      else if (raw.startsWith('~')) raw = homedir() + raw.slice(1)
+      raw = raw.replace(/^['"]|['"]$/g, '')
+      if (raw === '') return null
+      const dir = isAbsolute(raw) ? raw : resolvePath(base, raw)
+      try {
+        if (!existsSync(dir)) return { error: '目录不存在: ' + dir }
+        if (!statSync(dir).isDirectory()) return { error: '不是目录: ' + dir }
+      } catch (e) {
+        return { error: '无法进入目录: ' + (e && e.message ? String(e.message) : String(e)) }
+      }
+      return { dir }
+    }
+    function termKillTree(pid, signal) {
+      if (!pid) return
+      if (process.platform === 'win32') {
+        try {
+          const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+          killer.on('error', () => {})
+        } catch (e) {}
+        return
+      }
+      const sig = signal === 'SIGKILL' ? 'SIGKILL' : signal
+      try { process.kill(-pid, sig) } catch (e) {
+        try { process.kill(pid, sig) } catch (e2) {}
+      }
+      // Escalate: a process that ignores the polite signal must not pin the
+      // terminal in RUNNING forever.
+      const timer = setTimeout(() => {
+        try { process.kill(-pid, 'SIGKILL') } catch (e) { try { process.kill(pid, 'SIGKILL') } catch (e2) {} }
+      }, 4000)
+      if (timer.unref) timer.unref()
+    }
+    function termExec(st, t, command, source) {
+      if (t.busy) return { ok: false, error: 'busy' }
+      const line = String(command == null ? '' : command).replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+$/, '')
+      if (line.trim() === '') return { ok: true, skipped: true, ...termInfoOf(t) }
+      termAppend(t, '\x1b[2m$ \x1b[0m' + line + '\n')
+      const cd = termCdTarget(t, line)
+      if (cd) {
+        if (cd.error) {
+          termAppend(t, '\x1b[31m' + cd.error + '\x1b[0m\n')
+        } else {
+          t.cwd = cd.dir
+          termAppend(t, '\x1b[2m' + cd.dir + '\x1b[0m\n')
+        }
+        return { ok: true, ...termInfoOf(t) }
+      }
+      let child
+      let spec
+      try {
+        spec = termSpec(t, line)
+      } catch (e) {
+        const msg = e && e.message ? String(e.message) : String(e)
+        termAppend(t, '\x1b[31m[无法生成命令脚本] ' + msg + '\x1b[0m\n')
+        return { ok: false, error: msg }
+      }
+      t.scrubFrom = spec.script
+      t.scrubTo = '<命令>'
+      try {
+        child = spawn(spec.exe, spec.args, {
+          cwd: t.cwd || t.root || process.cwd(),
+          env: termEnv(),
+          windowsHide: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          // POSIX: one process group per command so a signal reaches the whole
+          // tree (npm run dev → node → ...), not just the shell wrapper.
+          detached: process.platform !== 'win32',
+        })
+      } catch (e) {
+        const msg = e && e.message ? String(e.message) : String(e)
+        if (spec.script) { try { rmSync(spec.script, { force: true }) } catch (e2) {} }
+        termAppend(t, '\x1b[31m[启动失败] ' + msg + '\x1b[0m\n')
+        return { ok: false, error: msg }
+      }
+      t.child = child
+      t.pid = child.pid || 0
+      t.busy = true
+      t.command = line
+      t.exitCode = null
+      t.lastKilled = false
+      t.startedAt = Date.now()
+      if (child.stdout) { child.stdout.setEncoding('utf8'); child.stdout.on('data', (d) => termAppend(t, d)) }
+      if (child.stderr) { child.stderr.setEncoding('utf8'); child.stderr.on('data', (d) => termAppend(t, d)) }
+      if (child.stdin) child.stdin.on('error', () => {})
+      child.on('error', (e) => {
+        termAppend(t, '\x1b[31m[启动失败] ' + (e && e.message ? String(e.message) : String(e)) + '\x1b[0m\n')
+      })
+      child.on('close', (code, signal) => {
+        if (t.child !== child) return
+        t.child = null
+        t.pid = 0
+        t.busy = false
+        t.command = null
+        t.exitCode = typeof code === 'number' ? code : null
+        t.endedAt = Date.now()
+        if (spec.script) { try { rmSync(spec.script, { force: true }) } catch (e) {} }
+        t.scrubFrom = null
+        if (t.lastKilled) termAppend(t, '\x1b[33m[已中断]\x1b[0m\n')
+        else if (t.exitCode !== null && t.exitCode !== 0) termAppend(t, '\x1b[31m[退出代码 ' + t.exitCode + ']\x1b[0m\n')
+        else if (signal) termAppend(t, '\x1b[33m[信号 ' + signal + ']\x1b[0m\n')
+        // A terminal command is a USER action: its file changes fold into the
+        // baseline (never the review), but mutating commands still refresh the
+        // tree/modified list so build output and installs show up right away.
+        if (source === 'run' || MUTATING_SHELL_RE.test(line) || MUTATING_GIT_RE.test(line)) {
+          if (st && st.baseReady) {
+            st.dirty = true
+            st.mutationStamp = (st.mutationStamp || 0) + 1
+            invalidateGitCacheFor(st.root)
+            bumpTree(st)
+            scheduleNotify(st.sid, 300)
+          }
+        }
+      })
+      return { ok: true, ...termInfoOf(t) }
+    }
+
+    // ---------- v1.24: project run-target detection ----------
+    // Local environments win over global ones: `node_modules/.bin/<pm>`,
+    // `.venv/Scripts/python.exe`, `./gradlew`, `./mvnw` are preferred whenever
+    // they exist; the global command is the fallback. Detection is best-effort
+    // by design — an unknown project still gets the terminal's free-form input.
+    const RUN_SCRIPT_ORDER = ['dev', 'start', 'serve', 'preview', 'run', 'develop', 'watch']
+    const RUN_SCRIPT_SKIP = /^(test|tests|lint|format|typecheck|build|clean|prepare|prepublish|postinstall|preinstall|release|deploy|docs?)$/i
+    function termQuote(s) {
+      if (TERM_SHELL.dialect === 'pwsh') return "'" + String(s).replace(/'/g, "''") + "'"
+      return "'" + String(s).replace(/'/g, "'\\''") + "'"
+    }
+    async function detectRunCandidates(st, activePath) {
+      const root = st.root
+      const out = []
+      const seen = new Set()
+      let rootTarget
+      try { rootTarget = await fs.resolve(root) } catch (e) { return out }
+      let entries = []
+      try { entries = await fs.listDir(rootTarget) } catch (e) { entries = [] }
+      const files = new Set()
+      const dirs = new Set()
+      for (const e of entries) { if (e.type === 'directory') dirs.add(e.name); else files.add(e.name) }
+      const has = (n) => files.has(n)
+      const hasDir = (n) => dirs.has(n)
+      const readRel = async (rel) => { try { return await fs.readText(await fs.resolve(joinPath(root, rel))) } catch (e) { return null } }
+      const existsRel = async (rel) => { try { return !!(await fs.stat(await fs.resolve(joinPath(root, rel)))) } catch (e) { return false } }
+      const firstExisting = async (rels) => { for (const rel of rels) if (await existsRel(rel)) return rel; return null }
+      const localExe = (rel) => (TERM_SHELL.dialect === 'pwsh' ? '& ' : '') + '"' + joinPath(root, rel) + '"'
+      const push = (c) => {
+        if (!c || !c.command) return
+        const key = c.command
+        if (seen.has(key)) return
+        seen.add(key)
+        out.push(c)
+      }
+      const relDir = (rel) => rel.split('/').slice(0, -1).join('/')
+
+      // ---- Node / JavaScript / TypeScript ----
+      if (has('package.json')) {
+        let pkg = null
+        try { pkg = JSON.parse((await readRel('package.json')) || '{}') } catch (e) { pkg = null }
+        const scripts = pkg && pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {}
+        const pm = has('pnpm-lock.yaml') ? 'pnpm' : has('yarn.lock') ? 'yarn' : (has('bun.lockb') || has('bun.lock')) ? 'bun' : 'npm'
+        const localPm = await firstExisting(['node_modules/.bin/' + pm + '.cmd', 'node_modules/.bin/' + pm + '.ps1', 'node_modules/.bin/' + pm])
+        const runner = localPm ? localExe(localPm) : pm
+        const names = Object.keys(scripts)
+        const ordered = RUN_SCRIPT_ORDER.filter((n) => names.indexOf(n) >= 0)
+          .concat(names.filter((n) => RUN_SCRIPT_ORDER.indexOf(n) < 0 && !RUN_SCRIPT_SKIP.test(n)))
+        for (const name of ordered.slice(0, 6)) {
+          push({
+            id: 'pm:' + name,
+            label: pm + ' run ' + name,
+            command: runner + ' run ' + name,
+            kind: 'node',
+            source: localPm ? 'local' : 'global',
+            detail: String(scripts[name] === undefined ? '' : scripts[name]).slice(0, 90),
+          })
+        }
+        const main = pkg && typeof pkg.main === 'string' ? pkg.main : (pkg && typeof pkg.bin === 'string' ? pkg.bin : null)
+        if (main && await existsRel(main)) {
+          push({ id: 'node:main', label: 'node ' + main, command: 'node ' + termQuote(main), kind: 'node', source: 'global', detail: 'package.json main' })
+        }
+        const localTsx = await firstExisting(['node_modules/.bin/tsx.cmd', 'node_modules/.bin/tsx'])
+        if (localTsx && activePath && /\.(ts|mts|cts)$/i.test(activePath)) {
+          push({ id: 'tsx:active', label: 'tsx ' + activePath, command: localExe(localTsx) + ' ' + termQuote(activePath), kind: 'node', source: 'local', detail: '当前文件' })
+        }
+      }
+
+      // ---- Python ----
+      const pyLocal = await firstExisting([
+        '.venv/Scripts/python.exe', 'venv/Scripts/python.exe', 'env/Scripts/python.exe',
+        '.venv/bin/python', 'venv/bin/python', 'env/bin/python', '.venv/bin/python3',
+      ])
+      const py = pyLocal ? localExe(pyLocal) : (process.platform === 'win32' ? 'python' : 'python3')
+      const pySource = pyLocal ? 'local' : 'global'
+      if (has('manage.py')) {
+        push({ id: 'django', label: py + ' manage.py runserver', command: py + ' manage.py runserver', kind: 'python', source: pySource, detail: 'Django' })
+      }
+      const pyEntry = await firstExisting(['main.py', 'app.py', 'run.py', 'server.py', 'src/main.py', 'src/app.py', '__main__.py'])
+      if (pyEntry) {
+        push({ id: 'py:entry', label: py + ' ' + pyEntry, command: py + ' ' + pyEntry, kind: 'python', source: pySource, detail: '入口脚本' })
+      }
+      if (has('pyproject.toml') && !pyEntry) {
+        const toml = (await readRel('pyproject.toml')) || ''
+        const m = /\[project\.scripts\][^[]*?^\s*([A-Za-z0-9_.-]+)\s*=/m.exec(toml)
+        if (m) push({ id: 'py:script', label: py + ' -m ' + m[1], command: py + ' -m ' + m[1], kind: 'python', source: pySource, detail: 'pyproject [project.scripts]' })
+      }
+
+      // ---- Rust / Go / .NET ----
+      if (has('Cargo.toml')) {
+        push({ id: 'cargo', label: 'cargo run', command: 'cargo run', kind: 'rust', source: 'global', detail: 'Cargo.toml' })
+      }
+      if (has('go.mod')) {
+        push({ id: 'go', label: 'go run .', command: 'go run .', kind: 'go', source: 'global', detail: 'go.mod' })
+      }
+      const csproj = entries.filter((e) => e.type === 'file' && /\.(cs|fs|vb)proj$/i.test(e.name))[0]
+      if (csproj || entries.some((e) => e.type === 'file' && /\.sln$/i.test(e.name))) {
+        push({ id: 'dotnet', label: 'dotnet run', command: 'dotnet run', kind: 'dotnet', source: 'global', detail: csproj ? csproj.name : '解决方案文件' })
+      }
+
+      // ---- Java (Gradle / Maven) ----
+      const gradlew = await firstExisting(['gradlew.bat', 'gradlew'])
+      const buildGradle = (await readRel('build.gradle')) || (await readRel('build.gradle.kts')) || ''
+      if (gradlew) {
+        const boot = /org\.springframework\.boot|spring-boot/i.test(buildGradle)
+        const task = boot ? 'bootRun' : 'run'
+        const cmd = (process.platform === 'win32' && /\.bat$/.test(gradlew) ? '.\\' + gradlew : './' + gradlew) + ' ' + task
+        push({ id: 'gradle', label: gradlew + ' ' + task, command: cmd, kind: 'java', source: 'local', detail: boot ? 'Spring Boot' : 'Gradle' })
+      }
+      const pom = await readRel('pom.xml')
+      if (pom && /spring-boot/i.test(pom)) {
+        const mvnw = await firstExisting(['mvnw.cmd', 'mvnw'])
+        const mvn = mvnw ? (process.platform === 'win32' && /\.cmd$/.test(mvnw) ? '.\\' + mvnw : './' + mvnw) : 'mvn'
+        push({ id: 'maven', label: mvn + ' spring-boot:run', command: mvn + ' spring-boot:run', kind: 'java', source: mvnw ? 'local' : 'global', detail: 'Spring Boot' })
+      }
+
+      // ---- Make / task runners ----
+      const makefile = has('Makefile') ? 'Makefile' : has('makefile') ? 'makefile' : null
+      if (makefile) {
+        const body = (await readRel(makefile)) || ''
+        const target = /^run\s*:/m.test(body) ? 'run' : (/^dev\s*:/m.test(body) ? 'dev' : '')
+        push({ id: 'make', label: 'make' + (target ? ' ' + target : ''), command: 'make' + (target ? ' ' + target : ''), kind: 'make', source: 'global', detail: makefile })
+      }
+
+      // ---- PHP / Ruby ----
+      if (has('artisan')) {
+        push({ id: 'artisan', label: 'php artisan serve', command: 'php artisan serve', kind: 'php', source: 'global', detail: 'Laravel' })
+      } else if (hasDir('public') && await existsRel('public/index.php')) {
+        push({ id: 'php:serve', label: 'php -S localhost:8000 -t public', command: 'php -S localhost:8000 -t public', kind: 'php', source: 'global', detail: 'PHP 内置服务器' })
+      } else if (has('composer.json')) {
+        let comp = null
+        try { comp = JSON.parse((await readRel('composer.json')) || '{}') } catch (e) { comp = null }
+        if (comp && comp.scripts && comp.scripts.start) push({ id: 'composer:start', label: 'composer start', command: 'composer start', kind: 'php', source: 'global', detail: 'composer script' })
+      }
+      if (has('Gemfile')) {
+        if (has('config.ru')) push({ id: 'rack', label: 'bundle exec rackup', command: 'bundle exec rackup', kind: 'ruby', source: 'global', detail: 'config.ru' })
+        else if (has('app.rb')) push({ id: 'ruby:app', label: 'bundle exec ruby app.rb', command: 'bundle exec ruby app.rb', kind: 'ruby', source: 'global', detail: 'app.rb' })
+      }
+
+      // ---- Docker compose ----
+      if (has('docker-compose.yml') || has('docker-compose.yaml') || has('compose.yml') || has('compose.yaml')) {
+        push({ id: 'compose', label: 'docker compose up', command: 'docker compose up', kind: 'docker', source: 'global', detail: 'Compose 文件' })
+      }
+
+      // ---- project scripts ----
+      const ps1 = await firstExisting(['run.ps1', 'start.ps1', 'dev.ps1', 'scripts/run.ps1'])
+      if (ps1 && TERM_SHELL.dialect === 'pwsh') {
+        push({ id: 'ps1', label: ps1, command: '& ' + termQuote(joinPath(root, ps1)), kind: 'script', source: 'local', detail: 'PowerShell 脚本' })
+      }
+      const shScript = await firstExisting(['run.sh', 'start.sh', 'dev.sh', 'scripts/run.sh'])
+      if (shScript) {
+        push({ id: 'sh', label: 'bash ' + shScript, command: 'bash ' + termQuote(shScript), kind: 'script', source: 'local', detail: 'Shell 脚本' })
+      }
+
+      // ---- static site (only when nothing else matched) ----
+      if (out.length === 0 && has('index.html')) {
+        push({ id: 'static', label: py + ' -m http.server 8000', command: py + ' -m http.server 8000', kind: 'static', source: pySource, detail: '静态站点' })
+      }
+
+      // ---- active file fallback ----
+      if (out.length === 0 && activePath) {
+        const ext = activePath.split('.').pop().toLowerCase()
+        if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
+          push({ id: 'node:active', label: 'node ' + activePath, command: 'node ' + termQuote(activePath), kind: 'node', source: 'global', detail: '当前文件' })
+        } else if (ext === 'py') {
+          push({ id: 'py:active', label: py + ' ' + activePath, command: py + ' ' + termQuote(activePath), kind: 'python', source: pySource, detail: '当前文件' })
+        } else if (ext === 'ps1' && TERM_SHELL.dialect === 'pwsh') {
+          push({ id: 'ps1:active', label: activePath, command: '& ' + termQuote(joinPath(root, activePath)), kind: 'script', source: 'local', detail: '当前文件' })
+        } else if (ext === 'sh') {
+          push({ id: 'sh:active', label: 'bash ' + activePath, command: 'bash ' + termQuote(activePath), kind: 'script', source: 'local', detail: '当前文件' })
+        }
+      }
+
+      // local environments first, stable inside each group
+      const ranked = out.map((c, i) => ({ c, i })).sort((a, b) => {
+        const d = (a.c.source === 'local' ? 0 : 1) - (b.c.source === 'local' ? 0 : 1)
+        return d !== 0 ? d : a.i - b.i
+      }).map((x) => x.c)
+      return ranked.slice(0, 8)
     }
 
     // ---------- HTTP carrier ----------
@@ -2473,6 +3024,10 @@ export default {
       // the last accept/reject/scan changes.
       for (const [, rec] of saveTimers) { clearTimeout(rec.t); saveState(rec.st) }
       saveTimers.clear()
+      // v1.24: no terminal child may outlive the plugin fiber.
+      for (const [, t] of terms) { if (t.pid) termKillTree(t.pid, 'SIGKILL') }
+      terms.clear()
+      try { rmSync(TERM_TMP_DIR, { recursive: true, force: true }) } catch (e) {}
     }, 'dsh-file-edit: wait cleanup')
 
     // ---------- change triggers ----------
