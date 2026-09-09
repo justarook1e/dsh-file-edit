@@ -374,10 +374,11 @@ window.__ModuleLoader__.load({
         // ---------- new-session guard ----------
         // Every New Session entry point in the shell (sidebar top button,
         // wordmark, workspace rows, agent-preset flows) funnels into
-        // ctx.workspaces.startSession — the shell closures read the method
+        // workspace session creation — v1.23 (DSH 0.1.5-alpha.1 compat):
+        // on new DSH that is ctx.uiWorkspace.startSession, on 0.1.1-rc.2 it
+        // is ctx.workspaces.startSession. The shell closures read the method
         // LIVE at click time, so shadowing the instance method here guards
-        // the native button AND this plugin's own 会话历史「新建会话」
-        // button with one seam. When the current session still has
+        // both layouts with one seam. When the current session still has
         // unreviewed revisions, toast and swallow the action; otherwise —
         // and on any check failure (fail-open) — hand off to the original.
         let toastEl = null
@@ -393,6 +394,20 @@ window.__ModuleLoader__.load({
           toastEl.style.display = 'block'
           if (toastTimer) clearTimeout(toastTimer)
           toastTimer = setTimeout(() => { if (toastEl) toastEl.style.display = 'none' }, 6000)
+        }
+        // v1.23 (DSH 0.1.5-alpha.1 compat): the Workspace Controller's client
+        // service dropped startSession/pickDirectory/refresh — session
+        // creation and directory picking moved to the ui-workspace package's
+        // own `uiWorkspace` service (startSession(workspaceId?),
+        // pickDirectory(), archiveSession). Probe it lazily via ctx.get
+        // (never a hard inject, so an old DSH without the service cannot
+        // block this plugin's activation) and accept late activation.
+        const getUiWorkspace = () => {
+          try { return ctx.get ? ctx.get('uiWorkspace') : null } catch (e) { return null }
+        }
+        const hasUiStartSession = () => {
+          const uw = getUiWorkspace()
+          return !!(uw && typeof uw.startSession === 'function')
         }
         const origStartSession = ctx.workspaces && typeof ctx.workspaces.startSession === 'function'
           ? ctx.workspaces.startSession
@@ -422,27 +437,60 @@ window.__ModuleLoader__.load({
         const guardedStartSession = function () {
           const args = arguments
           const allow = () => {
+            // Call the PRE-SHADOW original every time: the instance methods
+            // may carry our own shadow (tryShadow below), and calling through
+            // the wrapper would re-enter this guard forever. `__wrapped` is
+            // set by our wrapper only, so its presence means "unwrap first".
+            const unwrap = (fn) => (fn && fn.__wrapped ? fn.__wrapped : fn)
+            // 1) old service (0.1.1-rc.2): ctx.workspaces.startSession
             if (origStartSession && wsInstance) { origStartSession.apply(wsInstance, args); return }
-            // Late-bound fallback (service arrived after apply): live lookup.
+            // 2) new service (0.1.5-alpha.1): ctx.uiWorkspace.startSession —
+            //    the shell sidebars hold the uiWorkspace instance and read
+            //    the method at click time, so a live lookup sees a shadow.
+            const uw = getUiWorkspace()
+            if (uw && typeof uw.startSession === 'function') {
+              unwrap(uw.startSession).apply(uw, args)
+              return
+            }
+            // 3) late-bound old service (arrived after apply): live lookup.
             const live = ctx.workspaces
-            if (live && typeof live.startSession === 'function') live.startSession.apply(live, args)
+            if (live && typeof live.startSession === 'function') {
+              unwrap(live.startSession).apply(live, args)
+            }
           }
           const sid = currentSessionId()
-          if (!sid || !origStartSession) { allow(); return }
+          if (!sid || (!origStartSession && !hasUiStartSession())) { allow(); return }
           checkThen(sid, allow)
         }
         // Mechanism 1 — method shadow (covers every service-level entry
-        // point that calls ctx.workspaces.startSession). The service is
-        // delivered through Cordis's traceable proxy, so a raw identity
-        // compare always fails (method reads return shadow proxies) — verify
-        // through a marker on the wrapped function instead.
+        // point that creates a session: the old rc.2 ctx.workspaces.startSession
+        // and the new ctx.uiWorkspace.startSession). The service is delivered
+        // through Cordis's traceable proxy, so a raw identity compare always
+        // fails (method reads return shadow proxies) — verify through a
+        // marker on the wrapped function instead. Probed lazily: uiWorkspace
+        // may activate after apply.
         let wrapOk = false
-        if (origStartSession) {
+        const shadowPairs = []
+        const tryShadow = (inst, orig) => {
+          if (!inst || typeof orig !== 'function') return false
           try {
-            guardedStartSession.__wrapped = origStartSession
-            wsInstance.startSession = guardedStartSession
-            if (wsInstance.startSession && wsInstance.startSession.__wrapped === origStartSession) wrapOk = true
-          } catch (e) {}
+            if (inst.startSession && inst.startSession.__wrapped) return true
+            const g = function () { guardedStartSession.apply(undefined, arguments) }
+            g.__wrapped = orig
+            inst.startSession = g
+            if (inst.startSession && inst.startSession.__wrapped === orig) {
+              shadowPairs.push([inst, orig])
+              return true
+            }
+            return false
+          } catch (e) { return false }
+        }
+        if (wsInstance && origStartSession) wrapOk = tryShadow(wsInstance, origStartSession) || wrapOk
+        {
+          const uwInst = getUiWorkspace()
+          if (uwInst && typeof uwInst.startSession === 'function') {
+            wrapOk = tryShadow(uwInst, uwInst.startSession) || wrapOk
+          }
         }
         // Mechanism 2 — DOM capture interception for the native sidebar
         // buttons, ALWAYS installed: it does not depend on the service
@@ -516,8 +564,14 @@ window.__ModuleLoader__.load({
               b.__dshFbDirect = true
               const allowStartSession = () => {
                 try {
+                  // v1.23: uiWorkspace first (0.1.5-alpha.1), old service second.
+                  // Unwrap our own shadow (__wrapped) before calling, or the
+                  // wrapper re-enters the guard.
+                  const unwrap = (fn) => (fn && fn.__wrapped ? fn.__wrapped : fn)
+                  const uw = getUiWorkspace()
+                  if (uw && typeof uw.startSession === 'function') { unwrap(uw.startSession).apply(uw, [undefined]); return }
                   const live = ctx.workspaces
-                  if (live && typeof live.startSession === 'function') live.startSession(undefined)
+                  if (live && typeof live.startSession === 'function') unwrap(live.startSession).apply(live, [undefined])
                 } catch (e) {}
               }
               b.onclick = function (ev) {
@@ -543,7 +597,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.22.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.23.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -554,8 +608,11 @@ window.__ModuleLoader__.load({
           } catch (e) {}
           // Restore only when our wrapper is really the one installed (the
           // proxy wraps method reads, so compare via the marker, not identity).
-          if (origStartSession && wsInstance && wsInstance.startSession && wsInstance.startSession.__wrapped === origStartSession) {
-            wsInstance.startSession = origStartSession
+          for (const pair of shadowPairs) {
+            const inst = pair[0], orig = pair[1]
+            if (inst && inst.startSession && inst.startSession.__wrapped === orig) {
+              inst.startSession = orig
+            }
           }
           if (toastTimer) clearTimeout(toastTimer)
           if (toastEl) { toastEl.remove(); toastEl = null }
@@ -1638,7 +1695,15 @@ window.__ModuleLoader__.load({
           const items = wsState ? wsState.items : []
           const addWorkspace = async () => {
             try {
-              const path = await ctx.workspaces.pickDirectory()
+              // v1.23: pickDirectory moved to the uiWorkspace service
+              // (DSH 0.1.5-alpha.1); fall back to ctx.workspaces.pickDirectory()
+              // on the old 0.1.1-rc.2 layout where the service is absent.
+              const uw = getUiWorkspace()
+              const path = uw && typeof uw.pickDirectory === 'function'
+                ? await uw.pickDirectory()
+                : (ctx.workspaces && typeof ctx.workspaces.pickDirectory === 'function'
+                  ? await ctx.workspaces.pickDirectory()
+                  : null)
               if (path) await ctx.workspaces.create({ path: path })
               setError(null)
             } catch (e) {
