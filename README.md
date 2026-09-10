@@ -4,7 +4,7 @@
 
 > ⚠️ **测试版声明**：本插件目前处于**测试阶段**（含实验性的文件编辑、撤销/重做与自动保存功能），可能存在未知缺陷。请谨慎使用，重要文件与重要会话数据请提前备份。
 
-> **适配 DSH 版本**：当前版本（v1.24.0）适配 **DSH（deepseek-harness）`dsh-v0.1.5-alpha.1`**。
+> **适配 DSH 版本**：当前版本（v1.24.0）适配 **DSH（deepseek-harness）`dsh-v0.1.5-rc.1`**（已在 rc.1 上实机核验：宿主 5 个服务契约、客户端 4 个槽位注册与终端/运行 RPC 全部正常）。
 
 DSH WebUI 工作区文件插件，核心功能有三块：
 
@@ -32,7 +32,7 @@ DSH WebUI 工作区文件插件，核心功能有三块：
 - **大规模审阅性能（v1.18）**：状态保存改为防抖合并（连续接受/拒绝共享一次落盘，响应先于序列化返回）、已审阅文件不再重复持久化 `cur` 内容（状态文件体积约减半）、修改列表统计按文件版本缓存——文件数量很大时，单文件接受/全部接受不再卡顿。
 - **文件内搜索（v1.22）**：代码视图中 Ctrl+F 弹出搜索框——固定在「上一处/下一处变更」跳转控件左侧（同一粘性条），若按 Ctrl+F 前选中了文本则自动填入搜索框；命中文本以琥珀色高亮（当前命中更强高亮 + 描边），搜索框右端一体化背景内提供 ▲/▼箭头上一处/下一处（或 Enter/Shift+Enter/↑/↓），Esc 关闭并清除高亮；支持多行查询（按显示行拼接匹配）。
 - **多行鼠标选择与粘贴修复（v1.22）**：鼠标拖拽可跨行选择（每行是独立 contentEditable，浏览器原生拖选被限制在单行内——插件改为跨行补全 DOM 选区）；Ctrl+V 粘贴改走 Paste 事件（原实现在 keydown 上读 `clipboardData` 恒为空导致粘贴失效），多行文本粘贴自动分行。
-- **DSH 版本兼容（v1.23）**：适配 DSH `dsh-v0.1.5-alpha.1` 移除的 workspace 客户端 API——「新建会话」「添加工作区」「新建会话守卫（未决修订拦截）」改经新版 `uiWorkspace` 服务（`startSession` / `pickDirectory`，懒探测、非硬依赖）。
+- **DSH 版本兼容（v1.23 / v1.24 核验）**：适配 DSH `dsh-v0.1.5-alpha.1` 移除的 workspace 客户端 API——「新建会话」「添加工作区」「新建会话守卫（未决修订拦截）」改经新版 `uiWorkspace` 服务（`startSession` / `pickDirectory`，懒探测、非硬依赖）。该适配在 `dsh-v0.1.5-rc.1` 上**原样继续成立**（rc.1 新增的 keyed 根槽 `main` / `main.conversation`、`ctx.layout.selectPanel`、`sidebar.panellist` 均不影响本插件注册的 `sidebar.workspaces`、`conversation.view`、`conversation.input.dock`）。
 - **集成终端（v1.24）**：顶栏新增「终端」标签（在「文件」右侧）——工作目录 = 会话工作区，逐条命令在独立进程中执行（`cd` 由插件接管并保持，因此 `cd src` 后 `ls` 仍然生效），流式输出支持 ANSI 颜色（16 色 / 256 色 / 真彩色、加粗、下划线、反显）、`\r` 进度条重写与 `\x1b[K` 清除；运行中的进程可用「中断」按钮（等同 Ctrl+C，整棵进程树一起结束），输入行在进程运行时直接写入该进程 stdin（可回答 y/N、`input()`、`Read-Host` 等交互提示）；支持 ↑↓ 命令历史、Ctrl+L 清空、回车执行。**注意：终端命令不受 agent 沙箱策略限制**（等同本机终端），执行产生的文件变化按「用户改动」折叠进基线，不进入 DIFF 审阅。
 - **项目运行按钮（v1.24）**：文件标签页下方那行（文件工具栏）右侧新增「运行」按钮 + 下拉选择——自动识别项目入口并按**项目本地环境优先、全局兜底**排序：`package.json` scripts（pnpm/yarn/bun/npm 按锁文件判定，`node_modules/.bin/<pm>` 存在时优先本地）与 `main` 字段、Python（`.venv`/`venv` 内的解释器优先，`manage.py runserver`、`main.py`/`app.py`、`pyproject [project.scripts]`）、Rust（`cargo run`）、Go（`go run .`）、.NET（`dotnet run`）、Java（`gradlew bootRun`/`run`、Spring Boot 的 `mvn spring-boot:run`）、Makefile（`make run`）、PHP（Laravel `artisan serve`、内置服务器）、Ruby（`rackup`）、Docker Compose、`run.ps1`/`run.sh` 脚本，最后是当前文件（`node`/`python`/`bash`/PowerShell）。唯一候选一键直跑，多个候选弹出选择列表（带「本地/全局」标记）；点击后自动切到终端标签并执行，运行期间按钮变为「停止」。
 - **搜索框 Esc 关闭（v1.24）**：文件内搜索框打开后，无论焦点在搜索框、编辑区还是工具栏，按 Esc 都会关闭搜索框并清除高亮（此前只有焦点在搜索框内时 Esc 才生效）。
