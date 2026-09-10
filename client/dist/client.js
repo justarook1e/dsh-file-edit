@@ -1004,7 +1004,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.24.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.29.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -1497,12 +1497,21 @@ window.__ModuleLoader__.load({
           '.dsh-fe-term-prompt-on { color:var(--dsw-alias-state-success-primary); }',
           '.dsh-fe-term-input { flex:1; min-width:0; border:none; outline:none; background:transparent; color:var(--dsw-alias-label-primary); font-family:ui-monospace,Consolas,monospace; font-size:12.5px; padding:3px 0; }',
           '.dsh-fe-term-input::placeholder { color:var(--dsw-alias-label-secondary); opacity:.7; }',
-          '.dsh-fe-runbtn { display:inline-flex; align-items:center; gap:4px; flex:none; margin-left:6px; padding:2px 9px; border:1px solid color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); background:transparent; color:var(--dsw-alias-state-success-primary); border-radius:6px; font-size:12px; cursor:pointer; }',
+          // v1.29: icon-only run control. The old form was a text button
+          // ("运行" / "停止" / "识别中…") plus a separate caret button whose only
+          // job was opening the target picker; the label is now the tooltip and
+          // the button is a 22px square matching the toolbar's IconBtns, so the
+          // whole run affordance is one glyph. A single candidate still runs
+          // straight away; several (or a right-click for one) open the picker
+          // after a short press so a quick click cannot flash the veil.
+          '.dsh-fe-runbtn { display:inline-flex; align-items:center; justify-content:center; gap:0; flex:none; margin-left:6px; width:22px; height:22px; padding:0; border:1px solid color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, transparent); background:transparent; color:var(--dsw-alias-state-success-primary); border-radius:6px; font-size:12px; cursor:pointer; transition:background .12s ease,color .12s ease,border-color .12s ease; }',
           '.dsh-fe-runbtn:hover { background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent); }',
+          '.dsh-fe-runbtn:focus-visible { outline:1px solid var(--dsw-alias-state-success-primary); outline-offset:1px; }',
+          // Detecting: the glyph fades while termDetect runs (no text label any
+          // more, and no disabled attribute — a re-click just re-detects).
+          '.dsh-fe-runbtn-wait { opacity:.55; }',
           '.dsh-fe-runbtn-busy { border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, transparent); color:var(--dsw-alias-state-error-primary); }',
           '.dsh-fe-runbtn-busy:hover { background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }',
-          '.dsh-fe-runbtn-caret { display:inline-flex; align-items:center; justify-content:center; flex:none; width:18px; height:20px; padding:0; border:none; background:transparent; color:var(--dsw-alias-label-secondary); border-radius:5px; cursor:pointer; }',
-          '.dsh-fe-runbtn-caret:hover { background:color-mix(in srgb, var(--dsw-alias-label-secondary) 14%, transparent); color:var(--dsw-alias-label-primary); }',
           '.dsh-fe-runmenu { position:fixed; z-index:31; min-width:280px; max-width:min(520px, calc(100vw - 32px)); display:flex; flex-direction:column; gap:1px; padding:4px; border:1px solid var(--dsw-alias-border-l1); border-radius:8px; background:var(--dsw-alias-bg-layer-2); box-shadow:var(--dsw-shadow-lv2, 0 12px 32px rgba(0,0,0,.18)); transform-origin:top right; animation:dsh-fe-menu-in .14s ease-out; }',
           // The picker layer is rendered by FileView (RunMenuLayer), NOT by the
           // toolbar button: the toolbar is a sticky z-index:5 stacking context,
@@ -1518,6 +1527,28 @@ window.__ModuleLoader__.load({
           '.dsh-fe-runmenu-detail { font-size:11px; color:var(--dsw-alias-label-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }',
           '.dsh-fe-runmenu-foot { font-size:10.5px; color:var(--dsw-alias-label-secondary); padding:5px 8px 3px; border-top:1px solid var(--dsw-alias-border-l1); margin-top:2px; }',
           '@media (prefers-reduced-motion: reduce) { .dsh-fe-term-dot-on { animation:none; } }',
+          // ---- v1.28: no shell width handles over the 文件/终端 views ----
+          // DSH 0.1.5-rc.1's ConversationRoot renders two 40px col-resize strips
+          // (data-width-handle, z-index 8) that drag the transcript content
+          // width (--dsh-chat-user-width). They are meaningful for the
+          // centered 对话 transcript and for the ledger-style 轨迹 view (which
+          // suppresses them itself via data-conversation-composer-overlay),
+          // but the 文件/终端 panes are full-width app surfaces: the strips
+          // only hover a col-resize cursor and an out-of-place glow over the
+          // editor and the terminal, and dragging one silently shifts the
+          // transcript width from a view that never shows a transcript.
+          //
+          // Only the strip itself is hidden — never the width axis — so
+          // switching back to 对话 keeps whatever width was configured, and a
+          // drag started in 对话 may still continue while the view switches
+          // (the handle stays mounted and only stops painting/hit-testing).
+          // Keyed on the panes' own roots (.dsh-fe-viewer / .dsh-fe-term)
+          // under the shell's scrollport anchor ([data-conversation-scroll],
+          // ConversationRoot's .scrollBody, a SIBLING of the handles, so this
+          // has() sees the live view). The shell's own stacking context is
+          // untouched, so the fixed-width-dependent chrome (e.g. the run menu
+          // layer) still reads the same column box it did before.
+          'body:has([data-conversation-scroll] .dsh-fe-viewer) [data-width-handle], body:has([data-conversation-scroll] .dsh-fe-term) [data-width-handle] { display:none !important; }',
         ].join('\n')
         const ensureStyle = () => {
           if (styleEl) return
@@ -6033,40 +6064,59 @@ window.__ModuleLoader__.load({
             setDetecting(false)
             return r
           }
-          const onMain = async () => {
+          // Opens the run-target picker at the button (shared by the multi-
+          // candidate path and the right-click shortcut).
+          const openMenu = async () => {
             if (!sid) return
-            if (busy) { void termStore.signal(sid); return }
-            const r = await detect()
-            if (!r) return
-            if (r.candidates.length === 1) { await runProjectTarget(sid, r.candidates[0].command); return }
-            store.setRunMenu({ ...place(), sid: sid, items: r.candidates, error: r.ok ? null : r.error, loading: false })
-          }
-          const onCaret = async () => {
-            if (!sid) return
-            if (menu) { store.setRunMenu(null); return }
             store.setRunMenu({ ...place(), sid: sid, items: [], error: null, loading: true })
             const r = await detect()
             const cur = store.runMenu
-            if (cur) store.setRunMenu({ ...cur, items: r.candidates, error: r.ok ? null : r.error, loading: false })
+            if (cur) store.setRunMenu({ ...cur, items: r ? r.candidates : [], error: r && !r.ok ? r.error : null, loading: false })
           }
-          return React.createElement(React.Fragment, null,
-            React.createElement('button', {
-              type: 'button',
-              ref: (node) => { btnRef.el = node },
-              className: 'dsh-fe-runbtn' + (busy ? ' dsh-fe-runbtn-busy' : ''),
-              title: busy ? '中断当前运行的进程' : '运行项目（自动识别语言/框架，项目本地环境优先）',
-              onClick: () => { void onMain() },
-            },
-              busy ? IconStop() : IconPlay(),
-              React.createElement('span', null, busy ? '停止' : (detecting ? '识别中…' : '运行')),
-            ),
-            React.createElement('button', {
-              type: 'button',
-              className: 'dsh-fe-runbtn-caret',
-              title: '选择运行目标',
-              onClick: () => { void onCaret() },
-            }, IconChevDown()),
-          )
+          // v1.29: one glyph, three gestures —
+          //   left click  : run the project (the only candidate runs straight
+          //                 away; several open the picker);
+          //   right click : always open the picker, even with one candidate;
+          //   while busy  : left click interrupts (same as before), and since
+          //                 the only run is already in flight a right-click is
+          //                 deliberately ignored instead of raising the veil.
+          // A left click waits one frame-ish before acting so a right-click
+          // (which fires pointerdown/contextmenu first) can cancel it.
+          const clickTimer = React.useState({ id: null })[0]
+          const cancelClick = () => {
+            if (clickTimer.id !== null) { clearTimeout(clickTimer.id); clickTimer.id = null }
+          }
+          React.useEffect(() => () => cancelClick(), [])
+          const onMain = () => {
+            if (!sid) return
+            cancelClick()
+            if (busy) { void termStore.signal(sid); return }
+            clickTimer.id = setTimeout(() => { clickTimer.id = null; void runOrPick() }, 200)
+          }
+          const onContextMenu = (ev) => {
+            ev.preventDefault()
+            cancelClick()
+            if (busy) return
+            void openMenu()
+          }
+          const runOrPick = async () => {
+            const r = await detect()
+            if (!r) return
+            if (r.candidates.length === 1) { await runProjectTarget(sid, r.candidates[0].command); return }
+            await openMenu()
+          }
+          return React.createElement('button', {
+            type: 'button',
+            ref: (node) => { btnRef.el = node },
+            className: 'dsh-fe-runbtn' + (busy ? ' dsh-fe-runbtn-busy' : (detecting ? ' dsh-fe-runbtn-wait' : '')),
+            title: busy
+              ? '停止：中断当前运行的进程'
+              : '运行项目（自动识别语言/框架，项目本地环境优先）· 右键选择运行目标',
+            'aria-label': busy ? '停止运行' : '运行项目',
+            'aria-busy': detecting || undefined,
+            onClick: onMain,
+            onContextMenu: onContextMenu,
+          }, busy ? IconStop() : IconPlay())
         }
         // The run-target picker itself, rendered by FileView at the dialog layer.
         const closeRunMenu = () => { if (store.runMenu) store.setRunMenu(null) }

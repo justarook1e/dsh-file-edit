@@ -92,8 +92,9 @@ export default {
     // v1.20.4: expanded hard-skip list. These are dependency/runtime/cache/
     // generated-output directories — never authored source — so agent changes
     // inside them are NOT reviewed (and they do not consume the walk budget).
-    // Name-based match at any depth, applied identically to the review scan
-    // (walkFiles) and the file tree (treeNode).
+    // v1.27: this list now governs the REVIEW SCAN ONLY (walkFiles). The file
+    // tree has its own, much smaller hide list (TREE_SKIP_DIRS) so that a
+    // dependency/runtime folder is still browsable — see the note there.
     const SKIP_DIRS = new Set([
       // version control / editor / tooling metadata
       '.git', '.dsh', '.idea', '.vscode', '.DS_Store',
@@ -113,6 +114,19 @@ export default {
       // misc infra
       '.terraform', '.eslintcache', '.stylelintcache',
     ])
+    // v1.27: the file tree hides only what is not worth browsing at all —
+    // VCS/editor metadata and this plugin's own state. Dependency, runtime and
+    // build folders stay VISIBLE (that is what SKIP_DIRS above is now scoped
+    // to: they are excluded from the review scan / diff, not from the tree).
+    // Rationale: SKIP_DIRS matches by folder NAME at any depth, so a folder
+    // legitimately called `python/`, `build/` or `vendor/` used to disappear
+    // from the sidebar entirely even when it was just project layout.
+    const TREE_SKIP_DIRS = new Set(['.git', '.dsh', '.idea', '.vscode', '.DS_Store'])
+    // The tree gets its own, larger ceiling: MAX_ENTRIES is a REVIEW-coverage
+    // bound (how much source the diff may cover). With dependency folders now
+    // rendered, that number would truncate the tree far too early, so the tree
+    // is bounded separately — purely as a payload/serialization guard.
+    const TREE_MAX_NODES = 20000
     // v1.13.3: change triggers are event-driven and NARROW — the client no
     // longer fast-polls (its fixed 20s arm is only a failsafe), so a trigger
     // here must be both precise and cheap. write/edit always mutate and carry
@@ -512,14 +526,14 @@ export default {
         for (const entry of st.files) {
           const base = entry[1].base
           const cur = entry[1].cur
-          // v1.18: a clean file (base === cur on every axis) needs only its
-          // baseline persisted — loadState reconstructs cur as a clone of it.
-          // Big workspaces (15K entries, BM_automation) used to serialize
-          // EVERY file's content twice; halving the state blob is what makes
-          // per-file accept/reject saves tolerable on the debounced path.
-          const redundantCur = !!(base && cur && base.present === cur.present &&
-            base.version === cur.version && base.size === cur.size &&
-            (cur.content === null || base.content === cur.content))
+          // v1.18: a clean file needs only its baseline persisted — loadState
+          // reconstructs cur as a clone of it. Big workspaces (15K entries,
+          // BM_automation) used to serialize EVERY file's content twice;
+          // halving the state blob is what makes per-file accept/reject saves
+          // tolerable on the debounced path. v1.29: "clean" is entrySame, the
+          // same content-first rule the review itself uses (an EOL-only flip is
+          // clean even though its version token moved).
+          const redundantCur = entrySame(base, cur)
           files[entry[0]] = {
             base: base,
             cur: redundantCur ? undefined : cur,
@@ -783,21 +797,30 @@ export default {
     async function refreshOne(st, rel, w) {
       let f = st.files.get(rel)
       if (!f) { f = { base: null, cur: null, rev: 0, decisions: new Map() }; st.files.set(rel, f) }
-      if (f.cur && f.cur.present && f.cur.version === w.version && f.cur.size === w.size) {
-        return f
-      }
+      // Stat fast path: same token AND same size means the file was not touched
+      // at all, so there is nothing to re-read.
+      if (f.cur && f.cur.present && f.cur.version === w.version && f.cur.size === w.size) return f
       if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
-      f.cur = await loadFileEntry(st, rel)
+      const next = await loadFileEntry(st, rel)
+      // v1.29: a stat change is not a change. When the newly read text is
+      // identical to what we already hold (an identical rewrite, an editor
+      // "save", or a pure CRLF<->LF flip — which changes `size` by one byte
+      // per line), keep the EXISTING entry (old version included) so rev does
+      // not move: every consumer above this line (isChanged / isPending /
+      // f.rev-keyed caches / the client's prevRev payload guard) then sees an
+      // untouched file, and the pane does not re-render for nothing.
+      f.cur = entrySame(f.cur, next) ? f.cur : next
       f.rev++
       return f
     }
 
-    // "The file is under review" — presence or on-disk version differs from
-    // the baseline. Used by the scan, the targeted refresh and the deletion
-    // sweep to decide whether a change belongs to the review.
+    // "The file is under review" — presence or content differs from the
+    // baseline (v1.29: content-first via entrySame, so an identical rewrite or
+    // a pure CRLF/LF flip never opens a review). Used by the scan, the targeted
+    // refresh and the deletion sweep to decide whether a change belongs to the
+    // review.
     function isPending(f) {
-      return !!(f && f.base && f.cur &&
-        (f.base.present !== f.cur.present || f.base.version !== f.cur.version))
+      return !!(f && f.base && f.cur && !entrySame(f.base, f.cur))
     }
 
     async function scan(sid) {
@@ -857,7 +880,7 @@ export default {
             const pending = isPending(before)
             const f = await refreshOne(st, w.rel, w)
             if (!before || !beforeCur || beforeCur.present !== f.cur.present) treeChanged = true
-            else if (beforeCur.present && f.cur.present && beforeCur.version !== f.cur.version) contentChanged = true
+            else if (beforeCur.present && f.cur.present && !entrySame(beforeCur, f.cur)) contentChanged = true
             // First scan: baseline = current content (everything is baseline,
             // nothing is reviewed). Later scans decide by attribution.
             if (f.base === null) {
@@ -866,9 +889,11 @@ export default {
             // A non-pending file whose content changed outside the agent
             // channel (the user's own edit in an editor, a git checkout, a
             // copied file): fold the new content into the baseline silently
-            // instead of opening a review.
+            // instead of opening a review. v1.29: `!entrySame` last, so a pure
+            // CRLF/LF flip neither bumps the tree stamp nor re-folds anything —
+            // it simply is not a change.
             if (!firstScan && before && beforeCur && beforeCur.present && f.cur.present &&
-                beforeCur.version !== f.cur.version && !pending && !attrib(w.rel)) {
+                !pending && !attrib(w.rel) && !entrySame(beforeCur, f.cur)) {
               f.base = cloneEntry(f.cur)
               if (f.decisions.size > 0) f.decisions.clear()
               f.rev++
@@ -1011,13 +1036,18 @@ export default {
             }
             const f = before || { base: null, cur: null, rev: 0, decisions: new Map() }
             if (!f.cur || !f.cur.present || f.cur.version !== info.version || f.cur.size !== info.size) {
-              if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
-              f.cur = await loadFileEntry(st, rel)
-              f.rev++
+              const next = await loadFileEntry(st, rel)
+              // v1.29: identical text (including a pure CRLF/LF flip) keeps the
+              // existing entry, so no rev bump and no spurious review.
+              if (!entrySame(f.cur, next)) {
+                if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
+                f.cur = next
+                f.rev++
+              }
             }
             if (!before) st.files.set(rel, f)
             if (!before || !beforeCur || beforeCur.present !== f.cur.present) treeChanged = true
-            else if (beforeCur.present && f.cur.present && beforeCur.version !== f.cur.version) contentChanged = true
+            else if (beforeCur.present && f.cur.present && !entrySame(beforeCur, f.cur)) contentChanged = true
             // First sight of this file (never scanned): the agent channel
             // decides the baseline — touched → "added" review, otherwise fold.
             if (f.base === null) {
@@ -1027,7 +1057,7 @@ export default {
             // (mirror of the scan; prevents the open viewer flashing a diff
             // the next scan would accept anyway).
             if (before && beforeCur && beforeCur.present && f.cur.present &&
-                beforeCur.version !== f.cur.version && !pending && !attrib) {
+                !pending && !attrib && !entrySame(beforeCur, f.cur)) {
               f.base = cloneEntry(f.cur)
               if (f.decisions.size > 0) f.decisions.clear()
               f.rev++
@@ -1126,17 +1156,21 @@ export default {
     }
 
     async function treeNode(dirTarget, rel, depth, count, paths, ignored) {
-      if (depth > MAX_DEPTH || count.n >= MAX_ENTRIES) return null
+      if (depth > MAX_DEPTH || count.n >= TREE_MAX_NODES) return null
       let entries
       try { entries = await fs.listDir(dirTarget) } catch (e) { return null }
       const node = { name: rel === '' ? '.' : rel.split('/').pop(), type: 'directory', path: rel, children: [] }
       if (paths) paths.push(rel)
       for (const e of entries) {
-        if (count.n >= MAX_ENTRIES) break
+        if (count.n >= TREE_MAX_NODES) break
         const childRel = rel ? rel + '/' + e.name : e.name
         const repoRel = ignored && ignored.prefix ? ignored.prefix + '/' + childRel : childRel
         if (e.type === 'directory') {
-          if (SKIP_DIRS.has(e.name)) continue
+          // v1.27: only genuinely internal metadata is hidden; dependency /
+          // runtime / build folders are listed (they are merely NOT scanned for
+          // review — see SKIP_DIRS). Their contents still cost tree budget, so
+          // a huge folder can exhaust the tree ceiling; MAX_DEPTH also applies.
+          if (TREE_SKIP_DIRS.has(e.name)) continue
           // v1.17: ignored directories keep their full children in the tree
           // (grayed) — only the budget accounting skips ignored entries.
           const child = await treeNode(e.target, childRel, depth + 1, count, paths, ignored)
@@ -1458,11 +1492,13 @@ export default {
       const files = []
       for (const entry of st.files) {
         const rel = entry[0], f = entry[1]
-        // Version-axis listing: content comparison alone cannot see binary
-        // changes (content is null on both sides) and misses nothing for
-        // text. A fresh mtime with identical text is a touch, not a change.
+        // Content-first listing (v1.29): isChanged() already compares the
+        // normalized text for entries that carry it, so an identical rewrite —
+        // including a pure CRLF<->LF conversion, which moves the stat identity
+        // (size changes by one byte per line) but not one line of text — is
+        // simply not listed. Binary/large entries have no content in memory and
+        // fall back to the version axis inside entrySame.
         if (!f.cur || !isChanged(f)) continue
-        if (f.base && f.base.content !== null && f.base.content === f.cur.content) continue
         const s = fileStats(f)
         files.push({ path: rel, status: s.status, note: s.note, pending: s.pending, added: s.added, removed: s.removed })
       }
@@ -1470,12 +1506,55 @@ export default {
       return files
     }
 
-    // "There is a reviewable diff" for the file view: presence or on-disk
-    // version differs from the baseline. Content-only comparison cannot see
-    // binary/large changes (content is null), so the version axis is the
-    // single truth that also covers those.
+    // ---------- change identity (content-first, v1.29) ----------
+    // "Do these two observations of the same file describe the same content?"
+    //
+    // The version token is the fs service's FsVersion
+    // (`dev:ino:size:mtimeNs:ctimeNs`) — a STAT identity, not a content hash.
+    // Any rewrite bumps it even when not one character changed: an agent
+    // `write` of the identical text, an editor "save" with no edits, or — the
+    // reported bug — a pure CRLF<->LF conversion, which changes `size` (one
+    // byte per line) while every LINE stays the same. Comparing versions
+    // therefore raised a review for files with nothing to review: the file
+    // showed up as 已修改 with a "无未决定修改" toolbar and accept/reject
+    // buttons (a "full diff" over an unchanged file), for BOTH the plugin's own
+    // viewer and the modified-file list.
+    //
+    // Text entries carry their normalized content (`\r\n` -> `\n`, done once at
+    // read time in loadFileEntry), so they get a real comparison: the LINE
+    // ARRAYS — exactly what the diff itself compares and renders — must be
+    // equal. That makes the comparison blind to the line-ending style (CRLF vs
+    // LF) AND to the presence of a final newline, because neither changes a
+    // single line: `eol`/`crlf` are write-style hints for joinLines, not
+    // content. Ignoring them here is the whole point of the fix — the reported
+    // bug is precisely a flip of those two flags with identical lines.
+    //
+    // Entries without content (binary, > 512KB large) cannot be compared that
+    // way — nothing is in memory — so those keep the version axis as the only
+    // available truth. `note` differs => different kind of observation =>
+    // changed (a large/binary file that became readable is a real transition).
+    function entrySame(a, b) {
+      if (!a || !b) return a === b
+      if (a.present !== b.present) return false
+      if (!a.present) return true
+      if (a.content === null || b.content === null) {
+        return a.content === b.content && (a.note || null) === (b.note || null) && a.version === b.version
+      }
+      if ((a.note || null) !== (b.note || null)) return false
+      const la = splitLines(a.content)
+      const lb = splitLines(b.content)
+      if (la.length !== lb.length) return false
+      for (let i = 0; i < la.length; i++) if (la[i] !== lb[i]) return false
+      return true
+    }
+
+    // "There is a reviewable diff" for the file view. Content-first (v1.29):
+    // a rewrite that lands the identical bytes is not a change, no matter what
+    // the stat identity says. Binary/large entries (no content in memory) fall
+    // back to the version axis, which is all that is knowable about them.
     function isChanged(f) {
-      return !f.base || !f.cur || f.base.present !== f.cur.present || f.base.version !== f.cur.version
+      if (!f.base || !f.cur) return true
+      return !entrySame(f.base, f.cur)
     }
 
     function diffPayload(f, prevRev) {
@@ -1880,20 +1959,29 @@ export default {
           if (f && f.cur) {
             const target = await fs.resolve(joinPath(st.root, path))
             const info = await fs.stat(target)
-            const changed = !f.cur.present || !info || f.cur.version !== info.version || f.cur.size !== info.size
-            if (changed && f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
-            if (changed) {
+            const touched = !f.cur.present || !info || f.cur.version !== info.version || f.cur.size !== info.size
+            if (touched) {
               const pending = isPending(f)
-              f.cur = await loadFileEntry(st, path)
-              f.rev++
-              // v1.8 attribution: a non-pending file changed outside the
-              // agent channel (the user's own edit) folds into the baseline
-              // right away, so the open viewer never flashes a diff that the
-              // next scan would silently accept.
-              if (!pending && !st.touched.has(path) && st.shellWindow !== true && f.cur.present) {
-                f.base = cloneEntry(f.cur)
-                f.decisions.clear()
+              const next = await loadFileEntry(st, path)
+              // v1.29: only a CONTENT difference is a change. Identical text
+              // (an editor save with no edits, an identical agent rewrite, a
+              // pure CRLF/LF flip) leaves the entry — and therefore `changed`,
+              // rev and the client's cached payload — exactly as it was.
+              if (entrySame(f.cur, next)) {
+                // keep f.cur as-is
+              } else {
+                if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
+                f.cur = next
                 f.rev++
+                // v1.8 attribution: a non-pending file changed outside the
+                // agent channel (the user's own edit) folds into the baseline
+                // right away, so the open viewer never flashes a diff that the
+                // next scan would silently accept.
+                if (!pending && !st.touched.has(path) && st.shellWindow !== true && f.cur.present) {
+                  f.base = cloneEntry(f.cur)
+                  f.decisions.clear()
+                  f.rev++
+                }
               }
             }
           }
@@ -2127,9 +2215,15 @@ export default {
               const target = await fs.resolve(joinPath(st.root, path))
               const info = await fs.stat(target)
               if (!info || !f0.cur.present || f0.cur.version !== info.version || f0.cur.size !== info.size) {
-                if (f0.decisions.size > 0) { f0.decisions.clear(); f0.rev++ }
-                f0.cur = await loadFileEntry(st, path)
-                f0.rev++
+                const next = await loadFileEntry(st, path)
+                // v1.29: an identical re-read (editor save, EOL-only flip) keeps
+                // the entry, so the stale-write guard below still sees the true
+                // on-disk state without a spurious rev bump.
+                if (!entrySame(f0.cur, next)) {
+                  if (f0.decisions.size > 0) { f0.decisions.clear(); f0.rev++ }
+                  f0.cur = next
+                  f0.rev++
+                }
               }
             } catch (e) {}
           }
@@ -2816,9 +2910,160 @@ export default {
         seen.add(key)
         out.push(c)
       }
-      const relDir = (rel) => rel.split('/').slice(0, -1).join('/')
+      // ---- project-local runtimes (v1.25) ----
+      // "Local first" has to mean the RUNTIME, not just the script: a bare
+      // `python`/`node`/`cargo` is resolved by the child shell against PATH,
+      // i.e. the host process's environment — the project folder is never
+      // consulted. So every runtime this detector emits is looked up inside
+      // the workspace first and, when found, invoked by absolute path.
+      //
+      // Search order (first hit wins):
+      //   1. dependency-carrying environments: .venv / venv / env (+ Scripts|bin)
+      //   2. the project root itself
+      //   3. bin / Scripts / tools / runtime / .python / node_modules/.bin / vendor
+      //   4. root-level folders that are a Python distribution (python/,
+      //      python3.12/, miniconda3/, …) plus their Scripts|bin subdirs
+      //   5. folders of the same shape found under an OPPOSITE-named folder in
+      //      the root (`dist_package/python/` in a repo called `BM_automation`)
+      //      or beside the file being run (`dist_package/src/x.py` with the
+      //      runtime at `dist_package/python/`) — see the discovery below
+      // A venv outranks a stray `python.exe` in the root because it carries the
+      // project's installed packages; everything here outranks PATH.
+      const EXE_DIRS = ['.venv', 'venv', 'env']
+      const PLAIN_EXE_DIRS = ['bin', 'Scripts', 'tools', 'runtime', '.python', 'node_modules/.bin']
+      const VENDOR_EXE_DIRS = ['vendor']
+      // Root-level folders that are (or contain) a Python distribution:
+      // portable/embeddable Python, `python3.12/`, conda envs, WinPython, pypy.
+      const PY_DIR_RE = /^(?:py|python|pyenv|conda|miniconda|anaconda|winpython|pypy)[\w.-]*$/i
+      const exeNames = (base) => (process.platform === 'win32' ? [base + '.exe', base] : [base])
+      const pyExeNames = process.platform === 'win32'
+        ? ['python.exe', 'python3.exe', 'python', 'python3']
+        : ['python3', 'python']
+      // Two caches on purpose: the exe-directory cache lowercases names (so
+      // `Python.EXE` still matches on Windows), while the root cache must keep
+      // the on-disk case because those names are used to build paths.
+      const dirCache = new Map()
+      const rootCache = new Map()
+      // One listDir per directory (memoized): cheaper and race-free compared
+      // with stat-ing every candidate path, and a missing directory is simply
+      // an empty set.
+      const dirNames = async (rel) => {
+        if (dirCache.has(rel)) return dirCache.get(rel)
+        const names = new Set()
+        try {
+          const target = rel === '.' ? rootTarget : await fs.resolve(joinPath(root, rel))
+          const entries2 = await fs.listDir(target)
+          for (const e of entries2) names.add(String(e.name).toLowerCase())
+        } catch (e) { /* missing / unreadable → empty */ }
+        dirCache.set(rel, names)
+        return names
+      }
+      // Case-preserving listing of a workspace-relative directory, `null` when
+      // it is not a directory. Used only for runtime-folder discovery.
+      const dirEntryNames = async (rel) => {
+        if (rootCache.has(rel)) return rootCache.get(rel)
+        let names = null
+        try {
+          const target = rel === '.' ? rootTarget : await fs.resolve(joinPath(root, rel))
+          const st2 = await fs.stat(target)
+          if (st2 && st2.type === 'directory') {
+            names = []
+            for (const e of await fs.listDir(target)) {
+              if (e.type === 'directory') names.push(String(e.name))
+            }
+          }
+        } catch (e) { names = null }
+        rootCache.set(rel, names)
+        return names
+      }
+      // Every directory that may hold a project-local runtime, in priority
+      // order.
+      const exeRels = []
+      const addExeRel = (rel) => {
+        const clean = String(rel).replace(/\/+$/, '')
+        if (clean === '' || clean === '.') { if (exeRels.indexOf('.') < 0) exeRels.push('.'); return }
+        if (exeRels.indexOf(clean) < 0) exeRels.push(clean)
+      }
+      // A folder shaped like a Python distribution is picked up wherever it is
+      // found: `dist_package/python/python.exe` is a packaging convention
+      // (PyInstaller/embeddable runtime shipped next to the sources), not a
+      // root-level one, so the name heuristic travels with the directory.
+      const addPyDir = (base, name) => {
+        const rel = base === '' ? name : base + '/' + name
+        addExeRel(rel)
+        addExeRel(rel + '/Scripts')
+        addExeRel(rel + '/bin')
+      }
+      const collectPyDirs = async (base, names) => {
+        if (!names) return
+        for (const d of names) if (PY_DIR_RE.test(d)) await addPyDir(base, d)
+      }
+      for (const d of EXE_DIRS) {
+        if (!hasDir(d) && !has(d)) continue
+        addExeRel(d)
+        addExeRel(d + '/Scripts')
+        addExeRel(d + '/bin')
+      }
+      addExeRel('.')
+      for (const d of PLAIN_EXE_DIRS.concat(VENDOR_EXE_DIRS)) if (hasDir(d)) addExeRel(d)
+      // 4. root-level Python distributions.
+      await collectPyDirs('', Array.from(dirs))
+      // 5. The same shape one level deeper, in both directions:
+      //      root/<X>/python/            (sibling folder in the root)
+      //      <root of the active file>/python/   (its own folder)
+      // For `dist_package/src/BM_Specialist.py` that covers both
+      // `dist_package/python/` (parent of the file's own folder) and
+      // `<workspace>/python/`.
+      {
+        const rel2 = String(activePath || '').replace(/\\/g, '/').replace(/^\/+/, '')
+        if (rel2.length > 0 && !isAbsolute(rel2) && rel2.split('/').indexOf('..') < 0) {
+          const segs = rel2.split('/').filter((s) => s.length > 0)
+          const dirsOfFile = segs.slice(0, -1)
+          const nested = new Set()
+          for (let k = 0; k < dirsOfFile.length; k++) nested.add(dirsOfFile.slice(0, k).join('/'))
+          for (const x of Array.from(dirs)) nested.add(x)
+          for (const base of Array.from(nested)) {
+            if (base === '') continue
+            // `dirEntryNames` is the directory check: `null` means "not a
+            // directory / unreadable", so it doubles as the stat.
+            const inner = await dirEntryNames(base)
+            if (!inner) continue
+            if (PY_DIR_RE.test(base.split('/').pop())) continue
+            await collectPyDirs(base, inner)
+          }
+        }
+      }
+      // First match wins across the ordered directories; `names` are tried in
+      // the order given inside each directory.
+      const findLocalExe = async (names) => {
+        for (const rel of exeRels) {
+          const present = await dirNames(rel)
+          if (present.size === 0) continue
+          for (const n of names) {
+            if (present.has(n.toLowerCase())) return { rel: rel === '.' ? n : rel + '/' + n }
+          }
+        }
+        return null
+      }
+      // `& ` is required by PowerShell for a quoted path; harmless on POSIX.
+      const exeCommand = (absPath) => (TERM_SHELL.dialect === 'pwsh' ? '& ' : '') + '"' + absPath + '"'
+      // Resolve one runtime once, then reuse: `command` is either the local
+      // absolute path or the bare global name, `source` drives the 本地/全局
+      // badge and the local-first ranking, `note` explains it in the picker.
+      const resolveExe = async (names, fallback) => {
+        const found = await findLocalExe(names)
+        if (found) {
+          const abs = joinPath(root, found.rel)
+          return { command: exeCommand(abs), source: 'local', note: found.rel, label: found.rel }
+        }
+        return { command: fallback, source: 'global', note: '', label: fallback }
+      }
+      const noteOf = (r) => (r.note ? '本地 ' + r.note : '全局 PATH')
 
       // ---- Node / JavaScript / TypeScript ----
+      // A project-local node runtime (portable node, a node dropped in the
+      // root, a conda-style tools/ dir) wins over the PATH `node`.
+      const nodeRun = await resolveExe(exeNames('node'), 'node')
       if (has('package.json')) {
         let pkg = null
         try { pkg = JSON.parse((await readRel('package.json')) || '{}') } catch (e) { pkg = null }
@@ -2826,6 +3071,8 @@ export default {
         const pm = has('pnpm-lock.yaml') ? 'pnpm' : has('yarn.lock') ? 'yarn' : (has('bun.lockb') || has('bun.lock')) ? 'bun' : 'npm'
         const localPm = await firstExisting(['node_modules/.bin/' + pm + '.cmd', 'node_modules/.bin/' + pm + '.ps1', 'node_modules/.bin/' + pm])
         const runner = localPm ? localExe(localPm) : pm
+        const pmSource = localPm ? 'local' : 'global'
+        const pmNote = localPm ? '本地 ' + localPm : '全局 PATH'
         const names = Object.keys(scripts)
         const ordered = RUN_SCRIPT_ORDER.filter((n) => names.indexOf(n) >= 0)
           .concat(names.filter((n) => RUN_SCRIPT_ORDER.indexOf(n) < 0 && !RUN_SCRIPT_SKIP.test(n)))
@@ -2835,50 +3082,56 @@ export default {
             label: pm + ' run ' + name,
             command: runner + ' run ' + name,
             kind: 'node',
-            source: localPm ? 'local' : 'global',
-            detail: String(scripts[name] === undefined ? '' : scripts[name]).slice(0, 90),
+            source: pmSource,
+            detail: String(scripts[name] === undefined ? '' : scripts[name]).slice(0, 90) + ' · ' + pmNote,
           })
         }
         const main = pkg && typeof pkg.main === 'string' ? pkg.main : (pkg && typeof pkg.bin === 'string' ? pkg.bin : null)
         if (main && await existsRel(main)) {
-          push({ id: 'node:main', label: 'node ' + main, command: 'node ' + termQuote(main), kind: 'node', source: 'global', detail: 'package.json main' })
+          push({ id: 'node:main', label: 'node ' + main, command: nodeRun.command + ' ' + termQuote(main), kind: 'node', source: nodeRun.source, detail: 'package.json main · ' + noteOf(nodeRun) })
         }
         const localTsx = await firstExisting(['node_modules/.bin/tsx.cmd', 'node_modules/.bin/tsx'])
         if (localTsx && activePath && /\.(ts|mts|cts)$/i.test(activePath)) {
-          push({ id: 'tsx:active', label: 'tsx ' + activePath, command: localExe(localTsx) + ' ' + termQuote(activePath), kind: 'node', source: 'local', detail: '当前文件' })
+          push({ id: 'tsx:active', label: 'tsx ' + activePath, command: localExe(localTsx) + ' ' + termQuote(activePath), kind: 'node', source: 'local', detail: '当前文件 · 本地 ' + localTsx })
         }
       }
 
       // ---- Python ----
-      const pyLocal = await firstExisting([
-        '.venv/Scripts/python.exe', 'venv/Scripts/python.exe', 'env/Scripts/python.exe',
-        '.venv/bin/python', 'venv/bin/python', 'env/bin/python', '.venv/bin/python3',
-      ])
-      const py = pyLocal ? localExe(pyLocal) : (process.platform === 'win32' ? 'python' : 'python3')
-      const pySource = pyLocal ? 'local' : 'global'
+      // Local interpreter: .venv/venv/env, python-looking folders, the project
+      // root, bin/Scripts/tools/... Only when none exists does the bare
+      // `python`/`python3` fall back to PATH (flagged 全局 in the picker).
+      const pyRun = await resolveExe(pyExeNames, process.platform === 'win32' ? 'python' : 'python3')
+      const py = pyRun.command
+      const pySource = pyRun.source
+      const pyNote = noteOf(pyRun)
       if (has('manage.py')) {
-        push({ id: 'django', label: py + ' manage.py runserver', command: py + ' manage.py runserver', kind: 'python', source: pySource, detail: 'Django' })
+        push({ id: 'django', label: pyRun.label + ' manage.py runserver', command: py + ' manage.py runserver', kind: 'python', source: pySource, detail: 'Django · ' + pyNote })
       }
       const pyEntry = await firstExisting(['main.py', 'app.py', 'run.py', 'server.py', 'src/main.py', 'src/app.py', '__main__.py'])
       if (pyEntry) {
-        push({ id: 'py:entry', label: py + ' ' + pyEntry, command: py + ' ' + pyEntry, kind: 'python', source: pySource, detail: '入口脚本' })
+        push({ id: 'py:entry', label: pyRun.label + ' ' + pyEntry, command: py + ' ' + pyEntry, kind: 'python', source: pySource, detail: '入口脚本 · ' + pyNote })
       }
       if (has('pyproject.toml') && !pyEntry) {
         const toml = (await readRel('pyproject.toml')) || ''
         const m = /\[project\.scripts\][^[]*?^\s*([A-Za-z0-9_.-]+)\s*=/m.exec(toml)
-        if (m) push({ id: 'py:script', label: py + ' -m ' + m[1], command: py + ' -m ' + m[1], kind: 'python', source: pySource, detail: 'pyproject [project.scripts]' })
+        if (m) push({ id: 'py:script', label: pyRun.label + ' -m ' + m[1], command: py + ' -m ' + m[1], kind: 'python', source: pySource, detail: 'pyproject [project.scripts] · ' + pyNote })
       }
 
       // ---- Rust / Go / .NET ----
+      // Resolved locals first (a toolchain unpacked into tools/ or bin/ is
+      // common for portable builds); the bare command is the PATH fallback.
       if (has('Cargo.toml')) {
-        push({ id: 'cargo', label: 'cargo run', command: 'cargo run', kind: 'rust', source: 'global', detail: 'Cargo.toml' })
+        const cargo = await resolveExe(exeNames('cargo'), 'cargo')
+        push({ id: 'cargo', label: cargo.label + ' run', command: cargo.command + ' run', kind: 'rust', source: cargo.source, detail: 'Cargo.toml · ' + noteOf(cargo) })
       }
       if (has('go.mod')) {
-        push({ id: 'go', label: 'go run .', command: 'go run .', kind: 'go', source: 'global', detail: 'go.mod' })
+        const go = await resolveExe(exeNames('go'), 'go')
+        push({ id: 'go', label: go.label + ' run .', command: go.command + ' run .', kind: 'go', source: go.source, detail: 'go.mod · ' + noteOf(go) })
       }
       const csproj = entries.filter((e) => e.type === 'file' && /\.(cs|fs|vb)proj$/i.test(e.name))[0]
       if (csproj || entries.some((e) => e.type === 'file' && /\.sln$/i.test(e.name))) {
-        push({ id: 'dotnet', label: 'dotnet run', command: 'dotnet run', kind: 'dotnet', source: 'global', detail: csproj ? csproj.name : '解决方案文件' })
+        const dotnet = await resolveExe(exeNames('dotnet'), 'dotnet')
+        push({ id: 'dotnet', label: dotnet.label + ' run', command: dotnet.command + ' run', kind: 'dotnet', source: dotnet.source, detail: (csproj ? csproj.name : '解决方案文件') + ' · ' + noteOf(dotnet) })
       }
 
       // ---- Java (Gradle / Maven) ----
@@ -2888,13 +3141,13 @@ export default {
         const boot = /org\.springframework\.boot|spring-boot/i.test(buildGradle)
         const task = boot ? 'bootRun' : 'run'
         const cmd = (process.platform === 'win32' && /\.bat$/.test(gradlew) ? '.\\' + gradlew : './' + gradlew) + ' ' + task
-        push({ id: 'gradle', label: gradlew + ' ' + task, command: cmd, kind: 'java', source: 'local', detail: boot ? 'Spring Boot' : 'Gradle' })
+        push({ id: 'gradle', label: gradlew + ' ' + task, command: cmd, kind: 'java', source: 'local', detail: (boot ? 'Spring Boot' : 'Gradle') + ' · 本地 ' + gradlew })
       }
       const pom = await readRel('pom.xml')
       if (pom && /spring-boot/i.test(pom)) {
         const mvnw = await firstExisting(['mvnw.cmd', 'mvnw'])
         const mvn = mvnw ? (process.platform === 'win32' && /\.cmd$/.test(mvnw) ? '.\\' + mvnw : './' + mvnw) : 'mvn'
-        push({ id: 'maven', label: mvn + ' spring-boot:run', command: mvn + ' spring-boot:run', kind: 'java', source: mvnw ? 'local' : 'global', detail: 'Spring Boot' })
+        push({ id: 'maven', label: mvn + ' spring-boot:run', command: mvn + ' spring-boot:run', kind: 'java', source: mvnw ? 'local' : 'global', detail: 'Spring Boot · ' + (mvnw ? '本地 ' + mvnw : '全局 PATH') })
       }
 
       // ---- Make / task runners ----
@@ -2902,55 +3155,68 @@ export default {
       if (makefile) {
         const body = (await readRel(makefile)) || ''
         const target = /^run\s*:/m.test(body) ? 'run' : (/^dev\s*:/m.test(body) ? 'dev' : '')
-        push({ id: 'make', label: 'make' + (target ? ' ' + target : ''), command: 'make' + (target ? ' ' + target : ''), kind: 'make', source: 'global', detail: makefile })
+        const make = await resolveExe(exeNames('make'), 'make')
+        push({ id: 'make', label: make.label + (target ? ' ' + target : ''), command: make.command + (target ? ' ' + target : ''), kind: 'make', source: make.source, detail: makefile + ' · ' + noteOf(make) })
       }
 
       // ---- PHP / Ruby ----
       if (has('artisan')) {
-        push({ id: 'artisan', label: 'php artisan serve', command: 'php artisan serve', kind: 'php', source: 'global', detail: 'Laravel' })
+        const php = await resolveExe(exeNames('php'), 'php')
+        push({ id: 'artisan', label: php.label + ' artisan serve', command: php.command + ' artisan serve', kind: 'php', source: php.source, detail: 'Laravel · ' + noteOf(php) })
       } else if (hasDir('public') && await existsRel('public/index.php')) {
-        push({ id: 'php:serve', label: 'php -S localhost:8000 -t public', command: 'php -S localhost:8000 -t public', kind: 'php', source: 'global', detail: 'PHP 内置服务器' })
+        const php = await resolveExe(exeNames('php'), 'php')
+        push({ id: 'php:serve', label: php.label + ' -S localhost:8000 -t public', command: php.command + ' -S localhost:8000 -t public', kind: 'php', source: php.source, detail: 'PHP 内置服务器 · ' + noteOf(php) })
       } else if (has('composer.json')) {
         let comp = null
         try { comp = JSON.parse((await readRel('composer.json')) || '{}') } catch (e) { comp = null }
-        if (comp && comp.scripts && comp.scripts.start) push({ id: 'composer:start', label: 'composer start', command: 'composer start', kind: 'php', source: 'global', detail: 'composer script' })
+        if (comp && comp.scripts && comp.scripts.start) {
+          const composer = await resolveExe(exeNames('composer').concat(process.platform === 'win32' ? ['composer.bat'] : []), 'composer')
+          push({ id: 'composer:start', label: composer.label + ' start', command: composer.command + ' start', kind: 'php', source: composer.source, detail: 'composer script · ' + noteOf(composer) })
+        }
       }
       if (has('Gemfile')) {
-        if (has('config.ru')) push({ id: 'rack', label: 'bundle exec rackup', command: 'bundle exec rackup', kind: 'ruby', source: 'global', detail: 'config.ru' })
-        else if (has('app.rb')) push({ id: 'ruby:app', label: 'bundle exec ruby app.rb', command: 'bundle exec ruby app.rb', kind: 'ruby', source: 'global', detail: 'app.rb' })
+        const bundle = await resolveExe(exeNames('bundle').concat(process.platform === 'win32' ? ['bundle.bat', 'bundle.cmd'] : []), 'bundle')
+        const ruby = await resolveExe(exeNames('ruby'), 'ruby')
+        if (has('config.ru')) push({ id: 'rack', label: bundle.label + ' exec rackup', command: bundle.command + ' exec rackup', kind: 'ruby', source: bundle.source, detail: 'config.ru · ' + noteOf(bundle) })
+        else if (has('app.rb')) push({ id: 'ruby:app', label: bundle.label + ' exec ruby app.rb', command: bundle.command + ' exec ruby app.rb', kind: 'ruby', source: bundle.source, detail: 'app.rb · ' + noteOf(bundle) + ' · ruby ' + ruby.label })
       }
 
       // ---- Docker compose ----
       if (has('docker-compose.yml') || has('docker-compose.yaml') || has('compose.yml') || has('compose.yaml')) {
-        push({ id: 'compose', label: 'docker compose up', command: 'docker compose up', kind: 'docker', source: 'global', detail: 'Compose 文件' })
+        const docker = await resolveExe(exeNames('docker'), 'docker')
+        push({ id: 'compose', label: docker.label + ' compose up', command: docker.command + ' compose up', kind: 'docker', source: docker.source, detail: 'Compose 文件 · ' + noteOf(docker) })
       }
 
       // ---- project scripts ----
       const ps1 = await firstExisting(['run.ps1', 'start.ps1', 'dev.ps1', 'scripts/run.ps1'])
       if (ps1 && TERM_SHELL.dialect === 'pwsh') {
-        push({ id: 'ps1', label: ps1, command: '& ' + termQuote(joinPath(root, ps1)), kind: 'script', source: 'local', detail: 'PowerShell 脚本' })
+        push({ id: 'ps1', label: ps1, command: '& ' + termQuote(joinPath(root, ps1)), kind: 'script', source: 'local', detail: 'PowerShell 脚本 · 本地 ' + ps1 })
       }
       const shScript = await firstExisting(['run.sh', 'start.sh', 'dev.sh', 'scripts/run.sh'])
       if (shScript) {
-        push({ id: 'sh', label: 'bash ' + shScript, command: 'bash ' + termQuote(shScript), kind: 'script', source: 'local', detail: 'Shell 脚本' })
+        const bash = await resolveExe(exeNames('bash'), 'bash')
+        push({ id: 'sh', label: bash.label + ' ' + shScript, command: bash.command + ' ' + termQuote(shScript), kind: 'script', source: bash.source, detail: 'Shell 脚本 · ' + noteOf(bash) })
       }
 
       // ---- static site (only when nothing else matched) ----
       if (out.length === 0 && has('index.html')) {
-        push({ id: 'static', label: py + ' -m http.server 8000', command: py + ' -m http.server 8000', kind: 'static', source: pySource, detail: '静态站点' })
+        push({ id: 'static', label: pyRun.label + ' -m http.server 8000', command: py + ' -m http.server 8000', kind: 'static', source: pySource, detail: '静态站点 · ' + pyNote })
       }
 
       // ---- active file fallback ----
+      // This is the "open a .py and hit 运行" path, so the local interpreter
+      // matters most here.
       if (out.length === 0 && activePath) {
         const ext = activePath.split('.').pop().toLowerCase()
         if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
-          push({ id: 'node:active', label: 'node ' + activePath, command: 'node ' + termQuote(activePath), kind: 'node', source: 'global', detail: '当前文件' })
+          push({ id: 'node:active', label: nodeRun.label + ' ' + activePath, command: nodeRun.command + ' ' + termQuote(activePath), kind: 'node', source: nodeRun.source, detail: '当前文件 · ' + noteOf(nodeRun) })
         } else if (ext === 'py') {
-          push({ id: 'py:active', label: py + ' ' + activePath, command: py + ' ' + termQuote(activePath), kind: 'python', source: pySource, detail: '当前文件' })
+          push({ id: 'py:active', label: pyRun.label + ' ' + activePath, command: py + ' ' + termQuote(activePath), kind: 'python', source: pySource, detail: '当前文件 · ' + pyNote })
         } else if (ext === 'ps1' && TERM_SHELL.dialect === 'pwsh') {
-          push({ id: 'ps1:active', label: activePath, command: '& ' + termQuote(joinPath(root, activePath)), kind: 'script', source: 'local', detail: '当前文件' })
+          push({ id: 'ps1:active', label: activePath, command: '& ' + termQuote(joinPath(root, activePath)), kind: 'script', source: 'local', detail: '当前文件 · 本地 ' + activePath })
         } else if (ext === 'sh') {
-          push({ id: 'sh:active', label: 'bash ' + activePath, command: 'bash ' + termQuote(activePath), kind: 'script', source: 'local', detail: '当前文件' })
+          const bashActive = await resolveExe(exeNames('bash'), 'bash')
+          push({ id: 'sh:active', label: bashActive.label + ' ' + activePath, command: bashActive.command + ' ' + termQuote(activePath), kind: 'script', source: bashActive.source, detail: '当前文件 · ' + noteOf(bashActive) })
         }
       }
 
