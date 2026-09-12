@@ -1004,7 +1004,7 @@ window.__ModuleLoader__.load({
         }
         attachLoop()
         if (typeof console !== 'undefined' && console.info) {
-          console.info('[dsh-file-edit] guard v1.29.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
+          console.info('[dsh-file-edit] guard v1.31.0: wrapOk=' + wrapOk + ', sid=' + currentSessionId() + ', listeners installed (window+document, click) + direct button attach (setTimeout loop)')
         }
         ctx.effect(() => () => {
           guardDisposed = true
@@ -1117,6 +1117,10 @@ window.__ModuleLoader__.load({
           '.dsh-fe-tab-x:hover { color:var(--dsw-alias-label-primary); }',
           // Tree / sidebar rhythm: guide lines, hover easing, current markers.
           '.dsh-fe-children { margin-left:11px; padding-left:5px; border-left:1px solid color-mix(in srgb, var(--dsw-alias-label-secondary) 16%, transparent); }',
+          // v1.30: inline placeholder rows inside the lazy tree ("加载中…" /
+          // "（空）" / a failed level). Same muted voice as .dsh-fe-msg, but
+          // sized and padded for a nested tree row.
+          '.dsh-fe-dirmsg { padding:2px 8px; color:var(--dsw-alias-label-secondary); font-size:12px; opacity:.75; }',
           '.dsh-fe-row { border-radius:5px; transition:background .12s ease; }',
           '.dsh-fe-ws-row { transition:background .12s ease; }',
           '.dsh-fe-ws-row-cur .dsh-fe-ws-name { color:var(--dsw-alias-label-primary); font-weight:600; }',
@@ -1663,6 +1667,16 @@ window.__ModuleLoader__.load({
         // (node.git: M/U/A/D/R) and an ignored flag (node.ignored, from
         // git check-ignore). The badge sits at the row's right edge; ignored
         // files/folders gray out. Titles explain the letter on hover.
+        //
+        // v1.30: the tree is LAZY. A directory row asks the host for its
+        // immediate children the first time it is expanded (`listDir`) and the
+        // answer lives in the per-workspace cache — the root listing no longer
+        // drags the whole workspace (dependency folders included) into one
+        // payload before the first row can render. `props.lazy === false` marks
+        // the fallback: the host module had no listDir (a hot-reloaded client
+        // bundle against a not-yet-restarted host), so the whole tree came from
+        // `listTree` and every node already carries its children — behaviour is
+        // then exactly the pre-v1.30 one.
         const GIT_TITLES = {
           M: 'Modified — 已修改（未提交）',
           U: 'Untracked — 未跟踪',
@@ -1673,6 +1687,7 @@ window.__ModuleLoader__.load({
         function TreeNode(props) {
           const node = props.node
           const depth = props.depth || 0
+          const lazy = props.lazy === true
           const [open, setOpen] = React.useState(depth < 1)
           const badge = node.git
             ? React.createElement('span', { className: 'dsh-fe-git dsh-fe-git-' + String(node.git).toLowerCase(), title: GIT_TITLES[node.git] || node.git }, node.git)
@@ -1681,23 +1696,46 @@ window.__ModuleLoader__.load({
             (node.type === 'directory' && open ? ' dsh-fe-open' : '') +
             (node.ignored ? ' dsh-fe-row-ignored' : '')
           const ignoredNote = node.ignored ? '（被 .gitignore 排除）\n' : ''
+          const entry = lazy && node.type === 'directory' ? props.cache.get(node.path) : undefined
+          // Ask for this level once it is open and the cache holds no answer
+          // yet (including right after a treeStamp reload cleared the cache).
+          // The host call is guarded by the cache entry itself: a loaded or
+          // in-flight level is a no-op, so this effect may run every render.
+          React.useEffect(() => {
+            if (!lazy || !open || node.type !== 'directory') return
+            if (entry && (entry.loaded || entry.loading)) return
+            props.onLoadDir(node.path)
+          })
           if (node.type === 'directory') {
-            const kids = node.children || []
+            const kids = lazy ? ((entry && entry.children) || []) : (node.children || [])
+            const loading = !!(lazy && entry && entry.loading)
+            const dirErr = lazy && entry && entry.error ? entry.error : null
+            // Before the first load there is no way to know whether a folder is
+            // empty, so the chevron is drawn optimistically — except for a
+            // wholly gitignored folder, which the whole-tree path also treated
+            // as a leaf. Once an empty listing arrives the chevron goes away.
+            const knownEmpty = lazy ? !!(entry && entry.loaded && kids.length === 0) : kids.length === 0
+            const canExpand = !node.ignored && !knownEmpty
             return React.createElement('div', null,
               React.createElement('div', {
                 className: rowCls,
                 onClick: () => setOpen(!open),
                 title: ignoredNote + (node.path || node.name),
               },
-                // v1.17: a wholly gitignored directory arrives as a grayed
-                // leaf (children: []) — no chevron, nothing to expand.
-                React.createElement('span', { className: 'dsh-fe-chev' }, kids.length > 0 ? IconChevron() : null),
+                React.createElement('span', { className: 'dsh-fe-chev' }, canExpand ? IconChevron() : null),
                 React.createElement('span', { className: 'dsh-fe-ic' }, IconFolder()),
                 React.createElement('span', { className: 'dsh-fe-name' }, node.name),
                 badge,
               ),
               open ? React.createElement('div', { className: 'dsh-fe-children' },
-                kids.map((c) => React.createElement(TreeNode, { key: c.name, node: c, depth: depth + 1, onOpen: props.onOpen }))) : null,
+                loading ? React.createElement('div', { className: 'dsh-fe-msg dsh-fe-dirmsg' }, '加载中…') : null,
+                dirErr ? React.createElement('div', { className: 'dsh-fe-msg dsh-fe-dirmsg' }, String(dirErr)) : null,
+                lazy && entry && entry.loaded && kids.length === 0 && !node.ignored
+                  ? React.createElement('div', { className: 'dsh-fe-msg dsh-fe-dirmsg' }, '（空）') : null,
+                lazy && entry && entry.truncated
+                  ? React.createElement('div', { className: 'dsh-fe-msg dsh-fe-dirmsg' }, '（目录过大，仅显示前 ' + (entry.limit || 4000) + ' 项）') : null,
+                kids.map((c) => React.createElement(TreeNode, { key: c.name, node: c, depth: depth + 1, onOpen: props.onOpen, lazy: lazy, cache: props.cache, onLoadDir: props.onLoadDir })),
+              ) : null,
             )
           }
           return React.createElement('div', {
@@ -1747,6 +1785,14 @@ window.__ModuleLoader__.load({
           const [tree, setTree] = React.useState(null)
           const [treeError, setTreeError] = React.useState(null)
           const [treeLoading, setTreeLoading] = React.useState(false)
+          // v1.30: lazy-tree bookkeeping. `dirRef.cache` maps a workspace-
+          // relative directory path to its listing state
+          // ({children, loaded, loading, error, truncated}); `dirRef.mode` is
+          // 'lazy' | 'eager' | 'unknown' (eager = the host had no listDir, see
+          // loadFiles). The Map is mutated in place and `dirTick` forces the
+          // re-render — same shape as the other transient caches in this file.
+          const dirRef = React.useState(() => ({ mode: 'unknown', cache: new Map() }))[0]
+          const [dirTick, setDirTick] = React.useState(0)
           const [query, setQuery] = React.useState('')
           // v1.19: whether the session-history overflow control has been
           // expanded (transient per-mount state, same as the shell's
@@ -1864,16 +1910,76 @@ window.__ModuleLoader__.load({
           }
           const confirmAndDel = (ids) => setConfirmDel({ ids: ids.slice() })
           const selectedCount = sel ? sel.size : 0
+          // v1.30: record one directory listing in the cache and repaint.
+          const putDir = (path, patch) => {
+            const prev = dirRef.cache.get(path)
+            dirRef.cache.set(path, Object.assign({ children: [], loaded: false, loading: false, error: null, truncated: false }, prev, patch))
+            setDirTick((n) => n + 1)
+          }
+          // Fetch ONE level into the cache. `keep` leaves the current children
+          // in place while the request is in flight (the 20s silent poll must
+          // not blank out folders the user has open).
+          const fetchDir = async (path, keep) => {
+            const cur = dirRef.cache.get(path)
+            if (cur && cur.loading) return
+            putDir(path, keep ? { loading: true } : { children: [], loaded: false, loading: true, error: null })
+            const r = await call('listDir', { sessionId: sid, root: ws.path, path: path })
+            if (r && r.ok) putDir(path, { children: r.children || [], loaded: true, loading: false, error: null, truncated: !!r.truncated, limit: Number(r.limit) || 0 })
+            else putDir(path, { children: keep && cur ? cur.children : [], loaded: true, loading: false, error: (r && r.error) || '加载失败' })
+          }
+          // A directory row asks for its level when it opens. Already loaded or
+          // in-flight → no-op, which is what makes TreeNode's render-time
+          // effect safe to run on every render.
+          const loadDir = (path) => {
+            const cur = dirRef.cache.get(path)
+            if (cur && (cur.loaded || cur.loading)) return
+            void fetchDir(path, false)
+          }
           // v1.15.1: `silent` reloads skip the '…' busy indicator — the 20s
           // background re-check below must not flash the refresh button.
+          // v1.30: the tree loads ONE level at a time. The root listing comes
+          // from `listDir('')`; each expansion fetches its own level on demand
+          // (see loadDir). A host module that predates v1.30 has no listDir —
+          // its client bundle is hot-reloaded while the host is not — so the
+          // first 'no such method' switches this workspace to the pre-v1.30
+          // whole-tree `listTree` path instead of showing an error.
+          const listWholeTree = async () => {
+            const r = await call('listTree', { sessionId: sid, root: ws.path })
+            if (r.ok) { setTree(r.tree); setTreeError(null) }
+            else setTreeError(r.error || '加载失败')
+          }
           const loadFiles = async (force, silent) => {
             if (!force && (tree || treeError)) return
             if (!sid) { setTreeError('打开会话后可用'); return }
             if (!silent) setTreeLoading(true)
-            const r = await call('listTree', { sessionId: sid, root: ws.path })
-            if (r.ok) { setTree(r.tree); setTreeError(null) }
-            else setTreeError(r.error || '加载失败')
-            if (!silent) setTreeLoading(false)
+            try {
+              if (dirRef.mode === 'eager') { await listWholeTree(); return }
+              // Background re-check with a warm cache: refresh exactly the
+              // levels already on screen (root included) and leave the cache
+              // intact, so nothing collapses and no row flashes.
+              if (silent && dirRef.mode === 'lazy' && dirRef.cache.size > 0) {
+                for (const p of Array.from(dirRef.cache.keys())) await fetchDir(p, true)
+                return
+              }
+              const r = await call('listDir', { sessionId: sid, root: ws.path, path: '' })
+              if (r && r.ok) {
+                dirRef.mode = 'lazy'
+                dirRef.cache.clear()
+                dirRef.cache.set('', { children: r.children || [], loaded: true, loading: false, error: null, truncated: !!r.truncated })
+                setTree({ name: '.', type: 'directory', path: '', children: r.children || [] })
+                setTreeError(null)
+                setDirTick((n) => n + 1)
+                return
+              }
+              if (r && r.error && /no such method/i.test(String(r.error))) {
+                dirRef.mode = 'eager'
+                await listWholeTree()
+                return
+              }
+              setTreeError((r && r.error) || '加载失败')
+            } finally {
+              if (!silent) setTreeLoading(false)
+            }
           }
           // v1.11: history ordered by recency — newest session on top (the
           // host's sessionIds order reflects creation/attachment, not
@@ -1971,7 +2077,14 @@ window.__ModuleLoader__.load({
             const stamp = store.treeStamp
             if (stamp !== undefined && stamp !== null && stamp !== stampRef.seen) {
               stampRef.seen = stamp
-              if (stampRef.open && stampRef.filesOpen && !stampRef.loading) void loadFiles(true)
+              if (stampRef.open && stampRef.filesOpen && !stampRef.loading) {
+                // v1.30: a new stamp means the file SET changed; the level
+                // cache is dropped so every open directory re-asks on its next
+                // render (its TreeNode effect refetches a missing entry). The
+                // root reload below repopulates the top level immediately.
+                if (dirRef.mode !== 'eager') { dirRef.cache.clear(); setDirTick((n) => n + 1) }
+                void loadFiles(true)
+              }
             }
           })
           const isCurrentWs = (ws.sessionIds || []).indexOf(currentId) >= 0
@@ -2140,7 +2253,14 @@ window.__ModuleLoader__.load({
               secFiles ? React.createElement('div', null,
                 treeError ? React.createElement('div', { className: 'dsh-fe-msg' }, String(treeError)) : null,
                 tree ? React.createElement('div', { className: 'dsh-fe-children' },
-                  React.createElement(TreeNode, { node: tree, depth: 0, onOpen: (p) => store.openFile(p) })) : null,
+                  React.createElement(TreeNode, {
+                    node: tree,
+                    depth: 0,
+                    onOpen: (p) => store.openFile(p),
+                    lazy: dirRef.mode !== 'eager',
+                    cache: dirRef.cache,
+                    onLoadDir: loadDir,
+                  })) : null,
               ) : null,
             ) : null,
             // v1.20: destructive-action confirm (single delete from the dot
@@ -2234,7 +2354,7 @@ window.__ModuleLoader__.load({
               ? React.createElement('span', { className: 'dsh-fe-chip dsh-fe-chip-del' }, '删除')
               : React.createElement('span', { className: 'dsh-fe-chip' }, '修改')
           const stats = item.note
-            ? React.createElement('span', { className: 'dsh-fe-stats' }, item.note === 'binary' ? '二进制' : '过大')
+            ? React.createElement('span', { className: 'dsh-fe-stats' }, item.note === 'binary' ? '二进制' : (item.note === 'unreadable' ? '不可读' : '超出上限'))
             : React.createElement('span', { className: 'dsh-fe-stats' },
               React.createElement('span', { className: 'dsh-fe-stat-add' }, '+' + item.added),
               ' ',
@@ -5284,28 +5404,77 @@ window.__ModuleLoader__.load({
                   },
                 })))
           }
-          // Large-but-text files: host ships a read-only preview head instead of hunks.
-          if (diff.note === 'large' && diff.preview) {
-            const hlPrev = { mode: null }
+          // v1.31: the host no longer sends a size-capped "preview" banner — a
+          // text file past the 512KB in-memory window is loaded on demand and
+          // reviewed by hunks like any other. The only note-bearing payload left
+          // is binary / past-MAX_SIG_BYTES content, plus a read failure.
+          if (diff.note) {
+            const noteMsg = diff.note === 'binary'
+              ? '二进制文件无法预览，可在修改列表中直接接受或拒绝'
+              : (diff.note === 'unreadable'
+                ? '文件内容读取失败（可能已被删除或权限不足），可在修改列表中直接接受或拒绝'
+                : '文件超出可加载上限（64MB），无法逐块审阅，可在修改列表中直接接受或拒绝')
             return React.createElement('div', { className: 'dsh-fe-pane' },
               toolbar,
-              React.createElement('div', { className: 'dsh-fe-msg' },
-                '文件过大，无法逐块审阅；仅显示前 ' + diff.preview.length + ' 行' + (diff.lineCount ? '（共 ' + diff.lineCount + ' 行）' : '') + '。'),
+              React.createElement('div', { className: 'dsh-fe-msg' }, noteMsg),
+              error ? React.createElement('div', { className: 'dsh-fe-err' }, String(error)) : null,
+            )
+          }
+          // v1.31: a file too large to ship whole. The hunks themselves are
+          // always computed (that is what makes per-hunk accept/reject possible
+          // at any size); only the surrounding context is omitted, replaced by a
+          // head/tail preview and explicit "hidden lines" markers.
+          if (diff.windowed) {
+            const hlW = { mode: null }
+            const wHunks = diff.hunks || []
+            const total = diff.lineCount || 0
+            const headRows = (diff.preview || []).map((t, i) => renderRoRow('wh' + i, '', i + 1, t, hlW))
+            const tailRows = (diff.previewTail || []).map((t, i) => renderRoRow('wt' + i, '', (diff.previewTailStart || 0) + i, t, hlW))
+            const headEnd = (diff.preview || []).length
+            const tailStart = diff.previewTailStart || 0
+            const rows = []
+            rows.push(React.createElement('div', { key: 'wmsg', className: 'dsh-fe-msg' },
+              '文件过大（共 ' + total + ' 行），此处只渲染改动块本身与首尾预览；每一块仍可单独接受 / 拒绝。'))
+            rows.push(React.createElement('div', { key: 'whead', className: 'dsh-fe-code' }, headRows))
+            if (wHunks.length > 0 && wHunks[0].newStart > headEnd) {
+              rows.push(React.createElement('div', { key: 'wgap0', className: 'dsh-fe-msg' },
+                '⋯ 中间省略 ' + (wHunks[0].newStart - headEnd) + ' 行 ⋯'))
+            }
+            for (let k = 0; k < wHunks.length; k++) {
+              const h = wHunks[k]
+              rows.push(React.createElement('div', { key: 'wh' + k, className: 'dsh-fe-hunk' },
+                React.createElement('div', { className: 'dsh-fe-hunk-head' },
+                  React.createElement('span', null,
+                    (h.oldLen === 0 ? ('第 ' + (h.oldStart + 1) + ' 行前') : ('第 ' + (h.oldStart + 1) + '–' + (h.oldStart + h.oldLen) + ' 行'))
+                    + ' → ' +
+                    (h.newLen === 0 ? ('第 ' + (h.newStart + 1) + ' 行前') : ('第 ' + (h.newStart + 1) + '–' + (h.newStart + h.newLen) + ' 行'))),
+                  React.createElement('span', { className: 'dsh-fe-spacer' }, null),
+                  React.createElement(IconBtn, { tone: 'ok', small: true, title: '接受此块修改', onClick: () => onHunk(h, 'accept'), icon: IconCheck }),
+                  React.createElement(IconBtn, { tone: 'no', small: true, className: 'dsh-fe-pair', title: '拒绝此块修改', onClick: () => onHunk(h, 'reject'), icon: IconCross }),
+                ),
+                React.createElement('div', { className: 'dsh-fe-code' },
+                  (h.newLines || []).map((t, i) => renderRoRow('wn' + k + ':' + i, 'dsh-fe-new', h.newStart + i + 1, t, hlW)),
+                ),
+              ))
+            }
+            if (tailRows.length > 0) {
+              const lastEnd = wHunks.length > 0 ? wHunks[wHunks.length - 1].newStart + wHunks[wHunks.length - 1].newLen : headEnd
+              if (tailStart > lastEnd) {
+                rows.push(React.createElement('div', { key: 'wgap1', className: 'dsh-fe-msg' },
+                  '⋯ 省略 ' + (tailStart - lastEnd) + ' 行 ⋯'))
+              }
+              rows.push(React.createElement('div', { key: 'wtail', className: 'dsh-fe-code' }, tailRows))
+            }
+            if (wHunks.length === 0) {
+              rows.push(React.createElement('div', { key: 'wnone', className: 'dsh-fe-msg' }, '没有未决定的修改'))
+            }
+            return React.createElement('div', { className: 'dsh-fe-pane' },
+              toolbar,
               error ? React.createElement('div', { className: 'dsh-fe-err' }, String(error)) : null,
               scopeBar,
               React.createElement('div', { className: 'dsh-fe-diff' },
-                React.createElement('div', { className: 'dsh-fe-code' },
-                  diff.preview.map((t, i) => renderRoRow('p' + i, '', i + 1, t, hlPrev)),
-                ),
+                React.createElement('div', { className: 'dsh-fe-pane' }, rows),
               ),
-            )
-          }
-          if (diff.note) {
-            return React.createElement('div', { className: 'dsh-fe-pane' },
-              toolbar,
-              React.createElement('div', { className: 'dsh-fe-msg' },
-                diff.note === 'binary' ? '二进制文件无法预览，可在修改列表中直接接受或拒绝' : '文件过大无法预览'),
-              error ? React.createElement('div', { className: 'dsh-fe-err' }, String(error)) : null,
             )
           }
           const current = diff.current || []

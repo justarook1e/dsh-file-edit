@@ -3,7 +3,7 @@
 // Browser RPC arrives at POST /dsh-file-edit/api (registered on ctx.webServer).
 // Per-session review state (baseline + pending decisions) is persisted under
 // ~/.dsh/dsh-file-edit-state/<sessionId>.json so accept/reject survives restarts.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, rmSync, statSync, createWriteStream } from 'node:fs'
 import { join, relative, isAbsolute, resolve as resolvePath } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -86,7 +86,24 @@ export default {
     }
 
     const MAX_CONTENT_BYTES = 512 * 1024
-    const MAX_DIFF_LINES = 8000
+    // v1.31: the "content in memory" window above which an entry is read as a
+    // SIGNATURE instead (see sigFor). Text beyond this stays reviewable and
+    // diffable — that is the whole point of the signature — but its content is
+    // not kept between calls. Beyond MAX_SIG_BYTES even the streaming pass is
+    // refused (a 2GB log must not be hashed on a 20s poll), and only that tier
+    // still degrades to whole-file accept/reject.
+    const MAX_SIG_BYTES = 64 * 1024 * 1024
+    const SIG_TIERS = { hash: 'h', sampled: 's' }
+    // Sampled-signature windows (only used past MAX_SIG_BYTES — see sigFor).
+    const SIG_SAMPLE_BYTES = 64 * 1024
+    const SIG_SAMPLE_READ_BYTES = SIG_SAMPLE_BYTES + 1
+    // v1.31: how much text the DIFF VIEW still ships whole. A file in this tier
+    // is fully reviewable (real hunks, real stats) regardless — this bound only
+    // decides whether the viewer also gets the surrounding file to render as
+    // context, or just the hunks plus a head/tail preview. It is a
+    // rendering/DOM bound, not a review bound: 40,000 lines is already far past
+    // what a browser should be asked to lay out at once.
+    const MAX_DIFF_SHIP_LINES = 40000
     const MAX_ENTRIES = 8000
     const MAX_DEPTH = 16
     // v1.20.4: expanded hard-skip list. These are dependency/runtime/cache/
@@ -189,6 +206,103 @@ export default {
       if (lines.length === 0) return ''
       const sep = crlf ? '\r\n' : '\n'
       return lines.join(sep) + (trailingNL ? sep : '')
+    }
+    // v1.31: byte-level CRLF -> LF. This mirrors what splitLines does to text,
+    // so a signature built from these bytes answers exactly the question the
+    // diff answers: "are the LINES the same?". It is what makes a pure
+    // CRLF<->LF flip invisible for files whose content is not in memory —
+    // without reading the file into memory to find out.
+    function lfBytes(bytes) {
+      let crlf = false
+      for (let i = 0; i < bytes.length - 1; i++) {
+        if (bytes[i] === 13 && bytes[i + 1] === 10) { crlf = true; break }
+      }
+      if (!crlf) return bytes
+      const out = Buffer.allocUnsafe(bytes.length)
+      let n = 0
+      for (let i = 0; i < bytes.length; i++) {
+        const b = bytes[i]
+        if (b === 13 && i + 1 < bytes.length && bytes[i + 1] === 10) continue
+        out[n++] = b
+      }
+      return n === bytes.length ? bytes : out.subarray(0, n)
+    }
+    // Two signatures are comparable only when they came from the same tier
+    // (a sampled identity is a weaker claim than a full hash).
+    function sameSig(a, b) {
+      if (!a || !b) return false
+      return a.tier === b.tier && a.n === b.n && a.h === b.h
+    }
+    // A signature over text that is already in memory. It MUST hash the same
+    // bytes the streaming path hashes (LF-normalized UTF-8), or the two would
+    // disagree about a file that merely crossed the in-memory window.
+    function sigOfText(text) {
+      const bytes = lfBytes(Buffer.from(text, 'utf8'))
+      return { tier: SIG_TIERS.hash, n: bytes.length, h: createHash('sha1').update(bytes).digest('hex') }
+    }
+    // v1.31 content signature. `opts.digest` feeds every normalized chunk to a
+    // caller-owned hash, `opts.writePath` mirrors them into a file — so ONE
+    // streaming pass can produce the review verdict, the baseline blob and the
+    // on-disk byte count together (that is how a large text baseline is
+    // snapshotted for a later reject without a second read).
+    //
+    // Memory stays O(chunk): the run of \r bytes at a chunk boundary is held
+    // back until the next chunk decides whether each is half of a CRLF pair,
+    // because a naive per-chunk replace would miss (and corrupt) a CRLF that
+    // straddles the seam.
+    async function streamNormalized(target, opts) {
+      const options = opts || {}
+      const digest = options.digest
+      const out = options.writePath !== undefined ? createWriteStream(options.writePath) : null
+      // One error handler for the whole stream: re-attaching `once('error')` per
+      // drain (the obvious shape) accumulates listeners and trips Node's
+      // MaxListeners warning on a file with many chunks.
+      let fail = null
+      const onError = (e) => { fail = e || new Error('write failed') }
+      if (out) {
+        out.on('error', onError)
+        await new Promise(function (res, rej) {
+          out.once('open', res)
+          out.once('error', rej)
+        })
+      }
+      let carried = ''
+      let n = 0
+      const flush = async (s) => {
+        n += Buffer.byteLength(s, 'utf8')
+        if (!out) return
+        if (out.write(s)) { if (fail) throw fail; return }
+        await new Promise(function (res) { out.once('drain', res) })
+        if (fail) throw fail
+      }
+      try {
+        const stream = await fs.streamText(target)
+        for await (const chunk of stream) {
+          let text = carried + String(chunk)
+          // Hold back a trailing CR run: it may be the first half of a CRLF.
+          let end = text.length
+          while (end > 0 && text.charCodeAt(end - 1) === 13) end--
+          carried = text.slice(end)
+          text = text.slice(0, end).replace(/\r\n/g, '\n')
+          if (text === '') continue
+          if (digest) digest.update(text)
+          await flush(text)
+        }
+        // A file ending in a lone CR: it is content, not half of a CRLF pair.
+        if (carried !== '') {
+          if (digest) digest.update(carried)
+          await flush(carried)
+        }
+        if (out) await new Promise(function (res) { out.end(function () { res() }) })
+        if (fail) throw fail
+      } catch (e) {
+        // Never leave a half-written blob behind: it must not be mistaken for a
+        // complete snapshot on the next run.
+        if (out) { try { out.destroy() } catch (e2) {} }
+        try { if (options.writePath !== undefined) rmSync(options.writePath, { force: true }) } catch (e3) {}
+        throw e
+      }
+      return n
     }
     function joinPath(root, rel) {
       const sep = root.indexOf('\\') >= 0 ? '\\' : '/'
@@ -380,7 +494,7 @@ export default {
       return base.endsWith('.md') || base.endsWith('.markdown')
     }
     function cloneEntry(e) {
-      return { present: e.present, content: e.content, eol: e.eol, crlf: e.crlf === true, version: e.version, size: e.size, note: e.note, binRef: e.binRef ?? null, binSize: e.binSize ?? 0, md: e.md === true }
+      return { present: e.present, content: e.content, eol: e.eol, crlf: e.crlf === true, version: e.version, size: e.size, note: e.note, binRef: e.binRef ?? null, binSize: e.binSize ?? 0, md: e.md === true, sig: e.sig ?? null, trunc: e.trunc ?? null, baselineRef: e.baselineRef ?? null, baselineBytes: e.baselineBytes ?? 0 }
     }
     // "File was not in the baseline" as an explicit ABSENT entry instead of
     // null: every consumer (modifiedFiles / diffPayload / reject paths) then
@@ -388,10 +502,28 @@ export default {
     // newly created files render as one big "added" hunk and lets reject
     // restore the pre-file state (delete it).
     function absentEntry() {
-      return { present: false, content: null, eol: false, crlf: false, version: null, size: 0, note: undefined, binRef: null, binSize: 0, md: false }
+      return { present: false, content: null, eol: false, crlf: false, version: null, size: 0, note: undefined, binRef: null, binSize: 0, md: false, sig: null, trunc: null }
+    }
+    // Shared shape for "this file is gone" (deletion sweep, targeted refresh,
+    // reject of a created file): one place to keep the entry fields in sync.
+    // `note` stays undefined (unlike absentEntry, which is also the shape of a
+    // never-baselined path) so the deleted branch of the payload — not a note —
+    // is what renders it.
+    function goneEntry() {
+      return { present: false, content: null, eol: false, crlf: false, version: null, size: 0, binRef: null, binSize: 0, md: false, sig: null, trunc: null }
     }
 
-    // ---------- line diff (Myers) ----------
+    // ---------- line diff (Myers + anchored fallback) ----------
+    // v1.30: the Myers pass is bounded (time AND memory both grow with the
+    // size of the trimmed region), so a change region bigger than this budget
+    // is handed to the ANCHORED diff below instead of being reported as one
+    // whole-region hunk — see diffRange for the bug that caused.
+    const MYERS_MAX_SUM = 6000
+    // Recursion ceiling for the anchored splitter. Each level either consumes
+    // unique common lines (so the regions strictly shrink) or falls back to a
+    // single hunk; the cap only exists so a pathological input cannot recurse
+    // without bound.
+    const ANCHOR_MAX_DEPTH = 32
     function myersOps(a, b) {
       const n = a.length, m = b.length
       let start = 0
@@ -400,7 +532,7 @@ export default {
       while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB-- }
       const na = endA - start, nb = endB - start
       if (na === 0 && nb === 0) return []
-      if (na + nb > 6000) return null
+      if (na + nb > MYERS_MAX_SUM) return null
       const max = na + nb
       const MAX_D = Math.min(400, max)
       const v = new Array(2 * max + 1).fill(0)
@@ -442,12 +574,20 @@ export default {
       return rev
     }
 
-    function computeHunks(a, b) {
-      const ops = myersOps(a, b)
-      if (ops === null) {
-        return [{ id: 'h0', oldStart: 0, oldLen: a.length, newStart: 0, newLen: b.length, newLines: b.slice() }]
-      }
-      const hunks = []
+    // Turn one Myers op stream into hunks. `ops` is relative to the slices it
+    // was computed from, so every emitted coordinate is shifted back into the
+    // full arrays by (aOff, bOff) — that is what lets the same routine serve
+    // both the whole file and an anchored sub-region.
+    function hunksFromOps(ops, b, out, aOff, bOff) {
+      // Pure runs borrow the counterpart coordinate, corrected by the
+      // CUMULATIVE shift accumulated from every earlier hunk (each prior
+      // change moves the new file's indices by newLen − oldLen). The naive
+      // mirror (newStart = oldStart) was only right for the FIRST hunk —
+      // later pure hunks drifted by one per preceding change (live payload
+      // with three deletions reported 101/197 instead of 100/195, which
+      // also starved the last hunk of its trailing context block and broke
+      // the jump caret chain). Op-derived coordinates (o.i/o.j) are already
+      // absolute within the region and need no shift.
       let shift = 0
       let i = 0
       while (i < ops.length) {
@@ -460,20 +600,101 @@ export default {
           else { if (h.newStart < 0) h.newStart = o.j; h.newLen++; h.newLines.push(b[o.j]) }
           i++
         }
-        // Pure runs borrow the counterpart coordinate, corrected by the
-        // CUMULATIVE shift accumulated from every earlier hunk (each prior
-        // change moves the new file's indices by newLen − oldLen). The naive
-        // mirror (newStart = oldStart) was only right for the FIRST hunk —
-        // later pure hunks drifted by one per preceding change (live payload
-        // with three deletions reported 101/197 instead of 100/195, which
-        // also starved the last hunk of its trailing context block and broke
-        // the jump caret chain). Op-derived coordinates (o.i/o.j) are already
-        // absolute full-array indices and need no shift.
         if (h.oldStart < 0) h.oldStart = h.newStart - shift
         if (h.newStart < 0) h.newStart = h.oldStart + shift
         shift += h.newLen - h.oldLen
-        hunks.push(h)
+        h.oldStart += aOff
+        h.newStart += bOff
+        out.push(h)
       }
+    }
+
+    // Anchors = lines that occur EXACTLY ONCE in both regions ("patience diff"
+    // pivots). Such a pair provably matches, and the longest increasing
+    // subsequence of the pairs keeps them in order, so the region can be split
+    // at every anchor and each gap diffed on its own. This is what keeps a
+    // hand-edited large file cheap: a couple of small edits far apart leave
+    // thousands of unique lines between them, and those become anchors.
+    function anchorPairs(a, b, aFrom, aTo, bFrom, bTo) {
+      const ca = new Map()
+      for (let i = aFrom; i < aTo; i++) { const k = a[i]; ca.set(k, (ca.get(k) || 0) + 1) }
+      const cb = new Map()
+      for (let j = bFrom; j < bTo; j++) { const k = b[j]; cb.set(k, (cb.get(k) || 0) + 1) }
+      // Positions of the lines that are unique in BOTH regions — a Map lookup
+      // instead of a scan per candidate (an indexOf in this loop made the pass
+      // O(region²), which is exactly the size class this path exists for).
+      const posB = new Map()
+      for (let j = bFrom; j < bTo; j++) {
+        const k = b[j]
+        if (cb.get(k) === 1 && ca.get(k) === 1) posB.set(k, j)
+      }
+      const pairs = []
+      for (let i = aFrom; i < aTo; i++) {
+        const k = a[i]
+        if (ca.get(k) !== 1 || cb.get(k) !== 1) continue
+        pairs.push([i, posB.get(k)])
+      }
+      if (pairs.length === 0) return pairs
+      // Longest increasing subsequence on the b-index (O(k log k)); `tail[t]`
+      // is the smallest possible tail b-index of a length-(t+1) run, `prev`
+      // threads the chain back together.
+      const tail = []      // indexes INTO pairs
+      const prev = new Array(pairs.length).fill(-1)
+      for (let p = 0; p < pairs.length; p++) {
+        let lo = 0, hi = tail.length
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1
+          if (pairs[tail[mid]][1] < pairs[p][1]) lo = mid + 1
+          else hi = mid
+        }
+        if (lo > 0) prev[p] = tail[lo - 1]
+        tail[lo] = p
+      }
+      const chain = []
+      for (let p = tail.length > 0 ? tail[tail.length - 1] : -1; p >= 0; p = prev[p]) chain.push(pairs[p])
+      chain.reverse()
+      return chain
+    }
+
+    // Diff one region [aFrom,aTo) × [bFrom,bTo). Shared prefix/suffix are
+    // trimmed first, then the region is either small enough for exact Myers or
+    // split at anchors. A region with no anchor at all (nothing in common, or
+    // every line duplicated) is genuinely one replacement and is emitted as
+    // one hunk — which is the ONLY case where a whole region is reported.
+    function diffRange(a, b, aFrom, aTo, bFrom, bTo, out, depth) {
+      const total = aTo - aFrom, btotal = bTo - bFrom
+      let s = 0
+      const lim = Math.min(total, btotal)
+      while (s < lim && a[aFrom + s] === b[bFrom + s]) s++
+      let na = total - s, nb = btotal - s
+      while (na > 0 && nb > 0 && a[aFrom + s + na - 1] === b[bFrom + s + nb - 1]) { na--; nb-- }
+      if (na === 0 && nb === 0) return
+      const aStart = aFrom + s, bStart = bFrom + s
+      if (na + nb <= MYERS_MAX_SUM) {
+        const sa = a.slice(aStart, aStart + na)
+        const sb = b.slice(bStart, bStart + nb)
+        const ops = myersOps(sa, sb)
+        if (ops !== null) { hunksFromOps(ops, sb, out, aStart, bStart); return }
+      }
+      if (depth < ANCHOR_MAX_DEPTH) {
+        const anchors = anchorPairs(a, b, aStart, aStart + na, bStart, bStart + nb)
+        if (anchors.length > 0) {
+          let pa = aStart, pb = bStart
+          for (const pair of anchors) {
+            if (pair[0] > pa || pair[1] > pb) diffRange(a, b, pa, pair[0], pb, pair[1], out, depth + 1)
+            pa = pair[0] + 1
+            pb = pair[1] + 1
+          }
+          if (pa < aStart + na || pb < bStart + nb) diffRange(a, b, pa, aStart + na, pb, bStart + nb, out, depth + 1)
+          return
+        }
+      }
+      out.push({ oldStart: aStart, oldLen: na, newStart: bStart, newLen: nb, newLines: b.slice(bStart, bStart + nb) })
+    }
+
+    function computeHunks(a, b) {
+      const hunks = []
+      diffRange(a, b, 0, a.length, 0, b.length, hunks, 0)
       for (let k = 0; k < hunks.length; k++) hunks[k].id = 'h' + k
       return hunks
     }
@@ -542,7 +763,10 @@ export default {
           }
         }
         writeFileSync(stateFile(st.sid), JSON.stringify({ root: st.root, baseReady: st.baseReady, files, lastReject: st.lastReject ?? null }))
-        // GC: drop binary blob files no longer referenced by any entry.
+        // GC: drop blob files no longer referenced by any entry. Two kinds live
+        // here: binary snapshots (binRef) and v1.31 large-TEXT baseline
+        // snapshots (baselineRef, what makes a big text file rejectable without
+        // keeping its content in memory).
         try {
           const dir = blobRoot(st.sid)
           if (existsSync(dir)) {
@@ -551,6 +775,8 @@ export default {
               const f = entry[1]
               if (f.base && f.base.binRef) refs.add(f.base.binRef)
               if (f.cur && f.cur.binRef) refs.add(f.cur.binRef)
+              if (f.base && f.base.baselineRef) refs.add(f.base.baselineRef)
+              if (f.cur && f.cur.baselineRef) refs.add(f.cur.baselineRef)
             }
             for (const name of readdirSync(dir)) {
               if (!refs.has(name)) { try { rmSync(join(dir, name), { force: true }) } catch (e) {} }
@@ -759,18 +985,149 @@ export default {
     }
 
     // ---------- scanning ----------
-    async function loadFileEntry(st, rel) {
+    // v1.31 content signature for an entry whose content is NOT (or must not
+    // be) held in memory. Returns { sig, trunc } — `sig` is a real
+    // LF-normalized content hash (comparable to any text content), `trunc` is
+    // the last-resort sampled identity used only past MAX_SIG_BYTES, where a
+    // full pass would mean reading gigabytes on every poll.
+    async function sigFor(target, size) {
+      if (size <= MAX_SIG_BYTES) {
+        try {
+          const digest = createHash('sha1')
+          const n = await streamNormalized(target, { digest: digest })
+          return { sig: { tier: SIG_TIERS.hash, n: n, h: digest.digest('hex') }, trunc: null }
+        } catch (e) {
+          // No streaming backend (or an unreadable file): fall through to the
+          // sampled identity rather than claiming a content verdict we cannot
+          // support.
+        }
+      }
+      try {
+        const want = SIG_SAMPLE_READ_BYTES
+        const parts = []
+        const push = (bytes) => { if (bytes && bytes.length) parts.push(lfBytes(bytes)) }
+        push(await fs.readByteRange(target, { offset: 0, length: want }))
+        const mid = Math.max(0, Math.floor(size / 2) - Math.floor(SIG_SAMPLE_BYTES / 2))
+        push(await fs.readByteRange(target, { offset: mid, length: want }))
+        push(await fs.readByteRange(target, { offset: Math.max(0, size - SIG_SAMPLE_BYTES), length: want }))
+        const digest = createHash('sha1')
+        for (const p of parts) digest.update(p)
+        return { sig: null, trunc: { tier: SIG_TIERS.sampled, n: size, h: digest.digest('hex') } }
+      } catch (e) {
+        return { sig: null, trunc: null }
+      }
+    }
+    // Baseline snapshot for a large TEXT file (the fingerprint tier): the
+    // normalized content goes into the blob dir so a later reject can restore
+    // it byte-for-byte. Returns { sig, ref, bytes } or null.
+    async function snapshotText(st, rel, target, size) {
+      if (size > MAX_SIG_BYTES) return null
+      try {
+        const ref = createHash('sha1').update(rel).update(String(size)).update(String(Date.now())).digest('hex')
+        const dir = blobRoot(st.sid)
+        mkdirSync(dir, { recursive: true })
+        const blobPath = join(dir, ref)
+        const digest = createHash('sha1')
+        const n = await streamNormalized(target, { digest: digest, writePath: blobPath })
+        return { sig: { tier: SIG_TIERS.hash, n: n, h: digest.digest('hex') }, ref: ref, bytes: n }
+      } catch (e) {
+        return null
+      }
+    }
+    // v1.31: a text baseline that is too large to keep in memory still has to be
+    // RESTORABLE (拒绝 = write the baseline back). One streaming pass mirrors its
+    // normalized bytes into the session blob dir, so reject reads that file
+    // instead of needing `base.content`. Only ever called when an entry BECOMES
+    // a baseline (never for `cur`), and never overwrites an existing snapshot —
+    // the baseline object is often mutated in place (`f.base.size = …`), which
+    // v1.31: normalized bytes of a baseline that was read as CONTENT and is worth
+    // preserving (>= MAX_CONTENT_BYTES). Keyed by the entry's own fingerprint and
+    // written the moment the entry becomes a baseline, so the snapshot can never
+    // observe a later write to the file. Bounded by the review set: only the
+    // current baseline of each large file is held, and by exactly one generation.
+    const baselineBufs = new Map()
+    function bufferBaseline(entry) {
+      if (!entry || !entry.present || !entry.sig || entry.baselineRef || entry.content === null) return
+      if (entry.sig.tier !== SIG_TIERS.hash || entry.size > MAX_SIG_BYTES) return
+      if (baselineBufs.has(entry.sig.h)) return
+      baselineBufs.set(entry.sig.h, Buffer.from(entry.content, 'utf8'))
+    }
+    // must not invalidate its blob.
+    async function blobSnapshot(st, rel, entry) {
+      if (!entry || !entry.present || !entry.sig || entry.baselineRef) return false
+      if (entry.size > MAX_SIG_BYTES || entry.sig.tier !== SIG_TIERS.hash) return false
+      if (entry.syncing) return false
+      entry.syncing = true
+      const done = (ok) => { entry.syncing = false; return ok }
+      try {
+        const dir = blobRoot(st.sid)
+        mkdirSync(dir, { recursive: true })
+        const ref = createHash('sha1').update('base\u0001').update(rel).update(entry.sig.h).digest('hex')
+        const blobPath = join(dir, ref)
+        if (existsSync(blobPath)) {
+          entry.baselineRef = ref
+          entry.baselineBytes = entry.sig.n
+          return done(true)
+        }
+        // Prefer the bytes captured at baseline time (race-free by construction).
+        const held = baselineBufs.get(entry.sig.h)
+        if (held) {
+          if (held.length !== entry.sig.n) return done(false)
+          writeFileSync(blobPath, held)
+          entry.baselineRef = ref
+          entry.baselineBytes = entry.sig.n
+          return done(true)
+        }
+        // No captured copy (e.g. the state was restored from disk, or the
+        // baseline predates this version): stream the file and VERIFY it against
+        // the fingerprint — a mismatch means the file already moved on, and a
+        // snapshot that does not match the baseline must never be kept.
+        const target = await fs.resolve(joinPath(st.root, rel))
+        const digest = createHash('sha1')
+        const n = await streamNormalized(target, { digest: digest, writePath: blobPath })
+        if (n !== entry.sig.n || digest.digest('hex') !== entry.sig.h) {
+          try { rmSync(blobPath, { force: true }) } catch (e) {}
+          return done(false)
+        }
+        entry.baselineRef = ref
+        entry.baselineBytes = entry.sig.n
+        return done(true)
+      } catch (e) {
+        return done(false)
+      }
+    }
+    // v1.31: `prev` lets an unchanged file (same stat identity) skip the whole
+    // read — including the streaming signature pass. Content is read for
+    // anything up to MAX_SIG_BYTES; past that only a stat identity is kept, so
+    // the workspace scan never holds a large file's text in memory.
+    async function loadFileEntry(st, rel, prev) {
       const md = isMarkdownPath(rel)
       const target = await fs.resolve(joinPath(st.root, rel))
       let info
       try { info = await fs.stat(target) } catch (e) { info = undefined }
-      if (!info) return { present: false, content: null, eol: false, crlf: false, version: null, size: 0, binRef: null, binSize: 0, md: md }
-      if (info.size > MAX_CONTENT_BYTES) {
-        return { present: true, content: null, eol: false, crlf: false, version: info.version, size: info.size, note: 'large', binRef: null, binSize: 0, md: md }
+      if (!info) return { ...absentEntry(), md: md }
+      // Stat identity unchanged: the entry we already hold is still true (this
+      // is what keeps a 60MB file from being re-hashed on every poll).
+      if (prev && prev.present && prev.version === info.version && prev.size === info.size) return prev
+      // Past MAX_SIG_BYTES nothing is hashed either: the file is reviewed by its
+      // stat identity alone (accept/reject still work), which is the ONE size
+      // tier where that is true.
+      if (info.size > MAX_SIG_BYTES) {
+        const fp = await sigFor(target, info.size)
+        return { present: true, content: null, eol: false, crlf: false, version: info.version, size: info.size, note: 'large', trunc: fp.trunc, binRef: null, binSize: 0, md: md }
       }
       try {
         const text = await fs.readText(target)
-        return { present: true, content: text.replace(/\r\n/g, '\n'), eol: text.endsWith('\n'), crlf: /\r\n/.test(text), version: info.version, size: info.size, binRef: null, binSize: 0, md: md }
+        const content = text.replace(/\r\n/g, '\n')
+        const entry = { present: true, content: content, eol: text.endsWith('\n'), crlf: /\r\n/.test(text), version: info.version, size: info.size, binRef: null, binSize: 0, md: md }
+        // v1.31: with the content in hand, the fingerprint costs one hash — and it
+        // is what makes the baseline snapshot race-free: the blob is written from
+        // THESE bytes the moment they are known to be the baseline, so a later
+        // write to the file cannot leak into the snapshot. (Only computed for
+        // entries big enough to be worth preserving as a blob; a small file's
+        // baseline is simply its own content, which stays in memory.)
+        if (info.size > MAX_CONTENT_BYTES) entry.sig = sigOfText(content)
+        return entry
       } catch (e) {
         // Binary content (readText refused it): snapshot the raw bytes (up to
         // MAX_BACKUP_BYTES) into the per-session blob dir so a later reject
@@ -801,14 +1158,17 @@ export default {
       // at all, so there is nothing to re-read.
       if (f.cur && f.cur.present && f.cur.version === w.version && f.cur.size === w.size) return f
       if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
-      const next = await loadFileEntry(st, rel)
+      const next = await loadFileEntry(st, rel, f.cur)
       // v1.29: a stat change is not a change. When the newly read text is
       // identical to what we already hold (an identical rewrite, an editor
       // "save", or a pure CRLF<->LF flip — which changes `size` by one byte
-      // per line), keep the EXISTING entry (old version included) so rev does
-      // not move: every consumer above this line (isChanged / isPending /
-      // f.rev-keyed caches / the client's prevRev payload guard) then sees an
-      // untouched file, and the pane does not re-render for nothing.
+      // per line), keep the EXISTING entry (old version included) so the pane
+      // does not re-render for nothing.
+      // v1.31: `rev` still moves — the stat identity did change, and `rev` is
+      // also the per-entry content generation the stats cache keys on (a
+      // separate, liveness-only counter would need to be threaded through every
+      // entry). What stays put is the CONTENT and the version token, which is
+      // what "unchanged" has to mean for isChanged / isPending.
       f.cur = entrySame(f.cur, next) ? f.cur : next
       f.rev++
       return f
@@ -895,6 +1255,7 @@ export default {
             if (!firstScan && before && beforeCur && beforeCur.present && f.cur.present &&
                 !pending && !attrib(w.rel) && !entrySame(beforeCur, f.cur)) {
               f.base = cloneEntry(f.cur)
+              armBaseline(st, w.rel, f)
               if (f.decisions.size > 0) f.decisions.clear()
               f.rev++
             }
@@ -905,7 +1266,7 @@ export default {
               treeChanged = true
               const pending = isPending(f)
               if (f.decisions.size > 0) { f.decisions.clear(); f.rev++ }
-              f.cur = { present: false, content: null, eol: false, version: null, size: 0 }
+              f.cur = goneEntry()
               f.rev++
               // User-side deletion (not through the agent channel, file was
               // not pending): fold the deletion into the baseline silently.
@@ -929,6 +1290,9 @@ export default {
           // (or skipped by walk caps) survives so the next targetedRefresh
           // still attributes it instead of folding it into the baseline.
           for (const rel of seen) { if (touchedAtStart.has(rel)) st.touched.delete(rel) }
+          // v1.31: every file this walk touched that now carries a fingerprint
+          // baseline gets its restore blob (one pass, after the loop).
+          armSeenBaselines(st, seen)
           st.scannedAt = Date.now()
           st.error = null
           if (treeChanged || contentChanged) {
@@ -1028,7 +1392,7 @@ export default {
               if (before && before.cur && before.cur.present) {
                 treeChanged = true
                 if (before.decisions.size > 0) { before.decisions.clear(); before.rev++ }
-                before.cur = { present: false, content: null, eol: false, crlf: false, version: null, size: 0, binRef: null, binSize: 0 }
+                before.cur = goneEntry()
                 before.rev++
                 if (!pending && !attrib) before.base = absentEntry()
               }
@@ -1036,7 +1400,7 @@ export default {
             }
             const f = before || { base: null, cur: null, rev: 0, decisions: new Map() }
             if (!f.cur || !f.cur.present || f.cur.version !== info.version || f.cur.size !== info.size) {
-              const next = await loadFileEntry(st, rel)
+              const next = await loadFileEntry(st, rel, f.cur)
               // v1.29: identical text (including a pure CRLF/LF flip) keeps the
               // existing entry, so no rev bump and no spurious review.
               if (!entrySame(f.cur, next)) {
@@ -1052,6 +1416,7 @@ export default {
             // decides the baseline — touched → "added" review, otherwise fold.
             if (f.base === null) {
               f.base = attrib ? absentEntry() : cloneEntry(f.cur)
+              armBaseline(st, rel, f)
             }
             // Non-pending change outside the agent channel → fold silently
             // (mirror of the scan; prevents the open viewer flashing a diff
@@ -1059,12 +1424,16 @@ export default {
             if (before && beforeCur && beforeCur.present && f.cur.present &&
                 !pending && !attrib && !entrySame(beforeCur, f.cur)) {
               f.base = cloneEntry(f.cur)
+              armBaseline(st, rel, f)
               if (f.decisions.size > 0) f.decisions.clear()
               f.rev++
             }
           }
           // Consume the touched entries we handled (mirror of the scan).
           for (const rel of targets) st.touched.delete(rel)
+          // v1.31: same arming sweep as the scan — a precise refresh can also be
+          // where a large text baseline is first established.
+          armSeenBaselines(st, targets)
           if ((st.mutationStamp || 0) === stamp) {
             st.dirty = false
             st.shellWindow = false
@@ -1196,6 +1565,63 @@ export default {
         return String(x.name).localeCompare(String(y.name), undefined, { sensitivity: 'base' })
       })
       return node
+    }
+
+    // v1.30 lazy tree: the immediate children of ONE directory. The sidebar no
+    // longer asks for the whole workspace tree up front — each expansion costs
+    // one level, so the first row can render without serializing a dependency
+    // folder that happens to live under the root, and a 20k-node workspace no
+    // longer pays a 2.6MB payload before anything is visible.
+    // The per-directory ceiling is a payload/DOM guard only (a flat folder with
+    // tens of thousands of entries); `truncated` tells the client so it can say
+    // so instead of silently lying.
+    const TREE_DIR_MAX = 4000
+    async function treeChildren(dirTarget, rel) {
+      let entries
+      try { entries = await fs.listDir(dirTarget) } catch (e) { return null }
+      const out = []
+      for (const e of entries) {
+        const childRel = rel ? rel + '/' + e.name : e.name
+        if (e.type === 'directory') {
+          if (TREE_SKIP_DIRS.has(e.name)) continue
+          out.push({ name: e.name, type: 'directory', path: childRel })
+        } else if (e.type === 'file') {
+          out.push({ name: e.name, type: 'file', path: childRel, size: e.size !== undefined ? e.size : 0 })
+        }
+      }
+      // Same ordering contract as the whole-tree builder: directories first,
+      // then files, each group case-insensitively alphabetical.
+      out.sort(function (x, y) {
+        const dx = x.type === 'directory' ? 0 : 1
+        const dy = y.type === 'directory' ? 0 : 1
+        if (dx !== dy) return dx - dy
+        return String(x.name).localeCompare(String(y.name), undefined, { sensitivity: 'base' })
+      })
+      const truncated = out.length > TREE_DIR_MAX
+      return { children: truncated ? out.slice(0, TREE_DIR_MAX) : out, truncated: truncated }
+    }
+
+    // Decorate ONE listing with the same VCS letters / .gitignore graying the
+    // whole-tree path applies: a file takes its own letter, a directory the
+    // strongest letter among its descendants.
+    async function decorateChildren(root, rel, children) {
+      if (!children || children.length === 0) return
+      const git = await gitInfoFor(root, [])
+      if (!git) return
+      const repoRel = (p) => (git.prefix ? git.prefix + '/' + p : p)
+      const ignored = await checkIgnoreFor(root, rel, children.map((c) => repoRel(c.path)))
+      const dirAgg = dirAggOf(git)
+      for (const c of children) {
+        const rr = repoRel(c.path)
+        if (c.type === 'directory') {
+          const agg = dirAgg.get(rr)
+          if (agg) c.git = agg.letter
+        } else {
+          const l = git.statuses.get(rr)
+          if (l) c.git = l
+        }
+        if (ignored.has(rr)) c.ignored = true
+      }
     }
 
     // ---------- git VCS annotations (v1.15) ----------
@@ -1417,21 +1843,68 @@ export default {
     // flag is per node — every walked path was fed to check-ignore
     // individually.
     const GIT_PRIORITY = { U: 1, M: 2, R: 3, A: 4, D: 5 }
-    function annotateTree(node, git) {
-      const repoRel = (rel) => (git.prefix ? git.prefix + '/' + rel : rel)
+    // v1.30: the "strongest letter per ancestor directory" table, factored out
+    // of annotateTree so the LAZY tree path (one directory per request) can ask
+    // the same question for a single folder without walking a whole tree.
+    // Cached per git snapshot (the snapshot itself is cached with a 2s TTL).
+    const dirAggCache = new WeakMap()
+    function dirAggOf(git) {
+      let agg = dirAggCache.get(git)
+      if (agg) return agg
       // Aggregate every status path's letter into each of its ancestor
       // directories (repo-relative keys) — O(entries × depth), depth ≤ 16.
-      const dirAgg = new Map()
+      agg = new Map()
       for (const entry of git.statuses) {
         const letter = entry[1]
         const prio = GIT_PRIORITY[letter] || 1
         const segs = entry[0].split('/')
         for (let k = 0; k < segs.length; k++) {
           const d = segs.slice(0, k).join('/')
-          const cur = dirAgg.get(d)
-          if (!cur || cur.p < prio) dirAgg.set(d, { p: prio, letter: letter })
+          const cur = agg.get(d)
+          if (!cur || cur.p < prio) agg.set(d, { p: prio, letter: letter })
         }
       }
+      dirAggCache.set(git, agg)
+      return agg
+    }
+    // v1.30: batched `git check-ignore` for one directory listing. Kept apart
+    // from gitInfoFor because that helper's cached result carries the ignored
+    // set of whatever path list produced it — fine for a whole-tree load, wrong
+    // for a per-directory one. Keyed per (root, dir) with the same short TTL.
+    const ignoreCache = new Map()
+    async function checkIgnoreFor(root, dirRel, repoPaths) {
+      if (!repoPaths || repoPaths.length === 0) return new Set()
+      const key = gitKeyOf(root) + '\u0001' + dirRel
+      const hit = ignoreCache.get(key)
+      if (hit && Date.now() - hit.t < GIT_TTL) return hit.p
+      const p = (async () => {
+        const repoRoot = findRepoRoot(root)
+        if (!repoRoot) return new Set()
+        const ignored = new Set()
+        for (const bin of GIT_CANDIDATES) {
+          const r = await runGit(bin, ['check-ignore', '--stdin', '-z'], repoRoot, repoPaths.join('\0') + '\0')
+          if (r.spawnError) continue
+          if (r.ok && r.code === 0) {
+            const s = r.stdout.toString('utf8')
+            for (const x of s.split('\0')) if (x !== '') ignored.add(x)
+          }
+          break // code 1 (nothing ignored) or a failure: leave the set empty
+        }
+        return ignored
+      })().catch(() => new Set())
+      ignoreCache.set(key, { t: Date.now(), p: p })
+      return p
+    }
+    function annotateTree(node, git) {
+      const repoRel = (rel) => (git.prefix ? git.prefix + '/' + rel : rel)
+      // Post-order decoration pass: files take their own letter; a directory
+      // takes the strongest letter among its descendants (D > A > R > M > U) so
+      // a folder containing any change is itself flagged. Deleted files (D)
+      // never appear as tree nodes (they are gone from disk), so their letters
+      // reach ancestor directories through the status map instead. The ignored
+      // flag is per node — every walked path was fed to check-ignore
+      // individually.
+      const dirAgg = dirAggOf(git)
       const visit = (node, rel) => {
         let best = 0
         if (node.type === 'directory') {
@@ -1452,26 +1925,87 @@ export default {
     }
 
     // ---------- analysis ----------
-    function entryLines(entry) {
-      return entry.present && entry.content !== null ? splitLines(entry.content) : []
+    // v1.31: an entry that carries a fingerprint but no content is "not loaded
+    // yet". Loading is a review-time cost (the file is being looked at), never
+    // a scan-time one — that is what lets a large text file stay reviewable
+    // without keeping its text in the workspace state.
+    function isUnloaded(entry) {
+      return !!(entry && entry.present && entry.content === null && entry.sig)
     }
-    // v1.18: per-entry review stats cache. Computing the stats runs the Myers
-    // diff over the file's lines, which for a session with hundreds of
-    // modified files made EVERY getModified (and acceptAll's list) pay the
-    // full diff pass. The cache is keyed on f.rev — every mutation of
-    // (base, cur, decisions) bumps rev, so a hit is exact. Not persisted
-    // (saveState picks explicit fields only).
-    function fileStats(f) {
-      if (f.statsCache && f.statsCache.rev === f.rev) return f.statsCache
+    // Load the content of a fingerprint entry IN PLACE (entry.loading guards a
+    // concurrent double-load). `root`/`rel` locate the file; everything else the
+    // consumer needs is already on the entry.
+    //
+    // v1.31 CRITICAL: a BASELINE entry must be refilled from its own blob, never
+    // from the file on disk — the file holds the EDITED content at this point, so
+    // reading it would overwrite the baseline with the change and turn a real
+    // edit into a phantom "changed with 0 hunks". Content entries (the common
+    // case) still come from disk, which is exactly what they describe.
+    async function ensureLoaded(root, rel, entry) {
+      if (!entry || !entry.present) return
+      if (entry.content !== null || !entry.sig || entry.loading) return
+      if (entry.size > MAX_SIG_BYTES && !entry.baselineRef) return
+      try {
+        let text
+        if (entry.baselineRef) {
+          const blob = join(blobRoot(st.sid), entry.baselineRef)
+          if (!existsSync(blob)) return
+          entry.loading = true
+          text = readFileSync(blob, 'utf8')
+          entry.loading = false
+        } else {
+          const target = await fs.resolve(joinPath(root, rel))
+          entry.loading = true
+          text = await fs.readText(target)
+          entry.loading = false
+        }
+        entry.content = text.replace(/\r\n/g, '\n')
+        entry.eol = text.endsWith('\n')
+        entry.crlf = /\r\n/.test(text)
+        // The fingerprint is KEPT alongside the content: equality can then be
+        // settled by a hash instead of re-walking two line arrays, and it costs
+        // two short strings in memory (never in the state file — saveState picks
+        // explicit fields, and a clean entry persists only its baseline anyway).
+      } catch (e) {
+        entry.loading = false
+      }
+    }
+    async function fileLines(root, rel, entry) {
+      await ensureLoaded(root, rel, entry)
+      return linesOf(entry)
+    }
+    // v1.18: per-entry review stats cache. Computing the stats runs the diff
+    // over the file's lines, which for a session with hundreds of modified
+    // files made EVERY getModified (and acceptAll's list) pay the full diff
+    // pass. The cache is keyed on f.rev — every mutation of (base, cur,
+    // decisions) bumps rev, so a hit is exact. Not persisted (saveState picks
+    // explicit fields only).
+    // v1.31: async, because a fingerprint entry loads its content here (once,
+    // then it is cached on the entry and on rev). The old MAX_DIFF_LINES gate
+    // is gone: the anchored engine has no line ceiling, so a big file now gets
+    // real +N/-M numbers instead of a forced "过大".
+    // v1.31: the cache key includes both version tokens. `f.rev` alone is not
+    // enough: `refreshOne` deliberately keeps the same entry (and therefore the
+    // same stats when nothing was decided) across an EOL-only rewrite, while the
+    // file's OTHER side can still be replaced by a real edit between two calls —
+    // a version-stamped key cannot go stale that way.
+    function statsKey(f) {
+      return f.rev + '|' + ((f.base && f.base.version) || '-') + '|' + ((f.cur && f.cur.version) || '-')
+    }
+    async function fileStats(root, rel, f) {
+      const key = statsKey(f)
+      if (f.statsCache && f.statsCache.key === key) return f.statsCache
       const status = !f.base || !f.base.present ? 'added' : (!f.cur.present ? 'deleted' : 'modified')
       const note = (f.base && f.base.note) || f.cur.note || null
       let s
       if (note) {
         s = { status: status, note: note, pending: 1, added: 0, removed: 0 }
       } else {
-        const baseLines = entryLines(f.base)
-        const curLines = entryLines(f.cur)
-        if (baseLines.length > MAX_DIFF_LINES || curLines.length > MAX_DIFF_LINES) {
+        const baseLines = await fileLines(root, rel, f.base)
+        const curLines = await fileLines(root, rel, f.cur)
+        if (isUnloaded(f.base) || isUnloaded(f.cur)) {
+          // Beyond MAX_SIG_BYTES: the content cannot be held at all, so the
+          // counts stay unknown rather than being invented.
           s = { status: status, note: 'large', pending: 1, added: 0, removed: 0 }
         } else {
           const hunks = computeHunks(baseLines, curLines)
@@ -1485,21 +2019,21 @@ export default {
           s = { status: status, note: null, pending: pending, added: added, removed: removed }
         }
       }
-      f.statsCache = { rev: f.rev, ...s }
+      f.statsCache = { key: key, rev: f.rev, ...s }
       return f.statsCache
     }
-    function modifiedFiles(st) {
+    async function modifiedFiles(st) {
       const files = []
       for (const entry of st.files) {
         const rel = entry[0], f = entry[1]
-        // Content-first listing (v1.29): isChanged() already compares the
-        // normalized text for entries that carry it, so an identical rewrite —
-        // including a pure CRLF<->LF conversion, which moves the stat identity
-        // (size changes by one byte per line) but not one line of text — is
-        // simply not listed. Binary/large entries have no content in memory and
-        // fall back to the version axis inside entrySame.
+        // Content-first listing (v1.29): isChanged() compares the normalized
+        // text for entries that carry it — and the LF-normalized fingerprint for
+        // the ones that do not — so an identical rewrite, including a pure
+        // CRLF<->LF conversion (which moves the stat identity: one byte per
+        // line), is simply not listed. Only binary content still falls back to
+        // the version axis, because nothing else is knowable about it.
         if (!f.cur || !isChanged(f)) continue
-        const s = fileStats(f)
+        const s = await fileStats(st.root, rel, f)
         files.push({ path: rel, status: s.status, note: s.note, pending: s.pending, added: s.added, removed: s.removed })
       }
       files.sort(function (x, y) { return x.path < y.path ? -1 : (x.path > y.path ? 1 : 0) })
@@ -1529,35 +2063,74 @@ export default {
     // content. Ignoring them here is the whole point of the fix — the reported
     // bug is precisely a flip of those two flags with identical lines.
     //
-    // Entries without content (binary, > 512KB large) cannot be compared that
-    // way — nothing is in memory — so those keep the version axis as the only
-    // available truth. `note` differs => different kind of observation =>
-    // changed (a large/binary file that became readable is a real transition).
+    // Entries without content used to be stuck on the version axis (binary AND
+    // every text file past 512KB) — which is exactly why a CRLF/LF flip kept
+    // producing a phantom "已修改" for large files even after v1.29 fixed it for
+    // small ones. v1.31 splits that case in two:
+    //   * a text entry past the in-memory window carries `sig`, an LF-normalized
+    //     content hash — a REAL content verdict, so it is compared as one;
+    //   * binary content (`note: 'binary'`) and the past-MAX_SIG_BYTES tier
+    //     (`trunc`, a sampled identity) keep the version axis, which is all that
+    //     is knowable about them. `note` differing => different kind of
+    //     observation => changed (a file that became readable is a transition).
     function entrySame(a, b) {
       if (!a || !b) return a === b
       if (a.present !== b.present) return false
       if (!a.present) return true
-      if (a.content === null || b.content === null) {
-        return a.content === b.content && (a.note || null) === (b.note || null) && a.version === b.version
-      }
       if ((a.note || null) !== (b.note || null)) return false
-      const la = splitLines(a.content)
-      const lb = splitLines(b.content)
+      // Both sides fingerprinted: the hashes already answer the question (an
+      // entry keeps its fingerprint after its content is loaded, so this path is
+      // common). Fall through to the text comparison when either side has none.
+      if (a.sig && b.sig) {
+        if (sameSig(a.sig, b.sig)) return true
+        if (a.content !== null && b.content !== null) return linesEqual(a.content, b.content)
+        return false
+      }
+      const ac = a.content !== null && a.content !== undefined
+      const bc = b.content !== null && b.content !== undefined
+      if (ac && bc) return linesEqual(a.content, b.content)
+      // One side has content, the other only a fingerprint (the file crossed
+      // the 512KB window). A fingerprint IS a normalized-content hash, so hash
+      // the content and compare — no version fallback for a question we can
+      // answer exactly.
+      if (ac || bc) {
+        const withContent = ac ? a : b
+        const other = ac ? b : a
+        if (other.sig) return sameSig(sigOfText(withContent.content), other.sig)
+        return a.version === b.version
+      }
+      if (a.sig && b.sig) return sameSig(a.sig, b.sig)
+      if (a.trunc && b.trunc) return sameSig(a.trunc, b.trunc)
+      return a.version === b.version
+    }
+    function linesEqual(x, y) {
+      const la = splitLines(x)
+      const lb = splitLines(y)
       if (la.length !== lb.length) return false
       for (let i = 0; i < la.length; i++) if (la[i] !== lb[i]) return false
       return true
     }
-
-    // "There is a reviewable diff" for the file view. Content-first (v1.29):
-    // a rewrite that lands the identical bytes is not a change, no matter what
-    // the stat identity says. Binary/large entries (no content in memory) fall
-    // back to the version axis, which is all that is knowable about them.
+    function linesOf(entry) {
+      return entry && entry.present && entry.content !== null ? splitLines(entry.content) : []
+    }
+    // "This entry's lines are in hand" — an ABSENT entry counts (an empty
+    // baseline is a legitimate diff side), a present entry whose content could
+    // not be loaded does not.
+    function hasLines(entry) {
+      return !!entry && (!entry.present || entry.content !== null)
+    }
     function isChanged(f) {
       if (!f.base || !f.cur) return true
       return !entrySame(f.base, f.cur)
     }
 
-    function diffPayload(f, prevRev) {
+    // v1.31: async — a fingerprint entry (text past the in-memory window) loads
+    // its content HERE, at review time, which is what turns "整文件接受/拒绝"
+    // into a real per-hunk diff. The old MAX_DIFF_LINES gate is gone: the
+    // anchored engine has no line ceiling, so the only files that still fall
+    // back to a note are binary ones and the past-MAX_SIG_BYTES tier (whose
+    // content is never held at all).
+    async function diffPayload(f, root, rel, prevRev) {
       const status = !f.base || !f.base.present ? 'added' : (!f.cur.present ? 'deleted' : 'modified')
       if (prevRev !== undefined && prevRev !== null && prevRev === f.rev) {
         return { ok: true, same: true, rev: f.rev }
@@ -1575,41 +2148,46 @@ export default {
       if (status === 'added' && !f.cur.present) {
         return { ok: true, rev: f.rev, status: status, changed: false, zero: true, hunks: [], current: null, baseline: null }
       }
-      // v1.9: a clean markdown file renders in full (no line cap, no preview
-      // truncation). Review states (changed) keep the diff/note paths below —
-      // pending edits must stay visible for accept/reject.
-      const md = (f.base && f.base.md) || (f.cur && f.cur.md)
-      if (md && !changed && f.cur.content !== null) {
-        const curLines = entryLines(f.cur)
-        return { ok: true, rev: f.rev, status: status, changed: false, hunks: [], current: curLines, baseline: null }
-      }
+      // A note (binary, or past MAX_SIG_BYTES) is decided BEFORE any load: those
+      // entries have no content to load by definition.
       const note = (f.base && f.base.note) || f.cur.note || null
       if (note) {
-        // Large-but-text files (≤512KB, >8000 lines): content is already in
-        // memory (loadFileEntry reads anything ≤512KB), so ship a read-only
-        // preview head instead of nothing. Binary / oversized (>512KB) files
-        // keep the plain note payload (no content loaded).
-        if (note === 'large' && f.cur.content !== null) {
-          const curLines = entryLines(f.cur)
-          if (curLines.length > 0) {
-            return {
-              ok: true, rev: f.rev, status: status, changed: changed, note: note,
-              hunks: [], current: null, baseline: null,
-              preview: curLines.slice(0, 4000),
-              lineCount: curLines.length,
-            }
-          }
-        }
         return { ok: true, rev: f.rev, status: status, changed: changed, note: note, hunks: [], current: null, baseline: null }
       }
-      const baseLines = entryLines(f.base)
-      const curLines = entryLines(f.cur)
-      if (baseLines.length > MAX_DIFF_LINES || curLines.length > MAX_DIFF_LINES) {
-        return { ok: true, rev: f.rev, status: status, changed: changed, note: 'large', hunks: [], current: null, baseline: null }
+      const baseLines = await fileLines(root, rel, f.base)
+      const curLines = await fileLines(root, rel, f.cur)
+      // Load failed (file vanished / refuses to read): honest "nothing to show"
+      // beats claiming an empty diff.
+      if (f.base.present && baseLines.length === 0 && f.base.size > 0) {
+        return { ok: true, rev: f.rev, status: status, changed: changed, note: 'unreadable', hunks: [], current: null, baseline: null }
+      }
+      // v1.9: a clean markdown file renders in full (no line cap, no preview
+      // truncation). Review states (changed) keep the diff path below — pending
+      // edits must stay visible for accept/reject.
+      const md = (f.base && f.base.md) || (f.cur && f.cur.md)
+      if (md && !changed) {
+        return { ok: true, rev: f.rev, status: status, changed: false, hunks: [], current: curLines, baseline: null }
       }
       const all = computeHunks(baseLines, curLines)
       const hunks = []
       for (const h of all) if (!f.decisions.has(h.id)) hunks.push(h)
+      // v1.31: past the shipping bound the viewer gets the HUNKS plus a
+      // head/tail preview instead of the whole file. Hunk accept/reject does not
+      // need the surrounding text (applyHunk recomputes from the host's own
+      // copy), so this stays a rendering bound — never a review bound.
+      const huge = curLines.length > MAX_DIFF_SHIP_LINES || baseLines.length > MAX_DIFF_SHIP_LINES
+      if (huge) {
+        const head = 400
+        const tail = 200
+        const tailStart = curLines.length > head + tail ? curLines.length - tail : 0
+        return {
+          ok: true, rev: f.rev, status: status, changed: changed, hunks: hunks,
+          baseline: null, current: null, windowed: true, lineCount: curLines.length,
+          preview: curLines.slice(0, head),
+          previewTail: tailStart > 0 ? curLines.slice(tailStart) : [],
+          previewTailStart: tailStart > 0 ? tailStart + 1 : 0,
+        }
+      }
       return {
         ok: true, rev: f.rev, status: status, changed: changed, hunks: hunks,
         baseline: hunks.length > 0 ? baseLines : null,
@@ -1710,6 +2288,7 @@ export default {
         try { info = await fs.stat(await fs.resolve(joinPath(st.root, path))) } catch (e) { info = undefined }
         if (!info) {
           f.base = cloneEntry(f.cur)
+          armBaseline(st, path, f)
           f.decisions.clear()
           f.rev++
           f.justRejected = true
@@ -1717,8 +2296,33 @@ export default {
         }
         const snap = rec ? await snapshotForUndo(st, path, rec) : null
         await deleteFile(st, path)
-        f.cur = { present: false, content: null, eol: false, crlf: false, version: null, size: 0, binRef: null, binSize: 0 }
+        f.cur = goneEntry()
         if (snap) { snap.afterVersion = null; rec.files.push(snap) }
+      } else if (f.base.content === null && f.base.baselineRef) {
+        // v1.31: a TEXT baseline past the in-memory window. Its normalized
+        // bytes were mirrored into the session blob dir when it BECAME the
+        // baseline, so reject restores from that file — the large-file analogue
+        // of writing `base.content` back, and the reason big files can be
+        // rejected at all without holding their text in memory.
+        const blobPath = join(blobRoot(st.sid), f.base.baselineRef)
+        if (!existsSync(blobPath)) throw new Error('无法还原：大文件基线快照已丢失')
+        const snap = rec ? await snapshotForUndo(st, path, rec) : null
+        const target = await fs.resolve(joinPath(st.root, path))
+        const live = f.base.crlf ? readFileSync(blobPath, 'utf8').split('\n').join('\r\n') : readFileSync(blobPath, 'utf8')
+        const outcome = await writeFile(st, path, live)
+        const restoredEntry = {
+          present: true, content: null, eol: f.base.eol, crlf: f.base.crlf === true,
+          version: outcome.version, size: outcome.size !== undefined ? outcome.size : Buffer.byteLength(live, 'utf8'),
+          sig: f.base.sig ? { tier: f.base.sig.tier, n: f.base.sig.n, h: f.base.sig.h } : null,
+          baselineRef: f.base.baselineRef, baselineBytes: f.base.baselineBytes ?? 0,
+          binRef: null, binSize: 0, md: f.base.md === true,
+        }
+        f.cur = restoredEntry
+        // Restored content IS the baseline again: share the same fingerprint and
+        // the same blob, so isChanged() reports clean and a second reject still
+        // has a restore source.
+        f.base = cloneEntry(restoredEntry)
+        if (snap) { snap.afterVersion = outcome.version; rec.files.push(snap) }
       } else if (f.base.content === null) {
         // Binary / oversized baseline: restore the byte snapshot taken at
         // baseline time (binaries up to MAX_BACKUP_BYTES only).
@@ -1764,6 +2368,31 @@ export default {
       bumpTree(st)
       invalidateGitCacheFor(st.root)
     }
+    // v1.31: arm a just-assigned baseline with its restore source. Text whose
+    // content is in memory needs nothing (reject writes `base.content` back);
+    // a LARGE text baseline gets its normalized bytes mirrored into the session
+    // blob dir. Called right after every `f.base = …` of a PRESENT entry — it is
+    // cheap and idempotent (it returns immediately for anything in memory).
+    function armBaseline(st, rel, f) {
+      if (!f || !f.base || !f.base.present) return
+      // v1.31: a content baseline large enough to matter keeps its bytes for the
+      // snapshot, taken NOW (the entry is currently the baseline, so this is the
+      // only moment the content is guaranteed to be the baseline's).
+      bufferBaseline(f.base)
+      if (!f.base.sig || f.base.baselineRef || f.base.syncing) return
+      void blobSnapshot(st, rel, f.base)
+    }
+    // Sweep a batch of just-processed paths and give every fingerprint baseline
+    // its restore blob. It runs as ONE pass after the scan/refresh loop rather
+    // than at each `f.base = …`: a baseline is assigned from several branches
+    // (first scan, fold, on-demand load), and missing one of them is exactly how
+    // a big file ends up with a fingerprint it cannot restore from.
+    function armSeenBaselines(st, rels) {
+      for (const rel of rels) {
+        const f = st.files.get(rel)
+        if (f) armBaseline(st, rel, f)
+      }
+    }
     async function doAccept(st, f, path) {
       // A binary baseline needs its bytes for a future reject; snapshot them
       // now that this content becomes the new baseline.
@@ -1785,6 +2414,7 @@ export default {
         } catch (e) {}
       }
       f.base = cloneEntry(f.cur)
+      armBaseline(st, path, f)
       f.decisions.clear()
       f.rev++
     }
@@ -1835,6 +2465,48 @@ export default {
         }
       },
 
+      // v1.30: the lazy tree's workhorse — the IMMEDIATE children of one
+      // directory ('' = the workspace root). Same node shape as listTree's
+      // children (name/type/path/size + git letter + ignored flag) so the
+      // client renders both modes with one component, but the request and the
+      // payload are bounded to a single level. listTree stays as the fallback
+      // for a client running against an older host (fresh client bundle before
+      // the host module is reloaded).
+      async listDir(args) {
+        const st = requireState(args)
+        if (!st) return { ok: false, error: 'no-session' }
+        const sid = String(args.sessionId)
+        const rootOverride = args && args.root ? String(args.root) : null
+        const rawPath = args && args.path !== undefined && args.path !== null ? String(args.path) : ''
+        if (!rootOverride) {
+          // Same freshness policy as listTree: the listing itself reflects
+          // disk, the scan only keeps the REVIEW state current.
+          if (!st.root) await scan(sid)
+          else await ensureFresh(st, sid)
+          if (st.error) return { ok: false, error: st.error }
+        }
+        const rootPath = rootOverride || st.root
+        if (!rootPath) return { ok: false, error: 'no-workspace' }
+        let rel = ''
+        if (rawPath !== '' && rawPath !== '.' && rawPath !== './') {
+          const norm = normalizeRelPath(rootPath, rawPath)
+          if (!norm) return { ok: false, error: 'bad-path' }
+          rel = norm
+        }
+        try {
+          const dirTarget = rel ? await fs.resolve(joinPath(rootPath, rel)) : await fs.resolve(rootPath)
+          const info = await fs.stat(dirTarget)
+          if (!info) return { ok: false, error: 'not-found' }
+          if (info.type && info.type !== 'directory') return { ok: false, error: 'not-a-directory' }
+          const res = await treeChildren(dirTarget, rel)
+          if (res === null) return { ok: false, error: 'list-failed' }
+          await decorateChildren(rootPath, rel, res.children)
+          return { ok: true, root: rootPath, path: rel, children: res.children, truncated: res.truncated, limit: TREE_DIR_MAX }
+        } catch (e) {
+          return { ok: false, error: e && e.message ? String(e.message) : String(e) }
+        }
+      },
+
       async getModified(args) {
         const st = requireState(args)
         if (!st) return { ok: false, error: 'no-session' }
@@ -1844,7 +2516,7 @@ export default {
         // 20s failsafe cadence (ensureFresh).
         await ensureFresh(st, sid)
         if (st.error) return { ok: false, error: st.error }
-        return { ok: true, root: st.root, files: modifiedFiles(st), treeStamp: st.treeStamp, undo: st.lastReject ? { opId: st.lastReject.opId, count: st.lastReject.files.length, ts: st.lastReject.ts } : null }
+        return { ok: true, root: st.root, files: await modifiedFiles(st), treeStamp: st.treeStamp, undo: st.lastReject ? { opId: st.lastReject.opId, count: st.lastReject.files.length, ts: st.lastReject.ts } : null }
       },
 
       // Long-poll wake-up: resolves as soon as an agent mutation (write/edit/
@@ -1962,7 +2634,7 @@ export default {
             const touched = !f.cur.present || !info || f.cur.version !== info.version || f.cur.size !== info.size
             if (touched) {
               const pending = isPending(f)
-              const next = await loadFileEntry(st, path)
+              const next = await loadFileEntry(st, path, f.cur)
               // v1.29: only a CONTENT difference is a change. Identical text
               // (an editor save with no edits, an identical agent rewrite, a
               // pure CRLF/LF flip) leaves the entry — and therefore `changed`,
@@ -1979,6 +2651,7 @@ export default {
                 // next scan would silently accept.
                 if (!pending && !st.touched.has(path) && st.shellWindow !== true && f.cur.present) {
                   f.base = cloneEntry(f.cur)
+                  armBaseline(st, path, f)
                   f.decisions.clear()
                   f.rev++
                 }
@@ -2015,6 +2688,7 @@ export default {
                 st.touched.delete(path)
               } else {
                 f.base = cloneEntry(entry)
+                armBaseline(st, path, f)
               }
             }
             f.rev++
@@ -2024,11 +2698,15 @@ export default {
           }
         }
         if (!f.cur) return { ok: true, missing: true }
+        // v1.31: note the shape change — a file past MAX_SIG_BYTES now also
+        // keeps note:'large' here, but for a different reason than v1.9's
+        // markdown path: its size, not its extension, is what stops the load.
+        // diffPayload (below) turns that into the honest banner payload.
         // v1.9: large markdown (>512KB scan cap) loads its content ON DEMAND
         // when the file is opened, so the viewer renders the whole document
         // (bounded by MAX_MD_RENDER_BYTES). The entry keeps note:'large' for
         // every other consumer; only the diff payload treats it as renderable.
-        if (f.cur.md && f.cur.note === 'large' && f.cur.content === null && f.cur.size <= MAX_MD_RENDER_BYTES) {
+        if (f.cur.md && f.cur.note === 'large' && f.cur.content === null && f.cur.size <= MAX_SIG_BYTES) {
           try {
             const target = await fs.resolve(joinPath(st.root, path))
             const text = await fs.readText(target)
@@ -2041,7 +2719,7 @@ export default {
           } catch (e) {}
         }
         const prev = args && args.rev !== undefined && args.rev !== null ? Number(args.rev) : undefined
-        const payload = diffPayload(f, prev)
+        const payload = await diffPayload(f, st.root, path, prev)
         // v1.13: root lets the client key its per-file user edit history by
         // (workspace, relative path) — the history then survives closing/
         // reopening the tab and switching sessions within the workspace.
@@ -2065,8 +2743,8 @@ export default {
         const f = st.files.get(path)
         if (!f || !f.cur) return { ok: false, code: 'not-found', message: '文件不存在' }
         if (f.rev !== Number(args.rev)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
-        const baseLines = entryLines(f.base)
-        const curLines = entryLines(f.cur)
+        const baseLines = await fileLines(st.root, path, f.base)
+        const curLines = await fileLines(st.root, path, f.cur)
         const all = computeHunks(baseLines, curLines)
         let hunk = null
         for (const h of all) if (h.id === hunkId) hunk = h
@@ -2077,7 +2755,7 @@ export default {
           if (!f.base || !f.base.present) {
             const snap = await snapshotForUndo(st, path, rec)
             await deleteFile(st, path)
-            f.cur = { present: false, content: null, eol: false, crlf: false, version: null, size: 0, binRef: null, binSize: 0 }
+            f.cur = goneEntry()
             if (snap) { snap.afterVersion = null; rec.files.push(snap) }
           } else {
             const snap = await snapshotForUndo(st, path, rec)
@@ -2098,13 +2776,14 @@ export default {
         for (const h of all) if (!f.decisions.has(h.id)) pendingCount++
         if (pendingCount === 0) {
           f.base = cloneEntry(f.cur)
+          armBaseline(st, path, f)
           f.decisions.clear()
         }
         f.rev++
         // v1.18: hunk-reject committed an undo record → persist immediately;
         // accept-only decisions can ride the debounced save.
         scheduleSave(st, action === 'reject')
-        return diffPayload(f, undefined)
+        return await diffPayload(f, st.root, path)
       },
 
       // User edit from the file view's inline editor. One line at a time;
@@ -2126,8 +2805,12 @@ export default {
         const f = st.files.get(path)
         if (!f || !f.cur || !f.cur.present) return { ok: false, code: 'not-found', message: '文件不存在' }
         if (f.rev !== Number(args.rev)) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
-        const baseLines = entryLines(f.base)
-        const curLines = entryLines(f.cur)
+        const baseLines = await fileLines(st.root, path, f.base)
+        const curLines = await fileLines(st.root, path, f.cur)
+        // v1.31: an unloadable file (binary, or past MAX_SIG_BYTES) is reviewed
+        // by hunks but never edited inline — the editor round-trips the WHOLE
+        // text, and rebuilding it from no content would rewrite the file.
+        if (!hasLines(f.cur) || !hasLines(f.base)) return { ok: false, code: 'no-content', message: '文件内容不可读，无法行内编辑' }
         if (idx > curLines.length) return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试' }
         // Edited lines address cur lines only, so they can never be diff OLD
         // (deleted) lines — the client renders those read-only.
@@ -2180,7 +2863,7 @@ export default {
         bumpTree(st)
         invalidateGitCacheFor(st.root)
         scheduleSave(st)
-        return diffPayload(f, undefined)
+        return await diffPayload(f, st.root, path)
       },
 
       // v1.13: whole-content user save. The client's line editor keeps its
@@ -2215,7 +2898,7 @@ export default {
               const target = await fs.resolve(joinPath(st.root, path))
               const info = await fs.stat(target)
               if (!info || !f0.cur.present || f0.cur.version !== info.version || f0.cur.size !== info.size) {
-                const next = await loadFileEntry(st, path)
+                const next = await loadFileEntry(st, path, f0.cur)
                 // v1.29: an identical re-read (editor save, EOL-only flip) keeps
                 // the entry, so the stale-write guard below still sees the true
                 // on-disk state without a spurious rev bump.
@@ -2242,7 +2925,7 @@ export default {
             }
             f.cur = entry
             if (f.base === null) {
-              if (st.touched.has(path)) { f.base = absentEntry(); st.touched.delete(path) } else { f.base = cloneEntry(entry) }
+              if (st.touched.has(path)) { f.base = absentEntry(); st.touched.delete(path) } else { f.base = cloneEntry(entry); armBaseline(st, path, f) }
             }
             f.rev++
             scheduleSave(st)
@@ -2254,10 +2937,13 @@ export default {
         f.justRejected = false
         const wantRev = args && args.rev !== undefined && args.rev !== null ? Number(args.rev) : NaN
         if (Number.isFinite(wantRev) && f.rev !== wantRev) {
-          return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试', payload: diffPayload(f, undefined) }
+          return { ok: false, code: 'stale', message: '文件已变化，请刷新后重试', payload: await diffPayload(f, st.root, path) }
         }
-        const baseLines = entryLines(f.base)
-        const curLines = entryLines(f.cur)
+        const baseLines = await fileLines(st.root, path, f.base)
+        const curLines = await fileLines(st.root, path, f.cur)
+        // v1.31: a whole-content save needs the reference text on both sides —
+        // same rule as the inline editor (see applyEdit).
+        if (!hasLines(f.cur) || !hasLines(f.base)) return { ok: false, code: 'no-content', message: '文件内容不可读，无法保存' }
         const all = computeHunks(baseLines, curLines)
         const canFold = !!(f.base && f.base.present && f.base.content !== null)
         let newBase = canFold ? baseLines.slice() : null
@@ -2352,7 +3038,7 @@ export default {
         bumpTree(st)
         invalidateGitCacheFor(st.root)
         scheduleSave(st)
-        return diffPayload(f, undefined)
+        return await diffPayload(f, st.root, path)
       },
 
       async acceptFile(args) {
@@ -2396,7 +3082,7 @@ export default {
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
         await ensureFresh(st, sid, { failsafe: false })
-        const list = modifiedFiles(st)
+        const list = await modifiedFiles(st)
         let applied = 0
         for (const item of list) {
           const f = st.files.get(item.path)
@@ -2408,7 +3094,7 @@ export default {
         // that follow within 250ms); the response goes out before the
         // (potentially huge) state serialization runs in the background.
         scheduleSave(st)
-        return { ok: true, applied: applied, files: modifiedFiles(st) }
+        return { ok: true, applied: applied, files: await modifiedFiles(st) }
       },
 
       async rejectAll(args) {
@@ -2416,7 +3102,7 @@ export default {
         if (!st) return { ok: false, error: 'no-session' }
         const sid = String(args.sessionId)
         await ensureFresh(st, sid, { failsafe: false })
-        const list = modifiedFiles(st)
+        const list = await modifiedFiles(st)
         const failed = []
         const rec = newUndoRec()
         let applied = 0
@@ -2432,7 +3118,7 @@ export default {
         }
         commitUndo(st, rec)
         scheduleSave(st, true)
-        return { ok: true, applied: applied, failed: failed, files: modifiedFiles(st) }
+        return { ok: true, applied: applied, failed: failed, files: await modifiedFiles(st) }
       },
 
       // Undo the last reject batch: rewrite the pre-reject bytes for every
